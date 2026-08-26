@@ -1,0 +1,12 @@
+{
+  "extends": "@onlyoffice/config/tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "dist",
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+    "jsx": "react-jsx",
+    "strictNullChecks": true
+  }
+}

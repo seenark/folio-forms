@@ -1,0 +1,24 @@
+services:
+  onlyoffice:
+    image: onlyoffice/documentserver:9.4.0.1
+    container_name: onlyoffice
+    restart: unless-stopped
+
+    ports:
+      - "8080:80"
+
+    environment:
+      JWT_ENABLED: "false"
+      ALLOW_PRIVATE_IP_ADDRESS: "true"
+
+    volumes:
+      - onlyoffice-data:/var/www/onlyoffice/Data
+      - onlyoffice-logs:/var/log/onlyoffice
+      - onlyoffice-cache:/var/lib/onlyoffice
+      - onlyoffice-db:/var/lib/postgresql
+
+volumes:
+  onlyoffice-data:
+  onlyoffice-logs:
+  onlyoffice-cache:
+  onlyoffice-db:

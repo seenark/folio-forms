@@ -1,0 +1,23 @@
+{
+  "name": "@onlyoffice/auth",
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    },
+    "./*": {
+      "default": "./src/*.ts"
+    }
+  },
+  "scripts": {},
+  "dependencies": {
+    "@onlyoffice/env": "workspace:*",
+    "better-auth": "catalog:",
+    "dotenv": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@onlyoffice/config": "workspace:*",
+    "typescript": "catalog:"
+  }
+}

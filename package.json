@@ -1,0 +1,45 @@
+{
+  "name": "onlyoffice",
+  "private": true,
+  "workspaces": {
+    "packages": [
+      "apps/*",
+      "packages/*"
+    ],
+    "catalog": {
+      "dotenv": "^17.4.2",
+      "zod": "^4.4.3",
+      "typescript": "^6.0.3",
+      "@types/bun": "^1.3.14",
+      "better-auth": "1.7.1"
+    }
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "check-types": "turbo run check-types",
+    "dev:server": "turbo run dev -F server --",
+    "docker:build": "docker compose build",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f",
+    "check": "ultracite check",
+    "fix": "ultracite fix"
+  },
+  "dependencies": {
+    "@onlyoffice/env": "workspace:*",
+    "dotenv": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@onlyoffice/config": "workspace:*",
+    "@types/bun": "catalog:",
+    "oxfmt": "latest",
+    "oxlint": "latest",
+    "turbo": "^2.10.7",
+    "typescript": "catalog:",
+    "ultracite": "7.9.4"
+  },
+  "packageManager": "bun@1.3.14"
+}
