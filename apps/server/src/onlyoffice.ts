@@ -167,6 +167,14 @@ export function editorConfig(
     },
     documentType: "word",
     editorConfig: {
+      ...(options.action === "template-edit"
+        ? {}
+        : {
+            customization: {
+              compactToolbar: true,
+              hideRightMenu: true,
+            },
+          }),
       callbackUrl: `${officeServerOrigin}/onlyoffice/callback`,
       mode: "edit",
       plugins: {
