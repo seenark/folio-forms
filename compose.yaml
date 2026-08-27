@@ -1,24 +1,81 @@
+name: onlyoffice
+
 services:
+  postgres:
+    image: postgres:18
+    container_name: onlyoffice-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: onlyoffice
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d onlyoffice"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - postgres-data-v18:/var/lib/postgresql
+
   onlyoffice:
     image: onlyoffice/documentserver:9.4.0.1
     container_name: onlyoffice
     restart: unless-stopped
-
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8080:80"
-
     environment:
       JWT_ENABLED: "false"
       ALLOW_PRIVATE_IP_ADDRESS: "true"
-
+      ALLOW_META_IP_ADDRESS: "true"
     volumes:
       - onlyoffice-data:/var/www/onlyoffice/Data
       - onlyoffice-logs:/var/log/onlyoffice
       - onlyoffice-cache:/var/lib/onlyoffice
-      - onlyoffice-db:/var/lib/postgresql
+
+  server:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    container_name: onlyoffice-server
+    init: true
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      onlyoffice:
+        condition: service_started
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/onlyoffice
+      BETTER_AUTH_SECRET: DxQKnIZCNcMT7LrVW2oHfXYqJFUHV3mB
+      BETTER_AUTH_URL: http://localhost:3000
+      CORS_ORIGIN: http://localhost:5173
+      SERVER_ORIGIN: http://localhost:3000
+      API_BASE: http://localhost:3000
+      ONLYOFFICE_URL: http://localhost:8080
+      ONLYOFFICE_API_BASE: http://localhost:8080
+      ONLYOFFICE_INTERNAL_URL: http://onlyoffice
+      ONLYOFFICE_DOCUMENT_BASE_URL: http://host.docker.internal:3000
+      STORAGE_ROOT: /app/onlyoffice-submissions
+      TEMPLATE_PATH: /app/onlyoffice-templates/template.docx
+    command:
+      [
+        "sh",
+        "-c",
+        "bun run db:migrate && bun run db:seed && bun dist/index.mjs",
+      ]
+    volumes:
+      - ./onlyoffice-submissions:/app/onlyoffice-submissions
 
 volumes:
+  postgres-data-v18:
   onlyoffice-data:
   onlyoffice-logs:
   onlyoffice-cache:
-  onlyoffice-db:

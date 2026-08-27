@@ -1,0 +1,8 @@
+{
+  "extends": "@onlyoffice/config/tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "strictNullChecks": true
+  },
+  "include": ["src/**/*.ts", "drizzle.config.ts"]
+}

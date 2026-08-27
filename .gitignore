@@ -12,6 +12,8 @@ build
 apps/web/src/routeTree.gen.ts
 local.db
 local.db-*
+onlyoffice-submissions/
+runtime/
 
 # Environment variables
 .env

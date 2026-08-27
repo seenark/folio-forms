@@ -1,63 +1,78 @@
-# onlyoffice
+# Folio Forms prototype
 
-This project was created with [Better-T-Stack](https://github.com/AmanVarshney01/create-better-t-stack), a modern TypeScript stack that combines Elysia, and more.
+Local prototype for creating, publishing, and completing DOCX forms with ONLYOFFICE Docs.
 
-## Features
+## Stack
 
-- **TypeScript** - For type safety and improved developer experience
-- **Elysia** - Type-safe, high-performance framework
-- **Bun** - Runtime environment
-- **Authentication** - Better-Auth
-- **Turborepo** - Optimized monorepo build system
+- Bun + Turborepo
+- Elysia API on `http://localhost:3000`
+- React + Vite + TanStack Router on `http://localhost:5173`
+- ONLYOFFICE Docs Community Edition 9.4.0.1 on `http://localhost:8080`
+- PostgreSQL 18 on `localhost:5432`
+- Drizzle ORM and Better Auth bearer sessions
 
-## Getting Started
-
-First, install the dependencies:
+## Start locally
 
 ```bash
 bun install
-```
-
-Then, run the development server:
-
-```bash
+cp apps/server/.env.example apps/server/.env
+# Replace BETTER_AUTH_SECRET with a random value of at least 32 characters.
+docker compose -f compose.yaml up -d postgres onlyoffice
+bun run --cwd apps/server db:migrate
+bun run --cwd apps/server db:seed
 bun run dev
 ```
 
-The API is running at [http://localhost:3000](http://localhost:3000).
+`bun run dev` starts the API and web app through Turborepo. The server seed is idempotent and creates the demo accounts, prefill profiles, and a published `demo-employee-intake` form.
 
-## Deployment
+Open the prototype at [http://localhost:5173](http://localhost:5173). The ready-to-share demo form is:
 
-### Docker Compose
-
-- Target: server
-- Config: `docker-compose.yml` (app Dockerfiles live in `apps/*/Dockerfile`)
-- Build images: bun run docker:build
-- Start: bun run docker:up
-- Logs: bun run docker:logs
-- Stop: bun run docker:down
-
-Environment variables are read from each app's `.env` file (baked into web builds for public variables) and overridden in `docker-compose.yml` for container networking.
-
-For more details, see the guide on [Deploying with Docker Compose](https://www.better-t-stack.dev/docs/guides/docker).
-
-## Project Structure
-
-```
-onlyoffice/
-├── apps/
-│   └── server/      # Backend API (Elysia)
-├── packages/
-│   ├── auth/        # Authentication configuration & logic
+```text
+http://localhost:5173/forms/demo-employee-intake/fill
 ```
 
-## Available Scripts
+## Demo accounts
 
-- `bun run dev`: Start all applications in development mode
-- `bun run build`: Build all applications
-- `bun run dev:server`: Start only the server
-- `bun run check-types`: Check TypeScript types across all apps
-- `bun run docker:build`: Build the Docker Compose images
-- `bun run docker:up`: Build and start the Docker Compose stack
-- `bun run docker:logs`: Tail logs from the Docker Compose stack
-- `bun run docker:down`: Stop the Docker Compose stack
+| Role  | Email                | Password            |
+| ----- | -------------------- | ------------------- |
+| Admin | `admin@example.com`  | `AdminPassword123!` |
+| User  | `user-a@example.com` | `UserAPassword123!` |
+| User  | `user-b@example.com` | `UserBPassword123!` |
+
+The browser stores the Better Auth opaque bearer session token in `localStorage` for this local prototype. This is not the production security configuration.
+
+## Docker API mode
+
+To run PostgreSQL, ONLYOFFICE, and the API in Compose:
+
+```bash
+docker compose -f compose.yaml up -d --build postgres onlyoffice server
+bun run --cwd apps/web dev
+```
+
+The Compose server applies migrations and runs the same seed before listening on port 3000. The web app remains a host process so the clickable UI is available on port 5173.
+
+Local ONLYOFFICE networking intentionally keeps `JWT_ENABLED=false`, `ALLOW_PRIVATE_IP_ADDRESS=true`, and `ALLOW_META_IP_ADDRESS=true`. Enable JWT, HTTPS, protected document URLs, and a reverse proxy before any production deployment.
+
+## Prototype workflow
+
+1. Admin signs in and creates a Form with a title and description.
+2. Admin edits the DOCX template in ONLYOFFICE and adds tagged Content Controls.
+3. Admin saves the template and publishes it. Publishing invalidates unsubmitted drafts for that Form; completed submissions remain immutable.
+4. Admin copies the share link and sends it to respondents.
+5. A respondent signs in, receives user-specific prefill, fills editable controls, and uses the ONLYOFFICE **Form** tab to save a draft or submit.
+6. Submit persists extracted JSON, DOCX, and PDF under the private runtime storage root and exposes authorized download/data APIs.
+
+Content Control tags are the field keys in extracted JSON. Publish checks that every control is tagged and that tags are unique.
+
+## Useful commands
+
+```bash
+bun run check-types
+bun run build
+bun x ultracite check
+bun run --cwd apps/server db:migrate
+bun run --cwd apps/server db:seed
+```
+
+Database setup details are in [`packages/db/README.md`](packages/db/README.md). Official setup research is in [`docs/research/frontend-setup.md`](docs/research/frontend-setup.md) and [`docs/research/auth-setup.md`](docs/research/auth-setup.md).
