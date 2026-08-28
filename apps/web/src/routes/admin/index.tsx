@@ -1,10 +1,10 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { ArrowUpRight, FileText, Plus, RefreshCw } from "lucide-react";
-import { useEffect, useState } from "react";
+import { ArrowUpRight, FileText, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/app-shell";
 import { Button, Card, Badge, Notice, Spinner } from "@/components/ui";
-import { apiGet, formatDate } from "@/lib/api";
+import { apiDelete, apiGet, formatDate } from "@/lib/api";
 import type { FormSummary } from "@/lib/api";
 
 const fetchForms = async () => {
@@ -18,9 +18,15 @@ const AdminFormsRoute = () => {
   const [forms, setForms] = useState<FormSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [mutationError, setMutationError] = useState<string | null>(null);
+  const [removingId, setRemovingId] = useState<string | null>(null);
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  const restoreFocusId = useRef<string | null>(null);
 
   const load = async () => {
     setLoading(true);
+    setError(null);
+    setMutationError(null);
     try {
       const nextForms = await fetchForms();
       setForms(nextForms);
@@ -32,6 +38,48 @@ const AdminFormsRoute = () => {
       );
     } finally {
       setLoading(false);
+    }
+  };
+  useEffect(() => {
+    if (confirmingId) {
+      document
+        .querySelector<HTMLButtonElement>(
+          `button[data-confirm-form-id="${CSS.escape(confirmingId)}"]`
+        )
+        ?.focus();
+      return;
+    }
+    const formId = restoreFocusId.current;
+    if (formId) {
+      document
+        .querySelector<HTMLButtonElement>(
+          `button[data-remove-form-id="${CSS.escape(formId)}"]`
+        )
+        ?.focus();
+      restoreFocusId.current = null;
+    }
+  }, [confirmingId]);
+  const removeDraft = async (form: FormSummary) => {
+    if (form.status !== "draft" || removingId) {
+      return;
+    }
+    setRemovingId(form.id);
+    setMutationError(null);
+    try {
+      await apiDelete<{ deleted: boolean }>(`/api/admin/forms/${form.id}`);
+      setForms((currentForms) =>
+        currentForms.filter((currentForm) => currentForm.id !== form.id)
+      );
+    } catch (caughtError) {
+      setMutationError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Could not remove this draft form."
+      );
+    } finally {
+      restoreFocusId.current = form.id;
+      setRemovingId(null);
+      setConfirmingId(null);
     }
   };
 
@@ -122,6 +170,56 @@ const AdminFormsRoute = () => {
                 >
                   {form.status === "published" ? "Published" : "Draft"}
                 </Badge>
+                {form.status === "draft" && confirmingId !== form.id ? (
+                  <Button
+                    variant="danger"
+                    size="sm"
+                    data-remove-form-id={form.id}
+                    onClick={() => {
+                      setConfirmingId(form.id);
+                      setMutationError(null);
+                    }}
+                    disabled={Boolean(removingId)}
+                  >
+                    <Trash2 size={15} />
+                    Remove
+                  </Button>
+                ) : null}
+                {form.status === "draft" && confirmingId === form.id ? (
+                  <div
+                    className="flex items-center gap-2"
+                    role="alertdialog"
+                    aria-label={`Remove ${form.title}`}
+                  >
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      data-confirm-form-id={form.id}
+                      onClick={() => {
+                        void removeDraft(form);
+                      }}
+                      disabled={Boolean(removingId)}
+                    >
+                      {removingId === form.id ? (
+                        <Spinner />
+                      ) : (
+                        <Trash2 size={15} />
+                      )}
+                      {removingId === form.id ? "Removing…" : "Confirm remove"}
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => {
+                        restoreFocusId.current = form.id;
+                        setConfirmingId(null);
+                      }}
+                      disabled={Boolean(removingId)}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                ) : null}
                 <Link
                   to="/admin/forms/$formId"
                   params={{ formId: form.id }}
@@ -151,6 +249,11 @@ const AdminFormsRoute = () => {
           </Link>
         }
       />
+      {mutationError ? (
+        <div className="mb-4">
+          <Notice tone="danger">{mutationError}</Notice>
+        </div>
+      ) : null}
       {formsContent}
       <button
         onClick={() => {

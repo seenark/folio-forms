@@ -1,0 +1,4 @@
+[tools]
+bun = "1.4"
+python = "latest"
+uv = "latest"

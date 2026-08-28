@@ -71,6 +71,12 @@ export async function removeArtifact(
   }
   await rm(resolveArtifactPath(relativePath), { force: true });
 }
+/** Remove an artifact directory and everything stored below it. */
+export async function removeArtifactDirectory(
+  relativePath: string
+): Promise<void> {
+  await rm(resolveArtifactPath(relativePath), { force: true, recursive: true });
+}
 
 export async function ensureStorageRoot(): Promise<void> {
   await mkdir(storageRoot, { recursive: true });

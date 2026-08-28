@@ -94,17 +94,17 @@ const request = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
     if (
       body &&
       typeof body === "object" &&
-      "error" in body &&
-      typeof body.error === "string"
-    ) {
-      errorMessage = body.error;
-    } else if (
-      body &&
-      typeof body === "object" &&
       "message" in body &&
       typeof body.message === "string"
     ) {
       errorMessage = body.message;
+    } else if (
+      body &&
+      typeof body === "object" &&
+      "error" in body &&
+      typeof body.error === "string"
+    ) {
+      errorMessage = body.error;
     } else if (typeof body === "string") {
       errorMessage = body;
     }
@@ -117,6 +117,8 @@ export const apiGet = <T>(path: string) => request<T>(path);
 
 export const apiPost = <T>(path: string, body?: unknown) =>
   request<T>(path, { body: JSON.stringify(body ?? {}), method: "POST" });
+export const apiDelete = <T>(path: string) =>
+  request<T>(path, { method: "DELETE" });
 export const downloadArtifact = async (path: string, filename: string) => {
   const token = getToken();
   const response = await fetch(`${API_ORIGIN}${path}`, {

@@ -124,3 +124,9 @@ Oxlint + Oxfmt's linter will catch most issues automatically. Focus your attenti
 ---
 
 Most formatting and common issues are automatically fixed by Oxlint + Oxfmt. Run `bun x ultracite fix` before committing to ensure compliance.
+
+## Development Servers
+
+- For development servers only, use `herdr` persistent terminal sessions.
+- Do not start development servers in an assistant-owned terminal process.
+- Use `herdr` for development-server start, status, logs, and stop operations.

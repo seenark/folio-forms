@@ -34,6 +34,7 @@ import {
   ensureStorageRoot,
   readArtifact,
   readArtifactJson,
+  removeArtifactDirectory,
   resolveArtifactPath,
   writeArtifact,
 } from "./storage";
@@ -1209,6 +1210,22 @@ async function userEditorConfig(
     identity
   );
 }
+async function removeArtifactDirectoryWithRetry(
+  relativePath: string
+): Promise<void> {
+  try {
+    await removeArtifactDirectory(relativePath);
+  } catch {
+    try {
+      await removeArtifactDirectory(relativePath);
+    } catch (error) {
+      console.error(
+        `Could not remove artifact directory ${relativePath}`,
+        error
+      );
+    }
+  }
+}
 
 const app = new Elysia()
   .use(
@@ -1237,6 +1254,132 @@ const app = new Elysia()
       })),
     };
     return payload;
+  })
+  .delete("/api/admin/forms/:id", async ({ request, params }) => {
+    const identity = await requireIdentity(request);
+    requireAdmin(identity);
+    const formId = validateId(params.id, "Form");
+    const { operationIds } = await db.transaction(async (tx) => {
+      const formRows = await tx
+        .select()
+        .from(forms)
+        .where(eq(forms.id, formId))
+        .for("update")
+        .limit(1);
+      const form = formRows[0];
+      if (!form) {
+        fail(404, "not_found", "Form was not found");
+      }
+      if (
+        form.status !== "draft" ||
+        form.publishedPath ||
+        form.publishedKey ||
+        form.version > 0
+      ) {
+        fail(
+          409,
+          "form_not_draft",
+          "Only unpublished draft forms can be removed"
+        );
+      }
+
+      const activeOperations = await tx
+        .select({ id: operations.id, updatedAt: operations.updatedAt })
+        .from(operations)
+        .where(
+          and(
+            eq(operations.formId, form.id),
+            or(
+              eq(operations.status, "pending"),
+              eq(operations.status, "processing")
+            )
+          )
+        );
+      const staleOperationIds = new Set<string>();
+      const now = Date.now();
+      for (const operation of activeOperations) {
+        if (now - operation.updatedAt.getTime() >= operationTimeoutMs) {
+          staleOperationIds.add(operation.id);
+          await tx
+            .update(operations)
+            .set({
+              error: "The document operation timed out. Try again.",
+              status: "failed",
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(operations.id, operation.id),
+                or(
+                  eq(operations.status, "pending"),
+                  eq(operations.status, "processing")
+                )
+              )
+            );
+        }
+      }
+      if (activeOperations.some(({ id }) => !staleOperationIds.has(id))) {
+        fail(
+          409,
+          "operation_in_progress",
+          "Wait for the draft operation to finish before removing this form"
+        );
+      }
+
+      const responsesForForm = await tx
+        .select({ id: responses.id })
+        .from(responses)
+        .where(eq(responses.formId, form.id))
+        .limit(1);
+      if (responsesForForm[0]) {
+        fail(
+          409,
+          "form_has_responses",
+          "A form with responses cannot be removed"
+        );
+      }
+      const snapshotsForForm = await tx
+        .select({ id: prefillSnapshots.id })
+        .from(prefillSnapshots)
+        .where(eq(prefillSnapshots.formId, form.id))
+        .limit(1);
+      const submissionsForForm = await tx
+        .select({ id: submissions.id })
+        .from(submissions)
+        .where(eq(submissions.formId, form.id))
+        .limit(1);
+      if (snapshotsForForm[0] || submissionsForForm[0]) {
+        fail(
+          409,
+          "form_has_responses",
+          "A form with responses cannot be removed"
+        );
+      }
+
+      const formOperations = await tx
+        .select({ id: operations.id })
+        .from(operations)
+        .where(eq(operations.formId, form.id));
+      await tx.delete(operations).where(eq(operations.formId, form.id));
+      const deletedForms = await tx
+        .delete(forms)
+        .where(and(eq(forms.id, form.id), eq(forms.status, "draft")))
+        .returning({ id: forms.id });
+      if (!deletedForms[0]) {
+        fail(409, "form_not_draft", "Only draft forms can be removed");
+      }
+      return { operationIds: formOperations.map(({ id }) => id) };
+    });
+
+    await Promise.all([
+      removeArtifactDirectoryWithRetry(artifactPath("forms", formId)),
+      ...operationIds.map((operationId) =>
+        removeArtifactDirectoryWithRetry(
+          artifactPath("operations", operationId)
+        )
+      ),
+    ]);
+    return { deleted: true, formId };
   })
   .post("/api/admin/forms", async ({ request, body }) => {
     const identity = await requireIdentity(request);
