@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 
 import { auth, ensureBootstrapAdmin } from "@onlyoffice/auth";
 import { prisma } from "@onlyoffice/db";
+import { strToU8, zipSync } from "fflate";
 
 import {
   createApp,
@@ -46,6 +47,135 @@ const app = createApp({
   requestIp: (request) => request.headers.get("x-test-ip"),
 });
 const jsonHeaders = { "Content-Type": "application/json" };
+const maxTemplateUploadBytes = 25 * 1024 * 1024;
+const templateContentTypesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="bin" ContentType="application/octet-stream"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`;
+const templateRelationshipsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`;
+
+const docxXmlFixture = ({
+  additionalParts = {},
+  contentTypes = templateContentTypesXml,
+  document,
+  paddingBytes = 0,
+  relationships = templateRelationshipsXml,
+}: {
+  additionalParts?: Record<string, Uint8Array>;
+  contentTypes?: string;
+  document: string;
+  paddingBytes?: number;
+  relationships?: string;
+}): Uint8Array =>
+  zipSync(
+    {
+      "[Content_Types].xml": strToU8(contentTypes),
+      "_rels/.rels": strToU8(relationships),
+      "word/document.xml": strToU8(document),
+      "word/media/padding.bin": new Uint8Array(paddingBytes),
+      ...additionalParts,
+    },
+    { level: 0 }
+  );
+
+const docxFixture = (label: string, paddingBytes = 0): Uint8Array =>
+  docxXmlFixture({
+    document: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>${label}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>`,
+    paddingBytes,
+  });
+
+const strictDocxFixture = (label: string): Uint8Array =>
+  docxXmlFixture({
+    contentTypes: `<?xml version="1.0"?><ct:Types xmlns:ct="http://schemas.openxmlformats.org/package/2006/content-types"><ct:Override ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml" PartName="/word/document.xml"/></ct:Types>`,
+    document: `<?xml version="1.0"?><word:document xmlns:word="http://purl.oclc.org/ooxml/wordprocessingml/main"><word:body><word:p><word:r><word:t>${label}</word:t></word:r></word:p></word:body></word:document>`,
+    relationships: `<?xml version="1.0"?><pkg:Relationships xmlns:pkg="http://schemas.openxmlformats.org/package/2006/relationships"><pkg:Relationship Id="rId1" Target="/word/document.xml" Type="http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument"/></pkg:Relationships>`,
+  });
+
+const utf16Xml = (value: string, byteOrder: "be" | "le"): Uint8Array => {
+  const littleEndian = Buffer.from(value, "utf16le");
+  const bytes = new Uint8Array(littleEndian.byteLength + 2);
+  bytes[0] = byteOrder === "le" ? 0xff : 0xfe;
+  bytes[1] = byteOrder === "le" ? 0xfe : 0xff;
+  for (let index = 0; index < littleEndian.byteLength; index += 2) {
+    const target = index + 2;
+    const firstByte = littleEndian[index] ?? 0;
+    const secondByte = littleEndian[index + 1] ?? 0;
+    bytes[target] = byteOrder === "le" ? firstByte : secondByte;
+    bytes[target + 1] = byteOrder === "le" ? secondByte : firstByte;
+  }
+  return bytes;
+};
+
+const utf16DocxFixture = (): Uint8Array =>
+  zipSync(
+    {
+      "[Content_Types].xml": utf16Xml(
+        templateContentTypesXml.replace(
+          'encoding="UTF-8"',
+          'encoding="UTF-16"'
+        ),
+        "le"
+      ),
+      "_rels/.rels": utf16Xml(
+        templateRelationshipsXml.replace(
+          'encoding="UTF-8"',
+          'encoding="UTF-16"'
+        ),
+        "be"
+      ),
+      "word/document.xml": utf16Xml(
+        '<?xml version="1.0" encoding="UTF-16"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body/></w:document>',
+        "le"
+      ),
+    },
+    { level: 0 }
+  );
+
+const sizedDocxFixture = (label: string, byteLength: number): Uint8Array => {
+  const emptyPadding = docxFixture(label);
+  const paddingLength = byteLength - emptyPadding.byteLength;
+  if (paddingLength < 0) {
+    throw new Error("The requested DOCX fixture size is too small");
+  }
+  const fixture = docxFixture(label, paddingLength);
+  if (fixture.byteLength !== byteLength) {
+    throw new Error("The DOCX fixture did not reach the requested size");
+  }
+  return fixture;
+};
+
+const formCreationRequest = ({
+  authorization,
+  description = "",
+  source,
+  template,
+  title,
+}: {
+  authorization?: string;
+  description?: string;
+  source?: "blank" | "upload";
+  template?: { bytes: Uint8Array; name: string; type?: string };
+  title?: string;
+}): Request => {
+  const body = new FormData();
+  body.set("description", description);
+  if (source) {
+    body.set("source", source);
+  }
+  if (title !== undefined) {
+    body.set("title", title);
+  }
+  if (template) {
+    body.set(
+      "template",
+      new File([template.bytes], template.name, {
+        type: template.type ?? DOCX_CONTENT_TYPE,
+      })
+    );
+  }
+  return new Request("http://test.local/api/admin/forms", {
+    body,
+    headers: authorization ? { Authorization: `Bearer ${authorization}` } : {},
+    method: "POST",
+  });
+};
 
 interface CredentialFixtureOptions {
   email: string;
@@ -84,6 +214,7 @@ interface EditorConfigBody {
             authToken?: unknown;
             bridgeId: string;
             parentOrigin: string;
+            publicId?: string;
           }
         >;
       };
@@ -358,11 +489,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(await healthResponse.json()).toEqual({ ok: true });
 
   const unauthorizedResponse = await app.handle(
-    new Request("http://test.local/api/admin/forms", {
-      body: JSON.stringify({ title: "Denied Form" }),
-      headers: jsonHeaders,
-      method: "POST",
-    })
+    formCreationRequest({ source: "blank", title: "Denied Form" })
   );
   expect(unauthorizedResponse.status).toBe(401);
   expect(await unauthorizedResponse.json()).toMatchObject({
@@ -380,32 +507,102 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   const secretFormTitle = `Ticket 04 secret title ${crypto.randomUUID()}`;
   const secretFormDescription = `Ticket 04 secret description ${crypto.randomUUID()}`;
 
-  const createResponse = await app.handle(
+  const jsonCreateResponse = await app.handle(
     new Request("http://test.local/api/admin/forms", {
-      body: JSON.stringify({
-        description: secretFormDescription,
-        title: secretFormTitle,
-      }),
-      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      body: JSON.stringify({ source: "blank", title: "JSON is not accepted" }),
+      headers: {
+        ...jsonHeaders,
+        Authorization: `Bearer ${adminBearer}`,
+      },
       method: "POST",
+    })
+  );
+  expect(jsonCreateResponse.status).toBe(415);
+  expect(await jsonCreateResponse.json()).toMatchObject({
+    error: "invalid_file_type",
+  });
+  for (const invalidRequest of [
+    formCreationRequest({
+      authorization: adminBearer,
+      title: "Missing source",
+    }),
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "blank",
+    }),
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      title: "Missing uploaded template",
+    }),
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "blank",
+      template: {
+        bytes: docxFixture("unexpected-blank-template"),
+        name: "unexpected.docx",
+      },
+      title: "Unexpected blank template",
+    }),
+  ]) {
+    const invalidResponse = await app.handle(invalidRequest);
+    expect(invalidResponse.status).toBe(400);
+    expect(await invalidResponse.json()).toMatchObject({
+      error: "invalid_request",
+    });
+  }
+  const createResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      description: secretFormDescription,
+      source: "blank",
+      title: secretFormTitle,
     })
   );
   expect(createResponse.status).toBe(200);
   const createdForm = (await createResponse.json()) as {
     form?: {
-      id?: string;
-      templateDocumentKey?: string;
+      activeDraftCount?: number;
+      hasTemplateDraft?: boolean;
+      publicId?: string;
+      status?: string;
+      submissionCount?: number;
       title?: string;
     };
-    templateAvailable?: boolean;
   };
-  const formId = createdForm.form?.id;
-  expect(createdForm.form?.title).toBe(secretFormTitle);
-  expect(createdForm.templateAvailable).toBe(true);
-  const templateDocumentKey = createdForm.form?.templateDocumentKey;
-  if (!formId || !templateDocumentKey) {
-    throw new Error("The test form did not receive a template document key");
+  const formPublicId = createdForm.form?.publicId;
+  expect(createdForm.form).toMatchObject({
+    activeDraftCount: 0,
+    hasTemplateDraft: true,
+    status: "draft",
+    submissionCount: 0,
+    title: secretFormTitle,
+  });
+  if (!formPublicId) {
+    throw new Error("The test form did not receive a public identifier");
   }
+  expect(formPublicId).toMatch(/^[0-9a-f]{32}$/u);
+  const createdFormRecord = await prisma.form.findUnique({
+    include: { templateDraft: true },
+    where: { publicId: formPublicId },
+  });
+  if (!createdFormRecord?.templateDraft) {
+    throw new Error("The test form did not receive a template draft");
+  }
+  const formId = createdFormRecord.id;
+  const templateDocumentKey = createdFormRecord.templateDraft.documentKey;
+  expect(
+    await prisma.objectCleanupIntent.findUnique({
+      where: { objectKey: createdFormRecord.templateDraft.objectKey },
+    })
+  ).toBeNull();
+  const serializedCreate = JSON.stringify(createdForm);
+  expect(serializedCreate).not.toContain(formId);
+  expect(serializedCreate).not.toContain(adminId);
+  expect(serializedCreate).not.toContain(
+    createdFormRecord.templateDraft.objectKey
+  );
+  expect(serializedCreate).not.toContain(templateDocumentKey);
 
   const listResponse = await app.handle(
     new Request("http://test.local/api/admin/forms", {
@@ -414,18 +611,443 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   );
   expect(listResponse.status).toBe(200);
   const listBody = (await listResponse.json()) as {
-    forms?: { id: string; title: string }[];
+    forms?: {
+      activeDraftCount: number;
+      publicId: string;
+      status: string;
+      submissionCount: number;
+      title: string;
+    }[];
   };
-  expect(
-    listBody.forms?.some(
-      (form) => form.id === formId && form.title === secretFormTitle
-    )
-  ).toBe(true);
-
-  const adminEditorResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/editor-config`, {
+  const listedForm = listBody.forms?.find(
+    (form) => form.publicId === formPublicId
+  );
+  expect(listedForm).toMatchObject({
+    activeDraftCount: 0,
+    publicId: formPublicId,
+    status: "draft",
+    submissionCount: 0,
+    title: secretFormTitle,
+  });
+  for (const privateField of [
+    "createdBy",
+    "id",
+    "objectKey",
+    "publishedDocumentKey",
+    "templateDocumentKey",
+  ]) {
+    expect(listedForm).not.toHaveProperty(privateField);
+  }
+  const serializedList = JSON.stringify(listBody);
+  expect(serializedList).not.toContain(formId);
+  expect(serializedList).not.toContain(adminId);
+  expect(serializedList).not.toContain(
+    createdFormRecord.templateDraft.objectKey
+  );
+  expect(serializedList).not.toContain(templateDocumentKey);
+  const detailResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
       headers: { Authorization: `Bearer ${adminBearer}` },
     })
+  );
+  expect(detailResponse.status).toBe(200);
+  const detailBody = (await detailResponse.json()) as {
+    editorConfigUrl?: string;
+    form?: { publicId?: string };
+  };
+  expect(detailBody).toMatchObject({
+    editorConfigUrl: `/api/admin/forms/${formPublicId}/editor-config`,
+    form: { publicId: formPublicId },
+  });
+  for (const privateField of [
+    "createdBy",
+    "id",
+    "objectKey",
+    "publishedDocumentKey",
+    "templateDocumentKey",
+  ]) {
+    expect(detailBody.form).not.toHaveProperty(privateField);
+  }
+  const serializedDetail = JSON.stringify(detailBody);
+  expect(serializedDetail).not.toContain(formId);
+  expect(serializedDetail).not.toContain(adminId);
+  expect(serializedDetail).not.toContain(
+    createdFormRecord.templateDraft.objectKey
+  );
+  expect(serializedDetail).not.toContain(templateDocumentKey);
+  const competingAdminEmail = `ticket-08-competing-${crypto.randomUUID()}@example.com`;
+  const competingAdmin = await createCredentialFixture({
+    email: competingAdminEmail,
+    name: "Ticket 08 Competing Admin",
+    password,
+    role: "admin",
+  });
+  const competingAdminBearer = await bearerFor(
+    competingAdminEmail,
+    password,
+    `ticket-08-competing-admin-${crypto.randomUUID()}`
+  );
+  const formCountBeforeUploadChecks = await prisma.form.count();
+  const uploadBytes = docxFixture(`ticket-08-upload-${crypto.randomUUID()}`);
+  const uploadTitle = `Ticket 08 upload ${crypto.randomUUID()}`;
+  const uploadResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: { bytes: uploadBytes, name: "template.docx" },
+      title: uploadTitle,
+    })
+  );
+  expect(uploadResponse.status).toBe(200);
+  const uploadBody = (await uploadResponse.json()) as {
+    form?: { publicId?: string };
+  };
+  const uploadPublicId = uploadBody.form?.publicId;
+  const uploadRecord = uploadPublicId
+    ? await prisma.form.findUnique({
+        include: { templateDraft: true },
+        where: { publicId: uploadPublicId },
+      })
+    : null;
+  if (!uploadPublicId || !uploadRecord?.templateDraft) {
+    throw new Error("The uploaded Template Draft was not created");
+  }
+  const uploadObjectKey = uploadRecord.templateDraft.objectKey;
+  const uploadEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${uploadPublicId}/editor-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(uploadEditorResponse.status).toBe(200);
+  const uploadEditor = (await uploadEditorResponse.json()) as EditorConfigBody;
+  const uploadLeaseId = uploadEditor.bridge.lease.id;
+  expect(await readObject(uploadObjectKey)).toEqual(uploadBytes);
+  expect(
+    await prisma.objectCleanupIntent.findUnique({
+      where: { objectKey: uploadObjectKey },
+    })
+  ).toBeNull();
+  const sameAdminOtherBearer = await bearerFor(
+    adminEmail,
+    password,
+    `ticket-08-same-admin-other-session-${crypto.randomUUID()}`
+  );
+  const sameAdminOtherSessionDeleteResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${uploadPublicId}`, {
+      headers: { Authorization: `Bearer ${sameAdminOtherBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(sameAdminOtherSessionDeleteResponse.status).toBe(409);
+  expect(await sameAdminOtherSessionDeleteResponse.json()).toMatchObject({
+    error: "editor_in_use",
+  });
+  const competingDeleteResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${uploadPublicId}`, {
+      headers: { Authorization: `Bearer ${competingAdminBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(competingDeleteResponse.status).toBe(409);
+  expect(await competingDeleteResponse.json()).toMatchObject({
+    error: "editor_in_use",
+  });
+  expect(
+    await prisma.form.findUnique({ where: { publicId: uploadPublicId } })
+  ).not.toBeNull();
+  expect(await objectExists(uploadObjectKey)).toBe(true);
+
+  const maximumUploadBytes = sizedDocxFixture(
+    `ticket-08-limit-${crypto.randomUUID()}`,
+    maxTemplateUploadBytes
+  );
+  const maximumUploadResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: maximumUploadBytes,
+        name: "maximum-size.docx",
+        type: "application/octet-stream",
+      },
+      title: `Ticket 08 maximum upload ${crypto.randomUUID()}`,
+    })
+  );
+  expect(maximumUploadResponse.status).toBe(200);
+  const maximumUploadBody = (await maximumUploadResponse.json()) as {
+    form?: { publicId?: string };
+  };
+  const maximumUploadPublicId = maximumUploadBody.form?.publicId;
+  expect(maximumUploadPublicId).toBeTruthy();
+
+  const oversizedUploadResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: new Uint8Array(maxTemplateUploadBytes + 1),
+        name: "too-large.docx",
+      },
+      title: "Ticket 08 oversized upload",
+    })
+  );
+  expect(oversizedUploadResponse.status).toBe(413);
+  expect(await oversizedUploadResponse.json()).toMatchObject({
+    error: "payload_too_large",
+  });
+  const nonDocxResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: docxFixture("wrong-extension"),
+        name: "template.pdf",
+      },
+      title: "Ticket 08 wrong upload type",
+    })
+  );
+  expect(nonDocxResponse.status).toBe(415);
+  expect(await nonDocxResponse.json()).toMatchObject({
+    error: "invalid_file_type",
+  });
+  const malformedDocxResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: new TextEncoder().encode("not a ZIP package"),
+        name: "malformed.docx",
+      },
+      title: "Ticket 08 malformed upload",
+    })
+  );
+  expect(malformedDocxResponse.status).toBe(422);
+  expect(await malformedDocxResponse.json()).toMatchObject({
+    error: "invalid_template",
+  });
+  const incompleteDocxResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: zipSync({
+          "word/document.xml": strToU8(
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>'
+          ),
+        }),
+        name: "incomplete.docx",
+      },
+      title: "Ticket 08 incomplete upload",
+    })
+  );
+  expect(incompleteDocxResponse.status).toBe(422);
+  expect(await incompleteDocxResponse.json()).toMatchObject({
+    error: "invalid_template",
+  });
+  const malformedXmlResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: docxXmlFixture({
+          document:
+            '<?xml version="1.0"?><word:document xmlns:word="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><word:body/></word:document><',
+        }),
+        name: "malformed-xml.docx",
+      },
+      title: "Ticket 08 malformed XML upload",
+    })
+  );
+  expect(malformedXmlResponse.status).toBe(422);
+  expect(await malformedXmlResponse.json()).toMatchObject({
+    error: "invalid_template",
+  });
+  const doctypeResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: docxXmlFixture({
+          document:
+            '<?xml version="1.0"?><!DOCTYPE word:document [<!ENTITY injected "value">]><word:document xmlns:word="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><word:body><word:p>&injected;</word:p></word:body></word:document>',
+        }),
+        name: "doctype.docx",
+      },
+      title: "Ticket 08 XML doctype upload",
+    })
+  );
+  expect(doctypeResponse.status).toBe(422);
+  expect(await doctypeResponse.json()).toMatchObject({
+    error: "invalid_template",
+  });
+  const declaredSecondaryXmlResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: docxXmlFixture({
+          additionalParts: {
+            "word/_rels/document.xml.rels": strToU8(
+              '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="header" Target="header.bin" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header"/></Relationships>'
+            ),
+            "word/header.bin": strToU8(
+              '<!DOCTYPE w:hdr [<!ENTITY injected "value">]><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">&injected;</w:hdr>'
+            ),
+          },
+          contentTypes: templateContentTypesXml.replace(
+            "</Types>",
+            '<Override PartName="/word/header.bin" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/></Types>'
+          ),
+          document:
+            '<?xml version="1.0"?><word:document xmlns:word="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><word:body/></word:document>',
+        }),
+        name: "declared-secondary-xml.docx",
+      },
+      title: "Ticket 08 declared secondary XML upload",
+    })
+  );
+  expect(declaredSecondaryXmlResponse.status).toBe(422);
+  expect(await declaredSecondaryXmlResponse.json()).toMatchObject({
+    error: "invalid_template",
+  });
+  const strictUploadResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: strictDocxFixture(`ticket-08-strict-${crypto.randomUUID()}`),
+        name: "strict.docx",
+      },
+      title: "Ticket 08 Strict OOXML upload",
+    })
+  );
+  const vmlDoctypeResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: docxXmlFixture({
+          additionalParts: {
+            "word/_rels/document.xml.rels": strToU8(
+              '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="vml" Target="drawings/vmlDrawing1.vml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing"/></Relationships>'
+            ),
+            "word/drawings/vmlDrawing1.vml": strToU8(
+              '<!DOCTYPE xml [<!ENTITY injected "value">]><xml xmlns:v="urn:schemas-microsoft-com:vml">&injected;</xml>'
+            ),
+          },
+          contentTypes: templateContentTypesXml.replace(
+            "</Types>",
+            '<Override PartName="/word/drawings/vmlDrawing1.vml" ContentType="application/vnd.openxmlformats-officedocument.vmlDrawing"/></Types>'
+          ),
+          document:
+            '<?xml version="1.0"?><word:document xmlns:word="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><word:body/></word:document>',
+        }),
+        name: "vml-doctype.docx",
+      },
+      title: "Ticket 08 VML doctype upload",
+    })
+  );
+  expect(vmlDoctypeResponse.status).toBe(422);
+  expect(await vmlDoctypeResponse.json()).toMatchObject({
+    error: "invalid_template",
+  });
+  expect(strictUploadResponse.status).toBe(200);
+  const strictUploadBody = (await strictUploadResponse.json()) as {
+    form?: { publicId?: string };
+  };
+  const strictUploadPublicId = strictUploadBody.form?.publicId;
+  if (!strictUploadPublicId) {
+    throw new Error("The Strict OOXML Template Draft was not created");
+  }
+  const strictDeleteResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${strictUploadPublicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(strictDeleteResponse.status).toBe(200);
+  const utf16UploadResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: utf16DocxFixture(),
+        name: "utf16.docx",
+      },
+      title: "Ticket 08 UTF-16 OOXML upload",
+    })
+  );
+  expect(utf16UploadResponse.status).toBe(200);
+  const utf16UploadBody = (await utf16UploadResponse.json()) as {
+    form?: { publicId?: string };
+  };
+  const utf16UploadPublicId = utf16UploadBody.form?.publicId;
+  if (!utf16UploadPublicId) {
+    throw new Error("The UTF-16 OOXML Template Draft was not created");
+  }
+  const utf16DeleteResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${utf16UploadPublicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(utf16DeleteResponse.status).toBe(200);
+  expect(await prisma.form.count()).toBe(formCountBeforeUploadChecks + 2);
+
+  const deleteUploadResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${uploadPublicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(deleteUploadResponse.status).toBe(200);
+  expect(await deleteUploadResponse.json()).toEqual({ deleted: true });
+  expect(
+    await prisma.form.findUnique({ where: { publicId: uploadPublicId } })
+  ).toBeNull();
+  expect(
+    await prisma.editorLease.findUnique({ where: { id: uploadLeaseId } })
+  ).toBeNull();
+  expect(await objectExists(uploadObjectKey)).toBe(false);
+  expect(
+    await prisma.objectCleanupIntent.findUnique({
+      where: { objectKey: uploadObjectKey },
+    })
+  ).toBeNull();
+
+  if (!maximumUploadPublicId) {
+    throw new Error("The maximum-sized Template Draft was not created");
+  }
+  const maximumUploadRecord = await prisma.form.findUnique({
+    include: { templateDraft: true },
+    where: { publicId: maximumUploadPublicId },
+  });
+  if (!maximumUploadRecord?.templateDraft) {
+    throw new Error("The maximum-sized Template Draft was not persisted");
+  }
+  const maximumUploadObjectKey = maximumUploadRecord.templateDraft.objectKey;
+  const deleteMaximumUploadResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${maximumUploadPublicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(deleteMaximumUploadResponse.status).toBe(200);
+  expect(await objectExists(maximumUploadObjectKey)).toBe(false);
+  expect(
+    await prisma.objectCleanupIntent.findUnique({
+      where: { objectKey: maximumUploadObjectKey },
+    })
+  ).toBeNull();
+
+  const adminEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/editor-config`,
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      }
+    )
   );
   expect(adminEditorResponse.status).toBe(200);
   const adminEditor = (await adminEditorResponse.json()) as EditorConfigBody;
@@ -441,6 +1063,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(adminEditorSerialized).not.toContain(adminBearer);
   expect(adminEditorSerialized).not.toContain('"authToken"');
   expect(JSON.stringify(adminEditor.config)).not.toContain(publishCapability);
+  expect(adminPluginOptions.publicId).toBe(formPublicId);
+  expect(adminPluginOptions).not.toHaveProperty("formId");
+  expect(adminEditorSerialized).not.toContain(formId);
   expect(adminEditor.bridge.id).toBe(adminPluginOptions.bridgeId);
   expect(adminEditor.bridge.pluginOrigin).toBe(
     new URL(process.env.API_BASE ?? "http://localhost:3000").origin
@@ -473,15 +1098,13 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   ).toBeLessThanOrEqual(1000);
 
-  const competingAdminBearer = await bearerFor(
-    adminEmail,
-    password,
-    `ticket-06-competing-admin-${crypto.randomUUID()}`
-  );
   const competingAdminEditorResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/editor-config`, {
-      headers: { Authorization: `Bearer ${competingAdminBearer}` },
-    })
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/editor-config`,
+      {
+        headers: { Authorization: `Bearer ${competingAdminBearer}` },
+      }
+    )
   );
   expect(competingAdminEditorResponse.status).toBe(409);
   expect(await competingAdminEditorResponse.json()).toMatchObject({
@@ -537,7 +1160,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   );
 
   const sessionOnlyAdminSaveResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
       body: JSON.stringify({ documentKey: templateDocumentKey }),
       headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
       method: "POST",
@@ -548,7 +1171,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     error: "editor_capability_required",
   });
   const sessionOnlyAdminPublishResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/publish`, {
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/publish`, {
       body: JSON.stringify({ documentKey: templateDocumentKey }),
       headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
       method: "POST",
@@ -564,7 +1187,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     "X-Editor-Capability": capability,
   });
   const crossActionResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
       body: JSON.stringify({ documentKey: templateDocumentKey }),
       headers: capabilityHeaders(publishCapability),
       method: "POST",
@@ -583,7 +1206,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     `${capabilitySignature[0] === "a" ? "b" : "a"}${capabilitySignature.slice(1)}`,
   ].join(".");
   const tamperedCapabilityResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/publish`, {
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/publish`, {
       body: JSON.stringify({ documentKey: templateDocumentKey }),
       headers: capabilityHeaders(tamperedPublishCapability),
       method: "POST",
@@ -607,7 +1230,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     targetType: publishClaims.targetType,
   });
   const expiredCapabilityResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/publish`, {
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/publish`, {
       body: JSON.stringify({ documentKey: templateDocumentKey }),
       headers: capabilityHeaders(expiredPublishCapability),
       method: "POST",
@@ -616,28 +1239,32 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(expiredCapabilityResponse.status).toBe(401);
 
   const secondCreateResponse = await app.handle(
-    new Request("http://test.local/api/admin/forms", {
-      body: JSON.stringify({ title: "Capability scope target" }),
-      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
-      method: "POST",
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "blank",
+      title: "Capability scope target",
     })
   );
   expect(secondCreateResponse.status).toBe(200);
   const secondCreatedForm = (await secondCreateResponse.json()) as {
-    form?: { id?: string; templateDocumentKey?: string };
+    form?: { publicId?: string };
   };
-  if (
-    !secondCreatedForm.form?.id ||
-    !secondCreatedForm.form.templateDocumentKey
-  ) {
+  const secondFormPublicId = secondCreatedForm.form?.publicId;
+  const secondFormRecord = secondFormPublicId
+    ? await prisma.form.findUnique({
+        include: { templateDraft: true },
+        where: { publicId: secondFormPublicId },
+      })
+    : null;
+  if (!secondFormPublicId || !secondFormRecord?.templateDraft) {
     throw new Error("The cross-target Form was not created");
   }
   const crossTargetResponse = await app.handle(
     new Request(
-      `http://test.local/api/admin/forms/${secondCreatedForm.form.id}/publish`,
+      `http://test.local/api/admin/forms/${secondFormPublicId}/publish`,
       {
         body: JSON.stringify({
-          documentKey: secondCreatedForm.form.templateDocumentKey,
+          documentKey: secondFormRecord.templateDraft.documentKey,
         }),
         headers: capabilityHeaders(publishCapability),
         method: "POST",
@@ -693,6 +1320,10 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(signedDocumentResponse.headers.get("content-type")).toBe(
     DOCX_CONTENT_TYPE
   );
+  const initialTemplateBytes = new Uint8Array(
+    await signedDocumentResponse.arrayBuffer()
+  );
+  expect(initialTemplateBytes.byteLength).toBeGreaterThan(0);
 
   const forbiddenPluginOriginResponse = await app.handle(
     new Request("http://test.local/onlyoffice-plugin/config.json", {
@@ -735,9 +1366,12 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   ).toBeNull();
 
   const competingAdminEditorAfterReleaseResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/editor-config`, {
-      headers: { Authorization: `Bearer ${competingAdminBearer}` },
-    })
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/editor-config`,
+      {
+        headers: { Authorization: `Bearer ${competingAdminBearer}` },
+      }
+    )
   );
   expect(competingAdminEditorAfterReleaseResponse.status).toBe(200);
   const competingAdminEditor =
@@ -750,7 +1384,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   }
   expect(competingLease.id).toBeTruthy();
   const releasedCapabilityResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
       body: JSON.stringify({ documentKey: templateDocumentKey }),
       headers: capabilityHeaders(saveTemplateCapability),
       method: "POST",
@@ -766,9 +1400,12 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     where: { id: competingLease.id },
   });
   const reclaimedAdminEditorResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/editor-config`, {
-      headers: { Authorization: `Bearer ${adminBearer}` },
-    })
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/editor-config`,
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      }
+    )
   );
   expect(reclaimedAdminEditorResponse.status).toBe(200);
   const reclaimedAdminEditor =
@@ -780,7 +1417,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     throw new Error("The reclaimed Admin editor capability was not returned");
   }
   const expiredCompetingCapabilityResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
       body: JSON.stringify({ documentKey: templateDocumentKey }),
       headers: capabilityHeaders(competingSaveTemplateCapability),
       method: "POST",
@@ -791,9 +1428,46 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     error: "editor_lease_inactive",
   });
   saveTemplateCapability = reclaimedSaveTemplateCapability;
+  const operationCountBeforeInvalidSaveBodies = await prisma.operation.count({
+    where: { formId },
+  });
+  const extraSaveFieldResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
+      body: JSON.stringify({
+        documentKey: templateDocumentKey,
+        unexpected: true,
+      }),
+      headers: capabilityHeaders(saveTemplateCapability),
+      method: "POST",
+    })
+  );
+  expect(extraSaveFieldResponse.status).toBe(400);
+  expect(await extraSaveFieldResponse.json()).toMatchObject({
+    error: "invalid_request",
+  });
+  const oversizedSaveBodyResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
+      body: JSON.stringify({
+        documentKey: templateDocumentKey,
+        padding: "x".repeat(8192),
+      }),
+      headers: capabilityHeaders(saveTemplateCapability),
+      method: "POST",
+    })
+  );
+  expect(oversizedSaveBodyResponse.status).toBe(413);
+  expect(await oversizedSaveBodyResponse.json()).toMatchObject({
+    error: "payload_too_large",
+  });
+  expect(await prisma.operation.count({ where: { formId } })).toBe(
+    operationCountBeforeInvalidSaveBodies
+  );
+  expect(await readObject(createdFormRecord.templateDraft.objectKey)).toEqual(
+    initialTemplateBytes
+  );
 
   const saveTemplateResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
       body: JSON.stringify({ documentKey: templateDocumentKey }),
       headers: capabilityHeaders(saveTemplateCapability),
       method: "POST",
@@ -825,11 +1499,18 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     }
   );
   expect(saveTemplateOperation.status).toBe("completed");
+  expect(saveTemplateOperation).toMatchObject({
+    result: { publicId: formPublicId },
+  });
+  expect(JSON.stringify(saveTemplateOperation)).not.toContain(formId);
 
   const refreshedAdminEditorResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/editor-config`, {
-      headers: { Authorization: `Bearer ${adminBearer}` },
-    })
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/editor-config`,
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      }
+    )
   );
   expect(refreshedAdminEditorResponse.status).toBe(200);
   const refreshedAdminEditor =
@@ -841,8 +1522,22 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     throw new Error("The refreshed Admin editor capability was not returned");
   }
   expect(activeTemplateDocumentKey).not.toBe(templateDocumentKey);
+  const reopenedDocumentUrl = refreshedAdminEditor.config.document.url;
+  const reopenedDocumentResponse = await app.handle(
+    new Request(reopenedDocumentUrl, {
+      headers: {
+        Authorization: createOnlyOfficeAuthorization({
+          url: reopenedDocumentUrl,
+        }),
+      },
+    })
+  );
+  expect(reopenedDocumentResponse.status).toBe(200);
+  expect(new Uint8Array(await reopenedDocumentResponse.arrayBuffer())).toEqual(
+    initialTemplateBytes
+  );
   const publishResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/publish`, {
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/publish`, {
       body: JSON.stringify({ documentKey: activeTemplateDocumentKey }),
       headers: capabilityHeaders(activePublishCapability),
       method: "POST",
@@ -870,6 +1565,35 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     "X-Editor-Capability": publishBody.operationCapability,
   });
   expect(publishOperation.status).toBe("completed");
+  expect(publishOperation).toMatchObject({
+    result: { publicId: formPublicId, version: 1 },
+  });
+  expect(JSON.stringify(publishOperation)).not.toContain(formId);
+  const publishedListResponse = await app.handle(
+    new Request("http://test.local/api/admin/forms", {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(publishedListResponse.status).toBe(200);
+  const publishedList = (await publishedListResponse.json()) as {
+    forms?: { publicId: string; status: string; version: number }[];
+  };
+  expect(
+    publishedList.forms?.find((form) => form.publicId === formPublicId)
+  ).toMatchObject({ status: "published", version: 1 });
+  const publishedDeleteResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(publishedDeleteResponse.status).toBe(409);
+  expect(await publishedDeleteResponse.json()).toMatchObject({
+    error: "form_not_draft",
+  });
+  expect(
+    await prisma.form.findUnique({ where: { publicId: formPublicId } })
+  ).not.toBeNull();
 
   const concurrentSaveCapability =
     refreshedAdminEditor.bridge.capabilities["save-template"];
@@ -903,14 +1627,14 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   });
   const concurrentSaveResponses = await Promise.all([
     deterministicApp.handle(
-      new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+      new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
         body: JSON.stringify({ documentKey: activeTemplateDocumentKey }),
         headers: capabilityHeaders(concurrentSaveCapability),
         method: "POST",
       })
     ),
     deterministicApp.handle(
-      new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+      new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
         body: JSON.stringify({ documentKey: activeTemplateDocumentKey }),
         headers: capabilityHeaders(concurrentSaveCapability),
         method: "POST",
@@ -963,6 +1687,25 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(await readObject(stableTemplateBeforeConcurrency.objectKey)).toEqual(
     stableTemplateBytes
   );
+  const retrySaveResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
+      body: JSON.stringify({ documentKey: activeTemplateDocumentKey }),
+      headers: capabilityHeaders(concurrentSaveCapability),
+      method: "POST",
+    })
+  );
+  expect(retrySaveResponse.status).toBe(202);
+  const retrySaveBody = (await retrySaveResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!retrySaveBody.operationCapability || !retrySaveBody.operationId) {
+    throw new Error("The retry template save operation was not created");
+  }
+  const retryOperation = await waitForOperation(retrySaveBody.operationId, {
+    "X-Editor-Capability": retrySaveBody.operationCapability,
+  });
+  expect(retryOperation.status).toBe("completed");
 
   const user = await createCredentialFixture({
     email: userEmail,
@@ -1007,7 +1750,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     },
   });
   const userDeleteFormResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}`, {
+    new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
       headers: { Authorization: `Bearer ${userBearer}` },
       method: "DELETE",
     })
@@ -1028,6 +1771,55 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   if (!responseId) {
     throw new Error("The response was not started");
   }
+  const draftCountListResponse = await app.handle(
+    new Request("http://test.local/api/admin/forms", {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(draftCountListResponse.status).toBe(200);
+  const draftCountList = (await draftCountListResponse.json()) as {
+    forms?: {
+      activeDraftCount: number;
+      publicId: string;
+      submissionCount: number;
+    }[];
+  };
+  expect(
+    draftCountList.forms?.find((form) => form.publicId === formPublicId)
+  ).toMatchObject({ activeDraftCount: 1, submissionCount: 0 });
+  const formLifecycleBeforeResponseGuard = await prisma.form.findUnique({
+    select: { status: true, version: true },
+    where: { id: formId },
+  });
+  if (!formLifecycleBeforeResponseGuard) {
+    throw new Error("The Form lifecycle guard baseline was not found");
+  }
+  await prisma.form.update({
+    data: { status: "draft", version: 0 },
+    where: { id: formId },
+  });
+  const responseProtectedDelete = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(responseProtectedDelete.status).toBe(409);
+  expect(await responseProtectedDelete.json()).toMatchObject({
+    error: "form_has_responses",
+  });
+  const responseProtectedTemplate = await prisma.templateDraft.findUnique({
+    select: { objectKey: true },
+    where: { formId },
+  });
+  expect(responseProtectedTemplate).not.toBeNull();
+  if (responseProtectedTemplate) {
+    expect(await objectExists(responseProtectedTemplate.objectKey)).toBe(true);
+  }
+  await prisma.form.update({
+    data: formLifecycleBeforeResponseGuard,
+    where: { id: formId },
+  });
 
   const editorResponse = await app.handle(
     new Request(
@@ -1230,6 +2022,22 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     "X-Editor-Capability": submitBody.operationCapability,
   });
   expect(submitOperation.status).toBe("completed");
+  const submittedCountListResponse = await app.handle(
+    new Request("http://test.local/api/admin/forms", {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(submittedCountListResponse.status).toBe(200);
+  const submittedCountList = (await submittedCountListResponse.json()) as {
+    forms?: {
+      activeDraftCount: number;
+      publicId: string;
+      submissionCount: number;
+    }[];
+  };
+  expect(
+    submittedCountList.forms?.find((form) => form.publicId === formPublicId)
+  ).toMatchObject({ activeDraftCount: 0, submissionCount: 1 });
   const ownerOperationVisibilityResponse = await app.handle(
     new Request(`http://test.local/api/operations/${submitBody.operationId}`, {
       headers: { Authorization: `Bearer ${userBearer}` },
@@ -1513,7 +2321,60 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     data: { createdAt: new Date(0), expiresAt: new Date(1) },
     where: { id: expiredLease.id },
   });
+  const cleanupIntentObjectKey = objectKey(
+    "cleanup-intents",
+    crypto.randomUUID(),
+    "orphan.docx"
+  );
+  await putObject(
+    cleanupIntentObjectKey,
+    docxFixture("ticket-08-cleanup-intent"),
+    DOCX_CONTENT_TYPE
+  );
+  await prisma.objectCleanupIntent.create({
+    data: { objectKey: cleanupIntentObjectKey },
+  });
+  expect(await objectExists(cleanupIntentObjectKey)).toBe(true);
+  const inFlightCleanupObjectKey = objectKey(
+    "cleanup-intents",
+    crypto.randomUUID(),
+    "in-flight.docx"
+  );
+  await putObject(
+    inFlightCleanupObjectKey,
+    docxFixture("ticket-08-in-flight-cleanup"),
+    DOCX_CONTENT_TYPE
+  );
+  await prisma.objectCleanupIntent.create({
+    data: {
+      cleanupAfter: new Date(Date.now() + 60_000),
+      objectKey: inFlightCleanupObjectKey,
+    },
+  });
   await reconcileRecoverableState();
+  expect(await objectExists(cleanupIntentObjectKey)).toBe(false);
+  expect(
+    await prisma.objectCleanupIntent.findUnique({
+      where: { objectKey: cleanupIntentObjectKey },
+    })
+  ).toBeNull();
+  expect(await objectExists(inFlightCleanupObjectKey)).toBe(true);
+  expect(
+    await prisma.objectCleanupIntent.findUnique({
+      where: { objectKey: inFlightCleanupObjectKey },
+    })
+  ).not.toBeNull();
+  await prisma.objectCleanupIntent.update({
+    data: { cleanupAfter: new Date(0) },
+    where: { objectKey: inFlightCleanupObjectKey },
+  });
+  await reconcileRecoverableState();
+  expect(await objectExists(inFlightCleanupObjectKey)).toBe(false);
+  expect(
+    await prisma.objectCleanupIntent.findUnique({
+      where: { objectKey: inFlightCleanupObjectKey },
+    })
+  ).toBeNull();
 
   expect(
     await prisma.operation.findUnique({
@@ -1576,16 +2437,21 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     },
   });
   const reclaimedAfterReconcileResponse = await app.handle(
-    new Request(`http://test.local/api/admin/forms/${formId}/editor-config`, {
-      headers: { Authorization: `Bearer ${adminBearer}` },
-    })
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/editor-config`,
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      }
+    )
   );
   expect(reclaimedAfterReconcileResponse.status).toBe(200);
   const reclaimedAfterReconcile =
     (await reclaimedAfterReconcileResponse.json()) as EditorConfigBody;
   expect(reclaimedAfterReconcile.bridge.lease.id).toBeTruthy();
 
-  const callbackDocument = new TextEncoder().encode("callback-docx");
+  const callbackDocument = docxFixture(
+    `ticket-08-callback-${crypto.randomUUID()}`
+  );
   const callbackDownloadPaths = new Set<string>();
   const callbackDocumentServer = Bun.serve({
     fetch(request) {
@@ -1605,7 +2471,10 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         });
       }
       if (url.pathname === "/large.docx") {
-        return new Response(new Uint8Array(17));
+        return new Response(new Uint8Array(callbackDocument.byteLength + 1));
+      }
+      if (url.pathname === "/malformed.docx") {
+        return new Response("not a DOCX package");
       }
       return new Response(callbackDocument, {
         headers: { "Content-Type": DOCX_CONTENT_TYPE },
@@ -1621,7 +2490,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
           Promise.resolve(new TextEncoder().encode("%PDF-test")),
         forceSave: () => Promise.resolve(false),
       },
-      onlyOfficeCallbackMaxBytes: 16,
+      onlyOfficeCallbackMaxBytes: callbackDocument.byteLength,
       onlyOfficeCallbackOrigins: [callbackOrigin],
     });
     const callbackAppReplica = createApp({
@@ -1630,7 +2499,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
           Promise.resolve(new TextEncoder().encode("%PDF-test")),
         forceSave: () => Promise.resolve(false),
       },
-      onlyOfficeCallbackMaxBytes: 16,
+      onlyOfficeCallbackMaxBytes: callbackDocument.byteLength,
       onlyOfficeCallbackOrigins: [callbackOrigin],
     });
     const createCallbackOperation =
@@ -1831,6 +2700,39 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         where: { id: oversizedDocumentOperation.id },
       })
     ).toEqual({ status: "failed" });
+    const templateBeforeMalformedSave = await prisma.templateDraft.findUnique({
+      select: { documentKey: true, objectKey: true },
+      where: { formId },
+    });
+    if (!templateBeforeMalformedSave) {
+      throw new Error("The Template Draft rollback baseline was not found");
+    }
+    const templateBytesBeforeMalformedSave = await readObject(
+      templateBeforeMalformedSave.objectKey
+    );
+    const malformedSaveOperation = await createCallbackOperation();
+    const malformedSaveResponse = await postCallback(
+      callbackPayload(
+        malformedSaveOperation,
+        `${callbackOrigin}/malformed.docx`
+      )
+    );
+    expect(await malformedSaveResponse.json()).toEqual({ error: 1 });
+    expect(
+      await prisma.operation.findUnique({
+        select: { status: true },
+        where: { id: malformedSaveOperation.id },
+      })
+    ).toEqual({ status: "failed" });
+    expect(
+      await prisma.templateDraft.findUnique({
+        select: { documentKey: true, objectKey: true },
+        where: { formId },
+      })
+    ).toEqual(templateBeforeMalformedSave);
+    expect(await readObject(templateBeforeMalformedSave.objectKey)).toEqual(
+      templateBytesBeforeMalformedSave
+    );
 
     const validCallbackResponse = await postCallback(trustedPayload);
     expect(await validCallbackResponse.json()).toEqual({ error: 0 });
@@ -1847,6 +2749,30 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       where: { operationId: trustOperation.id },
     });
     expect(consumedTrustClaim?.consumedAt).not.toBeNull();
+    const changedEditorResponse = await callbackApp.handle(
+      new Request(
+        `http://test.local/api/admin/forms/${formPublicId}/editor-config`,
+        { headers: { Authorization: `Bearer ${adminBearer}` } }
+      )
+    );
+    expect(changedEditorResponse.status).toBe(200);
+    const changedEditor =
+      (await changedEditorResponse.json()) as EditorConfigBody;
+    expect(JSON.stringify(changedEditor)).not.toContain(formId);
+    const changedDocumentUrl = changedEditor.config.document.url;
+    const changedDocumentResponse = await callbackApp.handle(
+      new Request(changedDocumentUrl, {
+        headers: {
+          Authorization: createOnlyOfficeAuthorization({
+            url: changedDocumentUrl,
+          }),
+        },
+      })
+    );
+    expect(changedDocumentResponse.status).toBe(200);
+    expect(Buffer.from(await changedDocumentResponse.arrayBuffer())).toEqual(
+      Buffer.from(callbackDocument)
+    );
 
     const concurrentCallbackOperation = await createCallbackOperation();
     const concurrentCallbackPayload = callbackPayload(
@@ -1888,7 +2814,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     ).toEqual(concurrentCallbackState);
 
     expect(callbackDownloadPaths).toEqual(
-      new Set(["/large.docx", "/ok.docx", "/redirect.docx"])
+      new Set(["/large.docx", "/malformed.docx", "/ok.docx", "/redirect.docx"])
     );
   } finally {
     callbackDocumentServer.stop(true);
@@ -2676,6 +3602,88 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         event.outcome === "failure" &&
         (event.safeMetadata as Record<string, unknown> | null)?.errorCode ===
           "invalid_request"
+    )
+  ).toBe(true);
+  const formAuditEvents = await prisma.auditEvent.findMany({
+    orderBy: { createdAt: "asc" },
+    where: { targetType: "form" },
+  });
+  const formAuditText = JSON.stringify(formAuditEvents);
+  for (const secret of [
+    adminBearer,
+    competingAdminBearer,
+    secretFormTitle,
+    secretFormDescription,
+    templateDocumentKey,
+    createdFormRecord.templateDraft.objectKey,
+    publishCapability,
+    saveTemplateCapability,
+  ]) {
+    expect(formAuditText).not.toContain(secret);
+  }
+  for (const event of formAuditEvents) {
+    const metadata =
+      event.safeMetadata &&
+      typeof event.safeMetadata === "object" &&
+      !Array.isArray(event.safeMetadata)
+        ? (event.safeMetadata as Record<string, unknown>)
+        : null;
+    expect(
+      Object.keys(metadata ?? {}).every(
+        (key) => key === "errorCode" || key === "source"
+      )
+    ).toBe(true);
+  }
+  for (const expected of [
+    {
+      action: "create_form",
+      outcome: "success",
+      targetId: formPublicId,
+    },
+    {
+      action: "create_form",
+      outcome: "failure",
+      targetId: null,
+    },
+    {
+      action: "delete_form",
+      outcome: "success",
+      targetId: uploadPublicId,
+    },
+    {
+      action: "delete_form",
+      outcome: "failure",
+      targetId: formPublicId,
+    },
+    {
+      action: "save_template_draft",
+      outcome: "success",
+      targetId: formPublicId,
+    },
+    {
+      action: "save_template_draft",
+      outcome: "failure",
+      targetId: formPublicId,
+    },
+  ] as const) {
+    expect(
+      formAuditEvents.some(
+        (event) =>
+          event.action === expected.action &&
+          event.outcome === expected.outcome &&
+          event.targetId === expected.targetId
+      )
+    ).toBe(true);
+  }
+  expect(
+    formAuditEvents.some(
+      (event) =>
+        event.action === "delete_form" &&
+        event.actorId === competingAdmin.id &&
+        event.outcome === "failure" &&
+        event.targetId === uploadPublicId &&
+        (event.safeMetadata as Record<string, unknown> | null)?.errorCode ===
+          "editor_in_use"
     )
   ).toBe(true);
 });

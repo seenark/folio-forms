@@ -1,16 +1,17 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 
-import { Notice, Spinner } from "@/components/ui";
-import { API_ORIGIN, apiGet, apiPost } from "@/lib/api";
+import { Button, Notice, Spinner } from "@/components/ui";
+import { ApiError, API_ORIGIN, apiDelete, apiGet, apiPost } from "@/lib/api";
 
 type EditorAction = "save-template" | "publish" | "save-draft" | "submit";
 type EditorOperationStatus = "pending" | "completed" | "failed";
+export type OnlyOfficeEditorState = "loading" | "ready" | "blocked" | "error";
 
 interface EditorLease {
   id: string;
   expiresAt: string;
-  renewUrl: string;
   releaseUrl: string;
+  renewUrl: string;
 }
 
 const leaseRenewalIntervalMs = 30_000;
@@ -175,26 +176,77 @@ declare global {
 export const OnlyOfficeEditor = ({
   configUrl,
   onBridgeMessage,
+  onStateChange,
+  revision = 0,
   title,
 }: {
   configUrl?: string;
   onBridgeMessage?: (message: EditorBridgeMessage) => void | Promise<void>;
+  onStateChange?: (state: OnlyOfficeEditorState) => void;
+  revision?: number;
   title: string;
 }) => {
   const hostRef = useRef<HTMLDivElement>(null);
+  const feedbackRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<{ destroyEditor?: () => void } | null>(null);
   const onBridgeMessageRef = useRef(onBridgeMessage);
+  const onStateChangeRef = useRef(onStateChange);
   const pinnedSourceRef = useRef<MessageEventSource | null>(null);
   const terminalOperationIdsRef = useRef(new Set<string>());
   const editorId = useId().replaceAll(":", "");
   const leaseRef = useRef<EditorLease | null>(null);
+  const loadedConfigUrlRef = useRef<string | null>(null);
   const [config, setConfig] = useState<EditorConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [editorState, setEditorState] =
+    useState<OnlyOfficeEditorState>("loading");
+  const [retryToken, setRetryToken] = useState(0);
+
+  const reportState = useCallback((nextState: OnlyOfficeEditorState) => {
+    setEditorState(nextState);
+    onStateChangeRef.current?.(nextState);
+  }, []);
+
+  const releaseCurrentLease = useCallback(async (): Promise<void> => {
+    const lease = leaseRef.current;
+    leaseRef.current = null;
+    if (!lease) {
+      return;
+    }
+    try {
+      await apiDelete(lease.releaseUrl);
+    } catch {
+      // Lease expiry remains the fallback if best-effort release is unavailable.
+    }
+  }, []);
 
   useEffect(() => {
-    const lease = configUrl ? config?.bridge?.lease : undefined;
+    if (
+      leaseRef.current &&
+      loadedConfigUrlRef.current !== (configUrl ?? null)
+    ) {
+      void releaseCurrentLease();
+    }
+  }, [configUrl, releaseCurrentLease]);
+
+  useEffect(
+    () => () => {
+      void releaseCurrentLease();
+    },
+    [releaseCurrentLease]
+  );
+  useEffect(() => {
+    if (editorState === "blocked" || editorState === "error") {
+      feedbackRef.current?.focus();
+    }
+  }, [editorState]);
+
+  useEffect(() => {
+    const lease =
+      loadedConfigUrlRef.current === (configUrl ?? null)
+        ? config?.bridge?.lease
+        : undefined;
     if (!lease) {
-      leaseRef.current = null;
       return;
     }
 
@@ -234,43 +286,59 @@ export const OnlyOfficeEditor = ({
     return () => {
       cancelled = true;
       window.clearInterval(renewalTimer);
-      if (leaseRef.current?.id === lease.id) {
-        leaseRef.current = null;
-      }
+      // Preserve the lease reference across a same-document config refresh.
     };
   }, [config, configUrl]);
 
   useEffect(() => {
     onBridgeMessageRef.current = onBridgeMessage;
-  }, [onBridgeMessage]);
+    onStateChangeRef.current = onStateChange;
+  }, [onBridgeMessage, onStateChange]);
 
   useEffect(() => {
+    let cancelled = false;
     if (!configUrl) {
-      return;
+      setConfig(null);
+      setError("ไม่มีการตั้งค่าตัวแก้ไขเอกสาร");
+      reportState("error");
+      return () => {
+        cancelled = true;
+      };
     }
 
-    let cancelled = false;
     const path = configUrl.startsWith("http")
       ? configUrl.replace(API_ORIGIN, "")
       : configUrl;
+    loadedConfigUrlRef.current = null;
+    setConfig(null);
+    setError(null);
+    reportState("loading");
 
     const loadConfig = async () => {
-      setConfig(null);
-      setError(null);
-
       try {
         const nextConfig = await apiGet<EditorConfig>(path);
-        if (!cancelled) {
-          setConfig(nextConfig);
+        if (cancelled) {
+          return;
+        }
+        loadedConfigUrlRef.current = configUrl;
+        setConfig(nextConfig);
+        if (nextConfig.editorUrl) {
+          reportState("ready");
         }
       } catch (caughtError) {
-        if (!cancelled) {
-          setError(
-            caughtError instanceof Error
-              ? caughtError.message
-              : "Could not prepare the document editor."
-          );
+        if (cancelled) {
+          return;
         }
+        if (
+          caughtError instanceof ApiError &&
+          caughtError.code === "editor_in_use"
+        ) {
+          setError(null);
+          reportState("blocked");
+          return;
+        }
+        setError("ไม่สามารถโหลดตัวแก้ไขเอกสารได้ กรุณาลองใหม่อีกครั้ง");
+        reportState("error");
       }
     };
 
@@ -278,7 +346,13 @@ export const OnlyOfficeEditor = ({
     return () => {
       cancelled = true;
     };
-  }, [configUrl]);
+  }, [configUrl, reportState, retryToken, revision]);
+
+  useEffect(() => {
+    if (editorState === "blocked" || editorState === "error") {
+      feedbackRef.current?.focus();
+    }
+  }, [editorState]);
 
   useEffect(() => {
     if (!config) {
@@ -294,11 +368,13 @@ export const OnlyOfficeEditor = ({
       !pluginOrigin
     ) {
       if (!config.editorUrl) {
-        setError("The document editor bridge configuration is invalid.");
+        setError("การตั้งค่าตัวแก้ไขเอกสารไม่ถูกต้อง");
+        reportState("error");
       }
       return;
     }
     let cancelled = false;
+    let mountedHost: HTMLDivElement | null = null;
 
     const scriptUrl =
       config.apiScriptUrl ??
@@ -339,7 +415,7 @@ export const OnlyOfficeEditor = ({
     const renewCapability = async (request: CapabilityRequestMessage) => {
       if (!configUrl) {
         respondToCapabilityRequest(request, {
-          error: "Editor capability unavailable.",
+          error: "ไม่พบสิทธิ์สำหรับตัวแก้ไขเอกสาร",
         });
         return;
       }
@@ -365,7 +441,7 @@ export const OnlyOfficeEditor = ({
         const capability = fresh.bridge?.capabilities?.[request.action];
         if (typeof capability !== "string" || !capability) {
           respondToCapabilityRequest(request, {
-            error: "Editor capability unavailable.",
+            error: "ไม่พบสิทธิ์สำหรับตัวแก้ไขเอกสาร",
           });
           return;
         }
@@ -373,7 +449,7 @@ export const OnlyOfficeEditor = ({
       } catch {
         if (!cancelled) {
           respondToCapabilityRequest(request, {
-            error: "Editor capability unavailable.",
+            error: "ไม่สามารถยืนยันสิทธิ์ตัวแก้ไขเอกสารได้",
           });
         }
       }
@@ -441,7 +517,8 @@ export const OnlyOfficeEditor = ({
     }
 
     if (!isRecord(config.config)) {
-      setError("The document editor configuration is invalid.");
+      setError("การตั้งค่าตัวแก้ไขเอกสารไม่ถูกต้อง");
+      reportState("error");
       return () => {
         cancelled = true;
         window.removeEventListener("message", handleBridgeMessage);
@@ -455,17 +532,24 @@ export const OnlyOfficeEditor = ({
         return;
       }
       if (!window.DocsAPI || !hostRef.current) {
-        setError(
-          "The document editor is unavailable. Check that ONLYOFFICE is running."
-        );
+        setError("ไม่สามารถเปิดตัวแก้ไขเอกสารได้ กรุณาตรวจสอบบริการ ONLYOFFICE");
+        reportState("error");
         return;
       }
 
+      const host = hostRef.current;
+      const placeholder = document.createElement("div");
+      placeholder.id = editorId;
+      placeholder.className = "h-full w-full";
+      host.replaceChildren(placeholder);
+      mountedHost = host;
       editorRef.current = new window.DocsAPI.DocEditor(editorId, editorConfig);
+      reportState("ready");
     };
     const handleScriptError = () => {
       if (!cancelled) {
-        setError("Could not load ONLYOFFICE. Check the local service.");
+        setError("ไม่สามารถโหลดตัวแก้ไขเอกสารได้ กรุณาลองใหม่อีกครั้ง");
+        reportState("error");
       }
     };
 
@@ -486,26 +570,71 @@ export const OnlyOfficeEditor = ({
       cancelled = true;
       window.removeEventListener("message", handleBridgeMessage);
       pinnedSourceRef.current = null;
-      editorRef.current?.destroyEditor?.();
+      const editor = editorRef.current;
       editorRef.current = null;
+      try {
+        editor?.destroyEditor?.();
+      } finally {
+        mountedHost?.replaceChildren();
+      }
     };
-  }, [config, configUrl, editorId]);
+  }, [config, configUrl, editorId, reportState]);
 
-  if (error) {
+  const retry = () => {
+    setError(null);
+    setConfig(null);
+    reportState("loading");
+    setRetryToken((value) => value + 1);
+  };
+
+  if (editorState === "blocked") {
     return (
-      <div className="grid min-h-[520px] place-items-center p-8">
-        <Notice tone="danger">{error}</Notice>
+      <div
+        ref={feedbackRef}
+        className="grid min-h-[520px] place-items-center p-8"
+        tabIndex={-1}
+      >
+        <Notice tone="danger">
+          <div className="space-y-3">
+            <p className="font-semibold">เอกสารนี้กำลังถูกแก้ไขโดยผู้ใช้รายอื่น</p>
+            <p>ยังไม่เปิดตัวแก้ไขจนกว่าจะเชื่อมต่อใหม่ได้</p>
+            <Button type="button" variant="secondary" onClick={retry}>
+              ลองเชื่อมต่อใหม่
+            </Button>
+          </div>
+        </Notice>
+      </div>
+    );
+  }
+
+  if (editorState === "error" || error) {
+    return (
+      <div
+        ref={feedbackRef}
+        className="grid min-h-[520px] place-items-center p-8"
+        tabIndex={-1}
+      >
+        <Notice tone="danger">
+          <div className="space-y-3">
+            <p>{error ?? "ไม่สามารถเปิดตัวแก้ไขเอกสารได้"}</p>
+            <Button type="button" variant="secondary" onClick={retry}>
+              ลองใหม่
+            </Button>
+          </div>
+        </Notice>
       </div>
     );
   }
 
   if (!config) {
     return (
-      <div className="grid min-h-[520px] place-items-center gap-3 p-8 text-center">
+      <div
+        className="grid min-h-[520px] place-items-center gap-3 p-8 text-center"
+        aria-busy="true"
+        role="status"
+      >
         <Spinner />
-        <p className="text-sm text-[var(--ink-soft)]">
-          Preparing your document editor…
-        </p>
+        <p className="text-sm text-[var(--ink-soft)]">กำลังเตรียมตัวแก้ไขเอกสาร…</p>
       </div>
     );
   }
@@ -522,12 +651,7 @@ export const OnlyOfficeEditor = ({
 
   return (
     <div className="h-[min(72vh,760px)] min-h-[520px] w-full">
-      <div
-        ref={hostRef}
-        id={editorId}
-        className="h-full w-full"
-        aria-label={title}
-      />
+      <div ref={hostRef} className="h-full w-full" aria-label={title} />
     </div>
   );
 };

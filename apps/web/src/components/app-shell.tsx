@@ -76,7 +76,7 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
           <nav
             id="main-navigation"
             className={`${open ? "absolute inset-x-0 top-[73px] z-10 flex border-b border-[var(--line)] bg-[var(--paper)] p-5" : "hidden"} flex-col gap-2 lg:static lg:flex lg:flex-row lg:items-center lg:border-0 lg:bg-transparent lg:p-0`}
-            aria-label="Main navigation"
+            aria-label="เมนูหลัก"
           >
             {role === "admin" ? (
               <>
@@ -91,7 +91,7 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
                   aria-current={formsAreActive ? "page" : undefined}
                   onClick={() => setOpen(false)}
                 >
-                  Forms
+                  แบบฟอร์ม
                 </Link>
                 <Link
                   to="/admin/users"
@@ -110,7 +110,7 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
                   onClick={() => setOpen(false)}
                 >
                   <FilePlus2 className="mr-1 inline" size={15} />
-                  New form
+                  สร้างแบบฟอร์ม
                 </Link>
               </>
             ) : (

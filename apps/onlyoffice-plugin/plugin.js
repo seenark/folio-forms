@@ -942,12 +942,11 @@ function normalizeRuntimeOptions() {
     apiBase: firstString(options.apiBase)?.replace(/\/+$/, ""),
     bridgeId: firstString(options.bridgeId),
     documentKey: firstString(options.documentKey),
-    formId: firstString(options.formId, options.publicId),
     operationCapability: firstString(options.operationCapability),
     operationId: firstString(options.operationId),
     parentOrigin: firstString(options.parentOrigin),
     prefill: normalizePrefill(options),
-    publicId: firstString(options.publicId, options.formId),
+    publicId: firstString(options.publicId),
     responseId: firstString(options.responseId),
   };
 }
@@ -1076,15 +1075,15 @@ function actionRequest(action, data) {
   const documentKey = requireOption(runtimeOptions.documentKey, "documentKey");
 
   if (action === ACTIONS.SAVE_TEMPLATE || action === ACTIONS.PUBLISH) {
-    const formId = encodeURIComponent(
-      requireOption(runtimeOptions.formId, "formId")
+    const publicId = encodeURIComponent(
+      requireOption(runtimeOptions.publicId, "publicId")
     );
 
     return {
       body: {
         documentKey,
       },
-      path: `${API_ROUTES.ADMIN_FORMS}/${formId}/${
+      path: `${API_ROUTES.ADMIN_FORMS}/${publicId}/${
         action === ACTIONS.SAVE_TEMPLATE ? "save" : "publish"
       }`,
     };

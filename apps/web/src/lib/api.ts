@@ -64,23 +64,21 @@ export interface AdminUserCredentialResponse extends AdminUserMutationResponse {
   temporaryPassword: string;
 }
 
+export type FormStatus = "draft" | "published" | "archived";
 export interface FormSummary {
-  id: string;
-  publicId?: string;
+  publicId: string;
   title: string;
-  description?: string;
-  status?: string;
-  updatedAt?: string;
-  publishedAt?: string;
-  submissionCount?: number;
-  activeDraftCount?: number;
+  description: string;
+  status: FormStatus;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  hasTemplateDraft: boolean;
+  activeDraftCount: number;
+  submissionCount: number;
 }
 export type FormDetail = FormSummary & {
-  templateDocumentKey?: string;
-  publishedDocumentKey?: string;
-  editorUrl?: string;
-  editorConfigUrl?: string;
-  editorConfig?: Record<string, unknown>;
+  editorConfigUrl: string;
 };
 export interface Submission {
   id: string;
@@ -106,7 +104,7 @@ export const formatDate = (value: string | Date | undefined) => {
   const date = value instanceof Date ? value : new Date(value);
   return Number.isNaN(date.getTime())
     ? "—"
-    : new Intl.DateTimeFormat("en", {
+    : new Intl.DateTimeFormat("th-TH", {
         dateStyle: "medium",
       }).format(date);
 };
@@ -215,7 +213,12 @@ export const safeReturnPath = (value: unknown): string | null => {
 
 const request = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
   const headers = new Headers(init.headers);
-  headers.set("Content-Type", "application/json");
+  if (
+    !(typeof FormData !== "undefined" && init.body instanceof FormData) &&
+    !headers.has("Content-Type")
+  ) {
+    headers.set("Content-Type", "application/json");
+  }
   const token = getToken();
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
@@ -252,6 +255,12 @@ export const apiPost = <T>(
     headers: editorCapability
       ? { "X-Editor-Capability": editorCapability }
       : undefined,
+    method: "POST",
+  });
+
+export const apiPostFormData = <T>(path: string, body: FormData) =>
+  request<T>(path, {
+    body,
     method: "POST",
   });
 export const apiPatch = <T>(path: string, body?: unknown) =>

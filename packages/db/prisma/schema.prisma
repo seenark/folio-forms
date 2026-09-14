@@ -493,6 +493,16 @@ model EditorLease {
   @@map("editor_leases")
 }
 
+model ObjectCleanupIntent {
+  id           String   @id @default(uuid()) @db.Uuid
+  objectKey    String   @unique @map("object_key")
+  cleanupAfter DateTime @default(now()) @map("cleanup_after") @db.Timestamptz(3)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([cleanupAfter, createdAt])
+  @@map("object_cleanup_intents")
+}
+
 model AuditEvent {
   id           String       @id @default(uuid()) @db.Uuid
   actorId      String?      @map("actor_id")

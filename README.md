@@ -162,13 +162,16 @@ Each privileged account attempt appends an immutable Audit Event with its actor,
 ### Admin workflow
 
 1. Sign in with an Admin account.
-2. Select **New form** and enter a title and description.
-3. Open the DOCX editor.
-4. Add tagged content controls to the template.
-5. Use the ONLYOFFICE **Form** tab to select **Save Template**.
-6. Select **Publish** when the template is ready.
-7. Copy the generated share link.
-8. Review submitted responses from the form's **View submissions** page.
+2. Select **New form**, enter a title and description, then choose the bundled starter DOCX or upload a `.docx` no larger than 25 MiB.
+3. The API validates the file type, size, and required DOCX package parts before creating the Form.
+4. Open the leased DOCX editor. A second Admin sees a blocked, non-editable state until the active lease is released or expires.
+5. Add tagged content controls to the template.
+6. Select **Save Template** and wait for its Operation. A completed save is the exact Draft reopened later; a failed save leaves the prior Draft available for retry.
+7. Select **Publish** when the template is ready.
+8. Copy the generated share link.
+9. Review submitted responses from the form's **View submissions** page.
+
+The Admin Form list shows lifecycle state plus active Draft and Submission counts without exposing database IDs or RustFS object keys. Only a never-published Draft with no Response data can be hard-deleted; deletion removes its Template Draft objects. Create, save, and delete outcomes append attributable, secret-free Form Audit Events.
 
 Publishing:
 
@@ -220,7 +223,7 @@ The plugin applies prefill through ONLYOFFICE's command API, then restricts resp
 - Better Auth `User`, `Session`, `Account`, and `Verification` models.
 - Forms, Template Drafts, immutable Published Templates, Field Manifests, and Prefill Configuration.
 - One Response per User/Form, immutable Submissions, Prefill snapshots, and append-only Corrections.
-- Handoffs, pending claims, Operations, callback claims, and Editor Leases.
+- Handoffs, pending claims, Operations, callback claims, Editor Leases, and durable Object Cleanup Intents.
 - immutable Audit Events, login-failure windows, and Deletion Tombstones.
 
 Database constraints enforce:
@@ -242,6 +245,8 @@ responses/<responseId>/draft/<uuid>/docx
 submissions/<submissionId>/filled/<uuid>/docx
 operations/<operationId>/<kind>/<uuid>/docx
 ```
+
+Form creation and hard deletion record Object Cleanup Intents before an object can become unreachable. A committed create clears its intent atomically with the canonical database reference; a new create has a 15-minute in-flight grace so another server cannot clean it prematurely. Failed RustFS deletion leaves the intent durable, and startup plus minute reconciliation retries eligible cleanup.
 
 - Better Auth handles email/password sign-in and PostgreSQL-backed sessions.
 - Sessions use opaque Better Auth tokens, not JWTs.
@@ -316,14 +321,14 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/admin/forms` | List forms with submission counts |
-| `DELETE` | `/api/admin/forms/:id` | Remove a draft form without responses |
-| `POST` | `/api/admin/forms` | Create a form from the configured template |
-| `GET` | `/api/admin/forms/:id` | Read form detail and draft count |
-| `GET` | `/api/admin/forms/:id/editor-config` | Get template editor config |
-| `POST` | `/api/admin/forms/:id/save` | Save the template draft |
-| `POST` | `/api/admin/forms/:id/publish` | Publish a validated template |
-| `GET` | `/api/admin/forms/:id/submissions` | List all submissions for a form |
+| `GET` | `/api/admin/forms` | List lifecycle state plus active Draft and Submission counts |
+| `DELETE` | `/api/admin/forms/:publicId` | Remove a never-published Draft without Response data |
+| `POST` | `/api/admin/forms` | Create from the starter or an uploaded validated DOCX |
+| `GET` | `/api/admin/forms/:publicId` | Read safe form detail and counts |
+| `GET` | `/api/admin/forms/:publicId/editor-config` | Claim the exclusive lease and get template editor config |
+| `POST` | `/api/admin/forms/:publicId/save` | Save the Template Draft through an asynchronous Operation |
+| `POST` | `/api/admin/forms/:publicId/publish` | Publish a validated template |
+| `GET` | `/api/admin/forms/:publicId/submissions` | List all submissions for a form |
 
 ### Submission artifacts
 
@@ -350,9 +355,9 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 | `/` | Authenticated | Redirect Admin to `/admin`, User to `/dashboard` |
 | `/login` | Public | Sign in and preserve a safe return path |
 | `/dashboard` | User | View and resume responses |
-| `/admin` | Admin | View forms, remove draft forms, and submission counts |
-| `/admin/forms/new` | Admin | Create a form |
-| `/admin/forms/:formId` | Admin | Edit, save, publish, and share a template |
+| `/admin` | Admin | View lifecycle state and Draft/Submission counts; remove eligible Draft forms |
+| `/admin/forms/new` | Admin | Create from the starter or upload a validated DOCX |
+| `/admin/forms/:formId` | Admin | Edit under an exclusive lease, save, publish, and share a template |
 | `/admin/forms/:formId/submissions` | Admin | Review form submissions |
 | `/admin/forms/:formId/submissions/:submissionId` | Admin | Read a submission and download artifacts |
 | `/forms/:publicId/fill` | Authenticated | Fill, save, or submit a shared form |

@@ -16,62 +16,154 @@ import {
   Save,
   Send,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-import type { EditorBridgeMessage } from "@/components/onlyoffice-editor";
+import type {
+  EditorBridgeMessage,
+  OnlyOfficeEditorState,
+} from "@/components/onlyoffice-editor";
 import { OnlyOfficeEditor } from "@/components/onlyoffice-editor";
-import { Button, Notice, Spinner, Badge } from "@/components/ui";
-import { apiGet, apiPost, waitForOperation } from "@/lib/api";
-import type { FormDetail } from "@/lib/api";
+import { Badge, Button, Notice, Spinner } from "@/components/ui";
+import { ApiError, apiGet, apiPost, waitForOperation } from "@/lib/api";
+import type { FormDetail, FormSummary } from "@/lib/api";
 
-type FormDetailResponse =
-  | { editorConfigUrl?: string; form: FormDetail }
-  | FormDetail;
+interface FormDetailResponse {
+  editorConfigUrl: string;
+  form: FormSummary;
+}
+
 interface AdminEditorConfig {
   bridge?: {
     capabilities?: Partial<Record<"publish" | "save-template", string>>;
   };
+  config?: {
+    document?: {
+      key?: unknown;
+    };
+  };
 }
 
-const loadFormDetail = async (formId: string): Promise<FormDetail> => {
-  const payload = await apiGet<FormDetailResponse>(
-    `/api/admin/forms/${formId}`
-  );
-  return "form" in payload
-    ? {
-        ...payload.form,
-        editorConfigUrl:
-          payload.editorConfigUrl ?? payload.form.editorConfigUrl,
+type OperationViewStatus = "pending" | "processing" | "completed" | "failed";
+
+const formStatusDetails = {
+  archived: { label: "เก็บถาวร", tone: "neutral" as const },
+  draft: { label: "ร่าง", tone: "warning" as const },
+  published: { label: "เผยแพร่แล้ว", tone: "success" as const },
+};
+
+const detailErrorMessage = (caughtError: unknown, fallback: string): string => {
+  if (caughtError instanceof ApiError) {
+    switch (caughtError.code) {
+      case "editor_in_use": {
+        return "เอกสารนี้กำลังถูกแก้ไขโดยผู้ใช้รายอื่น กรุณารอแล้วลองใหม่";
       }
-    : payload;
+      case "document_unavailable": {
+        return "ยังไม่มีเอกสารต้นแบบสำหรับแก้ไข กรุณาตรวจสอบต้นแบบของแบบฟอร์ม";
+      }
+      case "stale_document": {
+        return "เอกสารมีการเปลี่ยนแปลงแล้ว กรุณาลองใหม่เพื่อใช้เอกสารปัจจุบัน";
+      }
+      case "editor_lease_inactive": {
+        return "เซสชันตัวแก้ไขหมดอายุ กรุณาลองใหม่";
+      }
+      case "operation_in_progress": {
+        return "มีการดำเนินการกับเอกสารอยู่แล้ว กรุณารอแล้วลองใหม่";
+      }
+      case "not_found": {
+        return "ไม่พบแบบฟอร์มนี้ อาจถูกลบไปแล้ว";
+      }
+      case "unauthorized": {
+        return "เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่";
+      }
+      case "password_change_required": {
+        return "กรุณาเปลี่ยนรหัสผ่านก่อนแก้ไขแบบฟอร์ม";
+      }
+      default: {
+        break;
+      }
+    }
+  }
+  return fallback;
+};
+
+const loadFormDetail = async (publicId: string): Promise<FormDetail> => {
+  const payload = await apiGet<FormDetailResponse>(
+    `/api/admin/forms/${publicId}`
+  );
+  return {
+    ...payload.form,
+    editorConfigUrl: payload.editorConfigUrl,
+  };
 };
 
 const FormEditorRoute = () => {
-  const { formId } = useParams({ from: "/admin/forms/$formId" });
+  const { formId: publicId } = useParams({
+    from: "/admin/forms/$formId",
+  });
   const navigate = useNavigate();
   const [form, setForm] = useState<FormDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [busy, setBusy] = useState<"save" | "publish" | null>(null);
   const [copied, setCopied] = useState(false);
   const [publishPrompt, setPublishPrompt] = useState(false);
+  const [editorState, setEditorState] =
+    useState<OnlyOfficeEditorState>("loading");
+  const [operationStatus, setOperationStatus] =
+    useState<OperationViewStatus | null>(null);
+  const [editorRevision, setEditorRevision] = useState(0);
+  const [reloadToken, setReloadToken] = useState(0);
+  const busyGuardRef = useRef(false);
+  const feedbackRef = useRef<HTMLDivElement>(null);
+  const restorePublishFocusRef = useRef(false);
+  useEffect(() => {
+    if (!publishPrompt) {
+      if (restorePublishFocusRef.current) {
+        restorePublishFocusRef.current = false;
+        document.querySelector<HTMLElement>("#publish-trigger")?.focus();
+      }
+      return;
+    }
+    document.querySelector<HTMLElement>("#publish-cancel")?.focus();
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        restorePublishFocusRef.current = true;
+        setPublishPrompt(false);
+      }
+    };
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [publishPrompt]);
+
+  useEffect(() => {
+    if (error || notice || operationStatus === "pending") {
+      feedbackRef.current?.focus();
+    }
+  }, [error, notice, operationStatus]);
 
   useEffect(() => {
     let cancelled = false;
+    setLoading(true);
+    setForm(null);
+    setError(null);
+    setNotice(null);
+    setOperationStatus(null);
+    setEditorState("loading");
+
     const loadForm = async () => {
       try {
-        const payload = await loadFormDetail(formId);
-        if (cancelled) {
-          return;
+        const payload = await loadFormDetail(publicId);
+        if (!cancelled) {
+          setForm(payload);
         }
-        setForm(payload);
       } catch (caughtError) {
         if (!cancelled) {
           setError(
-            caughtError instanceof Error
-              ? caughtError.message
-              : "Could not load this form."
+            detailErrorMessage(
+              caughtError,
+              "ไม่สามารถโหลดแบบฟอร์มได้ กรุณาลองใหม่อีกครั้ง"
+            )
           );
         }
       } finally {
@@ -85,163 +177,251 @@ const FormEditorRoute = () => {
     return () => {
       cancelled = true;
     };
-  }, [formId]);
+  }, [publicId, reloadToken]);
+
   if (loading) {
     return (
-      <div className="grid min-h-64 place-items-center">
+      <div
+        className="grid min-h-64 place-items-center gap-3"
+        aria-busy="true"
+        role="status"
+      >
         <Spinner />
+        <span className="text-sm text-[var(--ink-soft)]">กำลังโหลดแบบฟอร์ม…</span>
       </div>
     );
   }
+
   const loadedForm = form;
-  if (error || !loadedForm) {
-    return <Notice tone="danger">{error ?? "Form not found."}</Notice>;
+  if (!loadedForm) {
+    return (
+      <div ref={feedbackRef} className="space-y-4" tabIndex={-1}>
+        <Notice tone="danger">{error ?? "ไม่พบแบบฟอร์มนี้"}</Notice>
+        <Button
+          variant="secondary"
+          type="button"
+          onClick={() => setReloadToken((value) => value + 1)}
+        >
+          ลองโหลดอีกครั้ง
+        </Button>
+      </div>
+    );
   }
-  const publicId = loadedForm.publicId ?? loadedForm.id;
+
   const shareUrl = `${window.location.origin}/forms/${publicId}/fill`;
-  const editorDocumentKey =
-    loadedForm.templateDocumentKey ?? loadedForm.publishedDocumentKey;
-  const activeDraftCount = loadedForm.activeDraftCount ?? 0;
+  const { activeDraftCount } = loadedForm;
+  const { editorConfigUrl } = loadedForm;
+  const canAct =
+    editorState === "ready" &&
+    !busy &&
+    operationStatus !== "pending" &&
+    operationStatus !== "processing";
+
   const perform = async (action: "save" | "publish") => {
+    if (!canAct || busyGuardRef.current || !editorConfigUrl) {
+      return;
+    }
+    busyGuardRef.current = true;
     setBusy(action);
+    setOperationStatus("pending");
     setError(null);
     setNotice(null);
     try {
-      const configUrl = loadedForm.editorConfigUrl ?? loadedForm.editorUrl;
-      if (!configUrl) {
-        throw new Error("Editor configuration is unavailable.");
+      const editorConfig = await apiGet<AdminEditorConfig>(editorConfigUrl);
+      const documentKey = editorConfig.config?.document?.key;
+      if (typeof documentKey !== "string" || !documentKey) {
+        throw new Error("document_key_unavailable");
       }
-      const editorConfig = await apiGet<AdminEditorConfig>(configUrl);
       const capabilityAction = action === "save" ? "save-template" : "publish";
       const capability = editorConfig.bridge?.capabilities?.[capabilityAction];
       if (!capability) {
-        throw new Error("Editor capability is unavailable.");
+        throw new Error("editor_capability_unavailable");
       }
       const result = await apiPost<{ operationId?: string }>(
-        `/api/admin/forms/${formId}/${action}`,
-        { documentKey: editorDocumentKey },
+        `/api/admin/forms/${publicId}/${action}`,
+        { documentKey },
         capability
       );
       if (result.operationId) {
-        await waitForOperation(result.operationId);
+        await waitForOperation(result.operationId, (operation) => {
+          setOperationStatus(operation.status);
+        });
       }
-      setForm(await loadFormDetail(formId));
-      const noticeMessage =
+      if (action === "save") {
+        setEditorState("loading");
+        setEditorRevision((value) => value + 1);
+      }
+      setOperationStatus("completed");
+      setNotice(
         action === "publish"
-          ? "Published. New responses will use this document."
-          : "Draft saved.";
-      setNotice(noticeMessage);
+          ? "เผยแพร่แบบฟอร์มแล้ว คำตอบใหม่จะใช้เอกสารฉบับนี้"
+          : "บันทึกแบบร่างเรียบร้อยแล้ว"
+      );
+      try {
+        setForm(await loadFormDetail(publicId));
+      } catch (refreshError) {
+        setError(
+          detailErrorMessage(
+            refreshError,
+            "ดำเนินการสำเร็จแล้ว แต่โหลดข้อมูลล่าสุดไม่สำเร็จ กรุณาลองใหม่"
+          )
+        );
+      }
     } catch (caughtError) {
+      setOperationStatus("failed");
       setError(
-        caughtError instanceof Error
-          ? caughtError.message
-          : `Could not ${action} this form.`
+        detailErrorMessage(
+          caughtError,
+          action === "publish"
+            ? "เผยแพร่แบบฟอร์มไม่สำเร็จ กรุณาลองใหม่"
+            : "บันทึกแบบร่างไม่สำเร็จ กรุณาลองใหม่"
+        )
       );
     } finally {
       setBusy(null);
+      busyGuardRef.current = false;
     }
   };
   const requestAction = (action: "save" | "publish") => {
+    if (!canAct || busyGuardRef.current) {
+      return;
+    }
     if (action === "publish" && activeDraftCount > 0) {
       setPublishPrompt(true);
       return;
     }
     void perform(action);
   };
+
   const handleEditorBridgeMessage = async (message: EditorBridgeMessage) => {
+    if (message.action !== "save-template" && message.action !== "publish") {
+      return;
+    }
+    setOperationStatus(
+      message.status === "pending" ? "pending" : message.status
+    );
     if (message.status === "failed") {
-      setError(message.error ?? "The document action failed.");
-      return;
-    }
-    if (
-      message.status !== "completed" ||
-      (message.action !== "save-template" && message.action !== "publish")
-    ) {
-      return;
-    }
-    try {
-      setForm(await loadFormDetail(formId));
-      setError(null);
-      setNotice(
-        message.action === "publish"
-          ? "Published. New responses will use this document."
-          : "Draft saved."
-      );
-    } catch (caughtError) {
       setError(
-        caughtError instanceof Error
-          ? caughtError.message
-          : "Could not refresh this form."
+        message.action === "publish"
+          ? "เผยแพร่แบบฟอร์มไม่สำเร็จ กรุณาลองใหม่"
+          : "บันทึกแบบร่างไม่สำเร็จ กรุณาลองใหม่"
+      );
+      setNotice(null);
+      return;
+    }
+    if (message.status !== "completed") {
+      return;
+    }
+    if (message.action === "save-template") {
+      setEditorState("loading");
+      setEditorRevision((value) => value + 1);
+    }
+    setOperationStatus("completed");
+    setError(null);
+    setNotice(
+      message.action === "publish"
+        ? "เผยแพร่แบบฟอร์มแล้ว คำตอบใหม่จะใช้เอกสารฉบับนี้"
+        : "บันทึกแบบร่างเรียบร้อยแล้ว"
+    );
+    try {
+      setForm(await loadFormDetail(publicId));
+    } catch (refreshError) {
+      setError(
+        detailErrorMessage(
+          refreshError,
+          "ดำเนินการสำเร็จแล้ว แต่โหลดข้อมูลล่าสุดไม่สำเร็จ กรุณาลองใหม่"
+        )
       );
     }
   };
 
   const copyLink = async () => {
-    await navigator.clipboard.writeText(shareUrl);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1800);
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      setCopied(true);
+      setError(null);
+      setNotice("คัดลอกลิงก์แบบฟอร์มแล้ว");
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      setError("คัดลอกลิงก์ไม่สำเร็จ กรุณาลองใหม่");
+      setNotice(null);
+    }
   };
+
+  const status = formStatusDetails[loadedForm.status];
+  const operationBusy =
+    operationStatus === "pending" || operationStatus === "processing";
+
   return (
     <div>
       <div className="mb-7 flex flex-wrap items-center justify-between gap-4">
         <button
           className="inline-flex items-center gap-2 text-sm font-semibold text-[var(--ink-soft)] hover:text-[var(--ink)]"
+          type="button"
           onClick={() => navigate({ to: "/admin" })}
         >
           <ArrowLeft size={15} />
-          Back to forms
+          กลับไปยังรายการแบบฟอร์ม
         </button>
         <div className="flex flex-wrap gap-2">
           <Button
             variant="secondary"
             size="sm"
+            type="button"
             onClick={() => requestAction("save")}
-            disabled={Boolean(busy)}
+            disabled={!canAct}
           >
             {busy === "save" ? <Spinner /> : <Save size={15} />}
-            {busy === "save" ? "Saving…" : "Save template"}
+            {busy === "save" ? "กำลังบันทึก…" : "บันทึกแบบร่าง"}
           </Button>
           <Button
+            id="publish-trigger"
             size="sm"
+            type="button"
             onClick={() => requestAction("publish")}
-            disabled={Boolean(busy)}
+            disabled={!canAct}
           >
             {busy === "publish" ? <Spinner /> : <Send size={15} />}
-            {busy === "publish" ? "Publishing…" : "Publish"}
+            {busy === "publish" ? "กำลังเผยแพร่…" : "เผยแพร่"}
           </Button>
         </div>
       </div>
       {publishPrompt ? (
         <div
           className="mb-5 flex flex-wrap items-center justify-between gap-4 rounded-[var(--radius)] border border-[var(--warning)] bg-[var(--warning-soft)] p-4"
-          role="alertdialog"
           aria-labelledby="publish-warning-title"
+          role="alertdialog"
         >
           <div>
             <p id="publish-warning-title" className="font-semibold">
-              Publishing will invalidate {activeDraftCount} saved draft
-              {activeDraftCount === 1 ? "" : "s"}.
+              การเผยแพร่จะยกเลิกฉบับร่างที่กำลังแก้ไข {activeDraftCount} รายการ
             </p>
             <p className="mt-1 text-sm text-[var(--ink-soft)]">
-              Submitted responses remain unchanged.
+              คำตอบที่ส่งแล้วจะไม่เปลี่ยนแปลง
             </p>
           </div>
           <div className="flex gap-2">
             <Button
+              id="publish-cancel"
               variant="secondary"
               size="sm"
-              onClick={() => setPublishPrompt(false)}
+              type="button"
+              onClick={() => {
+                restorePublishFocusRef.current = true;
+                setPublishPrompt(false);
+              }}
             >
-              Cancel
+              ยกเลิก
             </Button>
             <Button
               size="sm"
+              type="button"
               onClick={() => {
                 setPublishPrompt(false);
                 void perform("publish");
               }}
             >
-              Publish anyway
+              เผยแพร่ต่อ
             </Button>
           </div>
         </div>
@@ -249,62 +429,70 @@ const FormEditorRoute = () => {
       <div className="mb-7 flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
         <div>
           <div className="mb-2 flex items-center gap-2">
-            <Badge tone={form.status === "published" ? "success" : "warning"}>
-              {form.status === "published" ? "Published" : "Draft"}
-            </Badge>
-            <span className="text-sm text-[var(--ink-soft)]">Admin editor</span>
+            <Badge tone={status.tone}>{status.label}</Badge>
+            <span className="text-sm text-[var(--ink-soft)]">
+              ตัวแก้ไขสำหรับผู้ดูแล
+            </span>
           </div>
           <h1 className="text-3xl font-bold tracking-[-0.04em]">
-            {form.title}
+            {loadedForm.title}
           </h1>
           <p className="mt-2 max-w-2xl text-[var(--ink-soft)]">
-            {form.description ||
-              "Shape the document, then publish when it is ready."}
+            {loadedForm.description || "จัดรูปแบบเอกสาร แล้วเผยแพร่เมื่อพร้อม"}
           </p>
         </div>
         <Link
           to="/admin/forms/$formId/submissions"
-          params={{ formId }}
+          params={{ formId: publicId }}
           className="inline-flex items-center gap-2 text-sm font-semibold underline underline-offset-4"
         >
-          View submissions <ExternalLink size={15} />
+          ดูคำตอบ <ExternalLink size={15} />
         </Link>
       </div>
-      {error ? (
-        <div className="mb-4">
-          <Notice tone="danger">{error}</Notice>
+      {error || notice || operationBusy ? (
+        <div ref={feedbackRef} className="mb-4 space-y-2" tabIndex={-1}>
+          {error ? <Notice tone="danger">{error}</Notice> : null}
+          {notice ? <Notice tone="success">{notice}</Notice> : null}
+          {operationBusy ? (
+            <Notice>
+              <span className="inline-flex items-center gap-2">
+                <Spinner />
+                {operationStatus === "processing"
+                  ? "กำลังประมวลผลเอกสาร…"
+                  : "กำลังบันทึกการเปลี่ยนแปลง…"}
+              </span>
+            </Notice>
+          ) : null}
         </div>
       ) : null}
-      {notice ? (
-        <div className="mb-4">
-          <Notice tone="success">{notice}</Notice>
-        </div>
-      ) : null}
-      <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--line)] bg-[var(--paper)] p-4">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--line)] bg-[var(--paper)] p-4">
         <div className="flex min-w-0 items-center gap-3">
           <Globe2 className="shrink-0 text-[var(--success)]" size={18} />
           <div className="min-w-0">
-            <p className="text-sm font-semibold">Share this form</p>
+            <p className="text-sm font-semibold">ลิงก์แบบฟอร์ม</p>
             <p className="truncate text-xs text-[var(--ink-soft)]">
               {shareUrl}
             </p>
           </div>
         </div>
-        <Button variant="secondary" size="sm" onClick={copyLink}>
+        <Button variant="secondary" size="sm" type="button" onClick={copyLink}>
           {copied ? <Check size={15} /> : <Copy size={15} />}
-          {copied ? "Copied" : "Copy link"}
+          {copied ? "คัดลอกแล้ว" : "คัดลอกลิงก์"}
         </Button>
       </div>
       <div className="mb-4 flex items-center gap-2 text-sm text-[var(--ink-soft)]">
         <FileText size={16} />
-        Document editor <span className="text-xs">· Desktop recommended</span>
+        ตัวแก้ไขเอกสาร
+        <span className="text-xs">· แนะนำให้ใช้คอมพิวเตอร์</span>
       </div>
       <div className="overflow-hidden rounded-[var(--radius)] border border-[var(--line-strong)] bg-[var(--muted)] shadow-inner">
         <OnlyOfficeEditor
-          key={editorDocumentKey}
+          key={publicId}
           onBridgeMessage={handleEditorBridgeMessage}
-          configUrl={form.editorConfigUrl ?? form.editorUrl}
-          title={`Editor for ${form.title}`}
+          onStateChange={setEditorState}
+          configUrl={editorConfigUrl}
+          revision={editorRevision}
+          title={`ตัวแก้ไขเอกสาร ${loadedForm.title}`}
         />
       </div>
     </div>

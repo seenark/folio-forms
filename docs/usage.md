@@ -127,10 +127,11 @@ docker compose --env-file apps/server/.env -f compose.yaml up -d --build server
 
 - เข้า `/admin`
 - จัดการบัญชีที่ `/admin/users`
-- สร้าง Form ใหม่
-- ลบ Form ที่ยังเป็น Draft และยังไม่มี Response
-- แก้ไข DOCX Template
-- Save Template
+- สร้าง Form ใหม่จาก Starter DOCX หรืออัปโหลดไฟล์ `.docx`
+- ดูสถานะ Form พร้อมจำนวน Draft และ Submission
+- ลบ Form ที่ยังไม่เคย Publish และยังไม่มี Response
+- แก้ไข DOCX Template ภายใต้ Editor Lease แบบ exclusive
+- Save Template Draft อย่างชัดเจน
 - Publish Template
 - Copy Share Link
 - ดู Submission ของทุก User
@@ -197,10 +198,15 @@ Share Link เป็น opaque public ID ที่ระบบสร้างใ
 
 หากต้องจัดการบัญชี ให้เปิดเมนู **ผู้ใช้** หรือ `/admin/users` หน้าเดียวกันรองรับการสร้างบัญชี แก้ไขอีเมล เปิด/ปิดบัญชี Promote/Demote และ Reset password คัดลอกรหัสผ่านชั่วคราวจากผลลัพธ์ก่อนเปลี่ยนหน้า เพราะ API จะไม่ส่งค่านั้นซ้ำ
 
-4. กด **New form**
-5. กรอก Title และ Description
-6. กด **Create draft**
-7. ระบบจะเปิด ONLYOFFICE Editor
+4. กด **สร้างแบบฟอร์ม**
+5. กรอกชื่อและคำอธิบาย
+6. เลือก Starter DOCX ของระบบ หรืออัปโหลดไฟล์ `.docx` ขนาดไม่เกิน 25 MiB
+7. กด **สร้าง Template Draft**
+8. ระบบจะตรวจชนิด ขนาด และโครงสร้าง DOCX ก่อนสร้าง Form แล้วเปิด ONLYOFFICE Editor
+
+หน้า `/admin` แสดงสถานะ `Draft`, `Published` หรือ `Archived` พร้อมจำนวน Response Draft และ Submission โดยใช้ Public ID สำหรับเส้นทางและไม่แสดง Object Key หรือ Database ID
+
+ถ้าเลือกอัปโหลด ไฟล์ต้องลงท้ายด้วย `.docx` และเป็นแพ็กเกจ DOCX ที่อ่านได้จริง ไฟล์ชนิดอื่น ไฟล์ใหญ่กว่า 25 MiB หรือ ZIP ที่ขาดส่วนประกอบ DOCX จะถูกปฏิเสธก่อนสร้าง Form
 
 ### 4.1 ออกแบบ Template
 
@@ -213,18 +219,22 @@ Share Link เป็น opaque public ID ที่ระบบสร้างใ
 - Tag เป็นชื่อที่ใช้ใน JSON และ Prefill
 - Tag ควรเป็นชื่อที่สื่อความหมาย เช่น `full_name`
 
+Editor หนึ่งรายการมี Admin แก้ไขได้ครั้งละหนึ่ง Browser Session เท่านั้น Admin คนที่สองจะเห็นสถานะไม่สามารถแก้ไขได้และสามารถลองใหม่หลัง Lease ถูกปล่อยหรือหมดอายุ
+
 เมื่อแก้ไข Template เสร็จ:
 
 1. เปิดแท็บ **Form** ใน ONLYOFFICE
-2. กด **Save Template**
-3. รอให้การบันทึกเสร็จ
-4. กด **Publish**
-5. กด **Copy link** เพื่อคัดลอก Share Link
-6. ส่งลิงก์ให้ User ทดลองกรอก
+2. กด **บันทึก Template** อย่างชัดเจน
+3. รอให้ Operation เสร็จ ระบบจะเปิดครั้งถัดไปจาก DOCX ชุดเดียวกับการบันทึกล่าสุด
+4. ถ้าการบันทึกล้มเหลว Template Draft ชุดก่อนหน้ายังอยู่และกด **ลองใหม่** ได้
+5. กด **Publish** เมื่อ Template พร้อม
+6. กด **คัดลอกลิงก์** เพื่อส่งให้ User
+
+Form ที่ยังเป็น `Draft`, ไม่เคย Publish และไม่มี Response เท่านั้นที่ลบแบบถาวรได้ การลบจะล้าง Template Draft และ Object ที่เกี่ยวข้อง แต่ Form สถานะอื่นใช้เส้นทางนี้ไม่ได้
 
 หน้า Admin ยังมีปุ่มด้านบนด้วย:
 
-- **Save template** — บันทึก Template Draft แต่ยังไม่เปลี่ยน Form ที่แชร์
+- **บันทึก Template** — สร้าง Operation และบันทึก Template Draft โดยยังไม่เปลี่ยนเอกสาร Published
 - **Publish** — ทำให้ Template นี้เป็น Published Template สำหรับ Response ใหม่
 
 ### 4.2 ผลของการ Publish
@@ -311,7 +321,7 @@ Form / TemplateDraft / PublishedTemplate / FieldManifest
 PrefillConfiguration / PrefillSnapshot
 Response / Submission / Correction
 Handoff / PendingClaim
-Operation / CallbackClaim / EditorLease
+Operation / CallbackClaim / EditorLease / ObjectCleanupIntent
 AuditEvent / LoginFailure / DeletionTombstone
 ```
 
@@ -327,7 +337,7 @@ submissions/<submissionId>/filled/<uuid>/docx
 operations/<operationId>/<kind>/<uuid>/docx
 ```
 
-Database เก็บ object key ไม่ใช่ Absolute path ของเครื่อง Bucket ไม่มี public access Browser และ ONLYOFFICE ต้องอ่านผ่าน API ที่ตรวจสิทธิ์และใช้ authorization อายุสั้นเท่านั้น ระบบเขียน staging object ให้สำเร็จก่อนเปลี่ยน reference ใน Database แล้วจึงลบ object เก่าหรือ staging ที่หมดหน้าที่ Callback claim ถูกเก็บและ consume แบบครั้งเดียวใน Database เพื่อให้ replay protection ยังทำงานหลัง restart และตอนเริ่ม Server ระบบจะ fail Operation ที่ค้างเกินเวลา, rollback Response ที่กำลัง submit และล้าง Lease หรือ callback claim ที่หมดอายุโดยไม่เปลี่ยน reference ของเอกสารที่ commit แล้ว
+Database เก็บ object key ไม่ใช่ Absolute path ของเครื่อง Bucket ไม่มี public access Browser และ ONLYOFFICE ต้องอ่านผ่าน API ที่ตรวจสิทธิ์และใช้ authorization อายุสั้นเท่านั้น ระบบเขียน staging object ให้สำเร็จก่อนเปลี่ยน reference ใน Database แล้วจึงลบ object เก่าหรือ staging ที่หมดหน้าที่ การสร้างและลบ Form จะบันทึก `ObjectCleanupIntent` ก่อนที่ object อาจไม่มี reference โดย intent ของการสร้างใหม่มีช่วงคุ้มครอง 15 นาทีเพื่อไม่ให้ Server อื่นลบ object ที่ยังอัปโหลดอยู่ ถ้าลบจาก RustFS ไม่สำเร็จ intent จะยังอยู่และ Server จะลองใหม่ตอนเริ่มระบบและทุกหนึ่งนาที Callback claim ถูกเก็บและ consume แบบครั้งเดียวใน Database เพื่อให้ replay protection ยังทำงานหลัง restart และตอนเริ่ม Server ระบบจะ fail Operation ที่ค้างเกินเวลา, rollback Response ที่กำลัง submit และล้าง Lease หรือ callback claim ที่หมดอายุโดยไม่เปลี่ยน reference ของเอกสารที่ commit แล้ว
 
 PDF ถูกสร้างเมื่อดาวน์โหลด ส่งกลับใน response แล้วทิ้งทันที ไม่มี PDF object ถาวรหรือ path ใน Database
 

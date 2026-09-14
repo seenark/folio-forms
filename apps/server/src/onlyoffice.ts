@@ -108,13 +108,12 @@ export interface EditorOptions {
     renewUrl: string;
   };
   documentKey: string;
-  formId: string;
   operationId?: string;
   prefill?: {
     data: Record<string, unknown>;
     editableFields: Record<string, unknown>;
   };
-  publicId?: string;
+  publicId: string;
   responseId?: string;
 }
 
@@ -442,7 +441,7 @@ export function editorConfig(
         fillForms: options.action !== "template-edit",
         review: false,
       },
-      title: `${options.action}-${options.formId}.docx`,
+      title: `${options.action}-${options.publicId}.docx`,
       url: documentUrl(options.documentKey),
     },
     documentType: "word",

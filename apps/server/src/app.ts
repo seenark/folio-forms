@@ -19,6 +19,7 @@ import {
 import { env } from "@onlyoffice/env/server";
 import { Elysia } from "elysia";
 import { unzipSync } from "fflate";
+import { SaxesParser } from "saxes";
 
 import {
   callbackClaim,
@@ -73,11 +74,20 @@ const fallbackTemplatePath = path.resolve(
   "../../../onlyoffice-templates/template.docx"
 );
 const idPattern = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
+const publicIdPattern = /^[0-9a-f]{32}$/u;
 const accountEmailPattern = /^[^\s@]+@[^\s@]+$/u;
 const operationTimeoutMs = 4 * 60_000;
 const editorLeaseDurationMs = 90_000;
 const callbackClaimLifetimeSeconds = 5 * 60;
-const maxCallbackDocumentBytes = 25 * 1024 * 1024;
+// ponytail: 15 minutes bounds an abandoned upload; use claimed cleanup jobs if uploads can exceed it.
+const objectCleanupIntentGraceMs = 15 * 60_000;
+const maxTemplateUploadBytes = 25 * 1024 * 1024;
+const maxTemplateMultipartOverheadBytes = 64 * 1024;
+const maxTemplateMultipartBodyBytes =
+  maxTemplateUploadBytes + maxTemplateMultipartOverheadBytes;
+const maxTemplateArchiveExpandedBytes = 64 * 1024 * 1024;
+const maxTemplateArchiveEntries = 2048;
+const maxCallbackDocumentBytes = maxTemplateUploadBytes;
 const maxCallbackBodyBytes = 64 * 1024;
 const loginFailureLimit = 5;
 const loginFailureWindowMs = 15 * 60_000;
@@ -86,6 +96,7 @@ const passwordMaximumLength = 128;
 const maxResponseDataBytes = 256 * 1024;
 const accountUserPageSize = 20;
 const accountBodyMaximumBytes = 64 * 1024;
+const documentActionBodyMaximumBytes = 8 * 1024;
 const accountEmailMaximumLength = 254;
 const accountNameMaximumLength = 120;
 // ponytail: one global account lock caps mutation throughput; shard locks only if needed.
@@ -164,11 +175,6 @@ interface ActiveEditorLease {
   holderSessionId: string;
   holderUserId: string;
 }
-interface LockedEditorLease extends ActiveEditorLease {
-  expiresAt: Date;
-  id: string;
-}
-
 type JsonRecord = Record<string, unknown>;
 type OperationAction = "save-template" | "publish" | "save-draft" | "submit";
 const operationTypeForAction: Record<OperationAction, OperationType> = {
@@ -185,6 +191,38 @@ type OperationErrorCode =
   | "force_save_failed"
   | "onlyoffice_document_error"
   | "operation_timeout";
+type FormSource = "blank" | "upload";
+type FormAuditAction = "create_form" | "save_template_draft" | "delete_form";
+type FormAuditErrorCode =
+  | "callback_claim_invalid"
+  | "blank_template_unavailable"
+  | "callback_document_unavailable"
+  | "callback_key_mismatch"
+  | "callback_processing_failed"
+  | "document_unavailable"
+  | "editor_capability_required"
+  | "editor_capability_scope_mismatch"
+  | "editor_in_use"
+  | "editor_lease_inactive"
+  | "force_save_failed"
+  | "form_has_responses"
+  | "form_not_draft"
+  | "internal_error"
+  | "invalid_editor_capability"
+  | "invalid_file_type"
+  | "invalid_request"
+  | "invalid_template"
+  | "not_found"
+  | "onlyoffice_document_error"
+  | "operation_in_progress"
+  | "operation_timeout"
+  | "payload_too_large"
+  | "stale_document"
+  | "stale_operation";
+interface FormAuditMetadata {
+  errorCode?: FormAuditErrorCode;
+  source?: FormSource;
+}
 type OperationMetadata = JsonRecord & {
   action: OperationAction;
   cleanupObjectKeys?: string[];
@@ -253,17 +291,18 @@ function asRecord(
   }
   return value as JsonRecord;
 }
-async function readJsonRecord(
+async function readRequestBytes(
   request: Request,
-  maximumBytes: number
-): Promise<JsonRecord> {
+  maximumBytes: number,
+  missingMessage = "Request body is required"
+): Promise<Uint8Array> {
   const contentLength = Number(request.headers.get("content-length") ?? "");
   if (Number.isFinite(contentLength) && contentLength > maximumBytes) {
     fail(413, "payload_too_large", "Request body is too large");
   }
   const reader = request.body?.getReader();
   if (!reader) {
-    fail(400, "invalid_request", "Request body must be a JSON object");
+    fail(400, "invalid_request", missingMessage);
   }
   const chunks: Uint8Array[] = [];
   let byteLength = 0;
@@ -285,11 +324,135 @@ async function readJsonRecord(
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  return bytes;
+}
+
+async function readJsonRecord(
+  request: Request,
+  maximumBytes: number
+): Promise<JsonRecord> {
+  const bytes = await readRequestBytes(
+    request,
+    maximumBytes,
+    "Request body must be a JSON object"
+  );
   try {
     return asRecord(JSON.parse(new TextDecoder().decode(bytes)));
   } catch {
     fail(400, "invalid_request", "Request body must be valid JSON");
   }
+}
+
+interface TemplateCreationInput {
+  description: string;
+  source: FormSource;
+  templateBytes?: Uint8Array;
+  title: string;
+}
+
+async function readTemplateCreationInput(
+  request: Request
+): Promise<TemplateCreationInput> {
+  const contentType = request.headers.get("content-type");
+  if (!contentType || !/^multipart\/form-data(?:\s*;|$)/iu.test(contentType)) {
+    fail(
+      415,
+      "invalid_file_type",
+      "Form creation requires multipart form data"
+    );
+  }
+  const requestBytes = await readRequestBytes(
+    request,
+    maxTemplateMultipartBodyBytes,
+    "Multipart form data is required"
+  );
+  const multipartRequest = new Request(request.url, {
+    body: requestBytes,
+    headers: { "content-type": contentType },
+    method: "POST",
+  });
+  let formData: Awaited<ReturnType<typeof multipartRequest.formData>>;
+  try {
+    formData = await multipartRequest.formData();
+  } catch {
+    fail(400, "invalid_request", "Multipart form data is invalid");
+  }
+
+  const entries = new Map<string, unknown>();
+  for (const [key, value] of formData.entries()) {
+    if (
+      key !== "description" &&
+      key !== "source" &&
+      key !== "template" &&
+      key !== "title"
+    ) {
+      fail(
+        400,
+        "invalid_request",
+        "Only title, description, source, and template are accepted"
+      );
+    }
+    if (entries.has(key)) {
+      fail(400, "invalid_request", `${key} must be provided once`);
+    }
+    entries.set(key, value);
+  }
+
+  const titleValue = entries.get("title");
+  const sourceValue = entries.get("source");
+  if (typeof titleValue !== "string" || titleValue.trim().length === 0) {
+    fail(400, "invalid_request", "title is required");
+  }
+  if (typeof sourceValue !== "string" || sourceValue.trim().length === 0) {
+    fail(400, "invalid_request", "source is required");
+  }
+  const title = titleValue.trim();
+  const source = sourceValue.trim();
+  if (title.length > 200) {
+    fail(400, "invalid_request", "Title is too long");
+  }
+  if (source !== "blank" && source !== "upload") {
+    fail(400, "invalid_request", "source must be blank or upload");
+  }
+  const descriptionValue = entries.get("description");
+  if (
+    descriptionValue !== undefined &&
+    (typeof descriptionValue !== "string" ||
+      descriptionValue.trim().length > 2000)
+  ) {
+    fail(400, "invalid_request", "Description is too long");
+  }
+  const description =
+    typeof descriptionValue === "string" ? descriptionValue.trim() : "";
+  const template = entries.get("template");
+  if (source === "blank") {
+    if (template !== undefined) {
+      fail(400, "invalid_request", "template is only accepted for upload");
+    }
+    return { description, source, title };
+  }
+  if (!(template instanceof File)) {
+    fail(400, "invalid_request", "template is required for upload");
+  }
+  if (!/\.docx$/iu.test(template.name)) {
+    fail(415, "invalid_file_type", "Template must be a DOCX file");
+  }
+  const normalizedType = template.type.trim().toLowerCase();
+  if (
+    normalizedType !== "" &&
+    normalizedType !== "application/octet-stream" &&
+    normalizedType !== DOCX_CONTENT_TYPE
+  ) {
+    fail(415, "invalid_file_type", "Template must be a DOCX file");
+  }
+  if (template.size > maxTemplateUploadBytes) {
+    fail(413, "payload_too_large", "Template upload is too large");
+  }
+  const templateBytes = new Uint8Array(await template.arrayBuffer());
+  if (templateBytes.byteLength > maxTemplateUploadBytes) {
+    fail(413, "payload_too_large", "Template upload is too large");
+  }
+  return { description, source, templateBytes, title };
 }
 
 function requiredString(record: JsonRecord, key: string): string {
@@ -300,15 +463,12 @@ function requiredString(record: JsonRecord, key: string): string {
   return value.trim();
 }
 
-function optionalString(record: JsonRecord, key: string): string | undefined {
-  const value = record[key];
-  if (value === undefined || value === null) {
-    return undefined;
+async function readDocumentKeyInput(request: Request): Promise<string> {
+  const input = await readJsonRecord(request, documentActionBodyMaximumBytes);
+  if (Object.keys(input).length !== 1 || !Object.hasOwn(input, "documentKey")) {
+    fail(400, "invalid_request", "Only documentKey is accepted");
   }
-  if (typeof value !== "string") {
-    fail(400, "invalid_request", `${key} must be a string`);
-  }
-  return value.trim();
+  return requiredString(input, "documentKey");
 }
 
 function jsonRecord(
@@ -354,16 +514,22 @@ function tokenDigest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-async function deleteObjects(
+function uniqueObjectKeys(
   keys: readonly (string | null | undefined)[]
-): Promise<void> {
-  const uniqueKeys = [
+): string[] {
+  return [
     ...new Set(
       keys.filter(
         (key): key is string => typeof key === "string" && key.length > 0
       )
     ),
   ];
+}
+
+async function deleteObjects(
+  keys: readonly (string | null | undefined)[]
+): Promise<void> {
+  const uniqueKeys = uniqueObjectKeys(keys);
   await Promise.all(
     uniqueKeys.map(async (key) => {
       try {
@@ -373,6 +539,32 @@ async function deleteObjects(
       }
     })
   );
+}
+
+async function drainObjectCleanupIntents(
+  objectKeys?: readonly string[]
+): Promise<void> {
+  const cleanupAfter = new Date();
+  const intents = await prisma.objectCleanupIntent.findMany({
+    orderBy: { createdAt: "asc" },
+    where: {
+      cleanupAfter: { lte: cleanupAfter },
+      ...(objectKeys ? { objectKey: { in: [...objectKeys] } } : {}),
+    },
+  });
+  for (const intent of intents) {
+    try {
+      await deleteObject(intent.objectKey);
+      await prisma.objectCleanupIntent.deleteMany({
+        where: { id: intent.id, objectKey: intent.objectKey },
+      });
+    } catch (error) {
+      console.error(
+        `Could not drain object cleanup intent ${intent.id}`,
+        error
+      );
+    }
+  }
 }
 
 async function deleteObjectUnlessCanonical(key: string): Promise<void> {
@@ -804,7 +996,8 @@ function editorLeaseBridge(lease: ClaimedEditorLease) {
 async function claimEditorLease(
   identity: Identity,
   targetType: EditorCapabilityTarget,
-  targetId: string
+  targetId: string,
+  formId: string
 ): Promise<EditorLeaseGrant> {
   const now = new Date();
   const expiresAt = nextEditorLeaseExpiry(identity, now);
@@ -823,7 +1016,20 @@ async function claimEditorLease(
     await expireOperationIfNeeded(activeOperation);
   }
   const lease = await prisma.$transaction(async (tx) => {
-    const [current] = await tx.$queryRaw<LockedEditorLease[]>(
+    const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
+      Prisma.sql`
+        SELECT "id"
+        FROM "forms"
+        WHERE "id" = ${formId}::uuid
+        FOR UPDATE
+      `
+    );
+    if (!lockedForm) {
+      fail(404, "not_found", "Form was not found");
+    }
+    const [current] = await tx.$queryRaw<
+      (ActiveEditorLease & ClaimedEditorLease)[]
+    >(
       Prisma.sql`
         SELECT
           "id",
@@ -1249,20 +1455,114 @@ async function withAdminMutation<T>(
   }
 }
 
-function formSummary(form: FormWithDocuments): JsonRecord {
-  const templateDraft = form.templateDraft;
-  const publishedTemplate = form.publishedTemplate;
+const formAuditErrorCodes: Record<string, true> = {
+  blank_template_unavailable: true,
+  callback_claim_invalid: true,
+  callback_document_unavailable: true,
+  callback_key_mismatch: true,
+  callback_processing_failed: true,
+  document_unavailable: true,
+  editor_capability_required: true,
+  editor_capability_scope_mismatch: true,
+  editor_in_use: true,
+  editor_lease_inactive: true,
+  force_save_failed: true,
+  form_has_responses: true,
+  form_not_draft: true,
+  internal_error: true,
+  invalid_editor_capability: true,
+  invalid_file_type: true,
+  invalid_request: true,
+  invalid_template: true,
+  not_found: true,
+  onlyoffice_document_error: true,
+  operation_in_progress: true,
+  operation_timeout: true,
+  payload_too_large: true,
+  stale_document: true,
+  stale_operation: true,
+};
+
+function formAuditErrorCode(error: unknown): FormAuditErrorCode {
+  const code = error instanceof HttpError ? error.code : "internal_error";
+  return formAuditErrorCodes[code]
+    ? (code as FormAuditErrorCode)
+    : "internal_error";
+}
+
+async function createFormAudit(
+  tx: Prisma.TransactionClient,
+  {
+    action,
+    actorId,
+    outcome,
+    safeMetadata,
+    targetId,
+  }: {
+    action: FormAuditAction;
+    actorId: string | null;
+    outcome: AuditOutcome;
+    safeMetadata: FormAuditMetadata;
+    targetId: string | null;
+  }
+): Promise<void> {
+  await tx.auditEvent.create({
+    data: {
+      action,
+      actorId,
+      outcome,
+      safeMetadata: jsonValue(safeMetadata),
+      targetId,
+      targetType: "form",
+    },
+  });
+}
+
+async function createFormFailureAudit({
+  action,
+  actorId,
+  error,
+  source,
+  targetId,
+}: {
+  action: FormAuditAction;
+  actorId: string | null;
+  error: unknown;
+  source?: FormSource;
+  targetId: string | null;
+}): Promise<void> {
+  await prisma.auditEvent.create({
+    data: {
+      action,
+      actorId,
+      outcome: AuditOutcome.failure,
+      safeMetadata: jsonValue({
+        ...(source ? { source } : {}),
+        errorCode: formAuditErrorCode(error),
+      }),
+      targetId,
+      targetType: "form",
+    },
+  });
+}
+
+interface FormCounts {
+  activeDraftCount: number;
+  submissionCount: number;
+}
+
+function formDto(
+  form: FormWithDocuments,
+  { activeDraftCount, submissionCount }: FormCounts
+): JsonRecord {
   return {
+    activeDraftCount,
     createdAt: form.createdAt,
-    createdBy: form.createdBy,
-    description: form.description,
-    hasPublishedDocument: Boolean(publishedTemplate?.objectKey),
-    hasTemplateDraft: Boolean(templateDraft?.objectKey),
-    id: form.id,
+    description: form.description ?? "",
+    hasTemplateDraft: Boolean(form.templateDraft),
     publicId: form.publicId,
-    publishedDocumentKey: publishedTemplate?.documentKey,
     status: form.status,
-    templateDocumentKey: templateDraft?.documentKey,
+    submissionCount,
     title: form.title,
     updatedAt: form.updatedAt,
     version: form.version,
@@ -1295,13 +1595,14 @@ function responseSummary(
 function submissionSummary(
   submission: Submission,
   extra: {
+    formPublicId?: string;
     formTitle?: string;
     userEmail?: string;
   } = {}
 ): JsonRecord {
   return {
     createdAt: submission.createdAt,
-    formId: submission.formId,
+    formPublicId: extra.formPublicId,
     formTitle: extra.formTitle,
     id: submission.id,
     responseId: submission.responseId,
@@ -1318,14 +1619,6 @@ async function findTemplateSource(): Promise<string | null> {
   }
   const fallbackSource = Bun.file(fallbackTemplatePath);
   return (await fallbackSource.exists()) ? fallbackTemplatePath : null;
-}
-function decodeXmlAttribute(value: string): string {
-  return value
-    .replaceAll("&amp;", "&")
-    .replaceAll("&lt;", "<")
-    .replaceAll("&gt;", ">")
-    .replaceAll("&quot;", '"')
-    .replaceAll("&apos;", "'");
 }
 export function resolveCallbackDocumentUrl(
   value: unknown,
@@ -1408,36 +1701,384 @@ async function readCallbackDocument(
   return bytes;
 }
 
-function validateTemplateControls(bytes: Uint8Array): string[] {
-  let archive: Record<string, Uint8Array>;
+const templatePackageRelationshipNamespace =
+  "http://schemas.openxmlformats.org/package/2006/relationships";
+const templatePackageContentTypesNamespace =
+  "http://schemas.openxmlformats.org/package/2006/content-types";
+const templateOfficeDocumentRelationships = new Set([
+  "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument",
+  "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+]);
+const templateWordNamespaces = new Set([
+  "http://purl.oclc.org/ooxml/wordprocessingml/main",
+  "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+]);
+const templateDocumentContentType =
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
+
+interface TemplateXmlAttribute {
+  local: string;
+  uri: string;
+  value: string;
+}
+
+interface TemplateXmlElement {
+  attributes: TemplateXmlAttribute[];
+  local: string;
+  uri: string;
+}
+
+interface TemplateXmlVisitor {
+  close?: (element: TemplateXmlElement) => void;
+  open?: (element: TemplateXmlElement) => void;
+}
+
+function templateXmlElement(tag: {
+  attributes: Record<string, { local: string; uri: string; value: string }>;
+  local: string;
+  uri: string;
+}): TemplateXmlElement {
+  return {
+    attributes: Object.values(tag.attributes).map((attribute) => ({
+      local: attribute.local,
+      uri: attribute.uri,
+      value: attribute.value,
+    })),
+    local: tag.local,
+    uri: tag.uri,
+  };
+}
+
+function parseTemplateXml(xml: string, visitor: TemplateXmlVisitor = {}): void {
+  const parser = new SaxesParser({ position: false, xmlns: true });
+  parser.on("doctype", () => {
+    throw new Error("DOCX XML document types are not allowed");
+  });
+  parser.on("opentag", (tag) => {
+    visitor.open?.(templateXmlElement(tag));
+  });
+  parser.on("closetag", (tag) => {
+    visitor.close?.(templateXmlElement(tag));
+  });
   try {
-    archive = unzipSync(bytes);
+    parser.write(xml).close();
   } catch {
+    fail(422, "invalid_template", "The DOCX package contains invalid XML");
+  }
+}
+
+function templateAttribute(
+  element: TemplateXmlElement,
+  local: string,
+  uri = ""
+): string | undefined {
+  return element.attributes.find(
+    (attribute) => attribute.local === local && attribute.uri === uri
+  )?.value;
+}
+
+function readTemplateArchive(
+  bytes: Uint8Array,
+  include: (archivePath: string) => boolean
+): Record<string, Uint8Array> {
+  let expandedBytes = 0;
+  let entryCount = 0;
+  const names = new Set<string>();
+  try {
+    return unzipSync(bytes, {
+      filter: (file) => {
+        entryCount += 1;
+        const archivePath = file.name;
+        const segments = archivePath.split("/");
+        if (
+          !archivePath ||
+          archivePath.startsWith("/") ||
+          archivePath.includes("\\") ||
+          archivePath.includes("\0") ||
+          segments.some(
+            (segment, index) =>
+              segment === "." ||
+              segment === ".." ||
+              (segment.length === 0 && index !== segments.length - 1)
+          ) ||
+          names.has(archivePath)
+        ) {
+          throw new Error("Unsafe DOCX archive path");
+        }
+        names.add(archivePath);
+        if (
+          !Number.isSafeInteger(file.originalSize) ||
+          file.originalSize < 0 ||
+          expandedBytes > maxTemplateArchiveExpandedBytes - file.originalSize
+        ) {
+          throw new Error("DOCX archive expands beyond the safety limit");
+        }
+        expandedBytes += file.originalSize;
+        if (entryCount > maxTemplateArchiveEntries) {
+          throw new Error("DOCX archive contains too many entries");
+        }
+        return include(archivePath);
+      },
+    });
+  } catch {
+    fail(422, "invalid_template", "The template is not a safe DOCX archive");
+  }
+}
+
+function templateArchiveText(
+  archive: Record<string, Uint8Array>,
+  archivePath: string
+): string {
+  const bytes = archive[archivePath];
+  if (!bytes || bytes.byteLength === 0) {
+    fail(422, "invalid_template", "The DOCX package is incomplete");
+  }
+  try {
+    let decodedBytes = bytes;
+    let encoding: "utf-16" | "utf-8" = "utf-8";
+    if (
+      (bytes[0] === 0xff && bytes[1] === 0xfe) ||
+      (bytes[0] === 0x3c && bytes[1] === 0x00)
+    ) {
+      encoding = "utf-16";
+    } else if (
+      (bytes[0] === 0xfe && bytes[1] === 0xff) ||
+      (bytes[0] === 0x00 && bytes[1] === 0x3c)
+    ) {
+      if (bytes.byteLength % 2 !== 0) {
+        throw new Error("UTF-16 XML must contain complete code units");
+      }
+      decodedBytes = new Uint8Array(bytes);
+      for (let index = 0; index < decodedBytes.byteLength; index += 2) {
+        const firstByte = decodedBytes[index] ?? 0;
+        decodedBytes[index] = decodedBytes[index + 1] ?? 0;
+        decodedBytes[index + 1] = firstByte;
+      }
+      encoding = "utf-16";
+    }
+    return new TextDecoder(encoding, { fatal: true }).decode(decodedBytes);
+  } catch {
+    fail(422, "invalid_template", "The DOCX package contains invalid XML");
+  }
+}
+
+function isTemplateXmlContentType(contentType: string | undefined): boolean {
+  const normalized = contentType?.split(";", 1)[0]?.trim().toLowerCase();
+  return (
+    normalized === "application/xml" ||
+    normalized === "text/xml" ||
+    normalized === "application/vnd.openxmlformats-officedocument.vmldrawing" ||
+    normalized?.endsWith("+xml") === true
+  );
+}
+
+function validateTemplatePackageArchive(
+  archive: Record<string, Uint8Array>
+): Set<string> {
+  const contentTypes = templateArchiveText(archive, "[Content_Types].xml");
+  const relationships = templateArchiveText(archive, "_rels/.rels");
+  const document = templateArchiveText(archive, "word/document.xml");
+  const defaultContentTypes = new Map<string, string>();
+  const overrideContentTypes = new Map<string, string>();
+  let contentTypesRoot = false;
+  let contentTypesRootSeen = false;
+  parseTemplateXml(contentTypes, {
+    open: (element) => {
+      if (!contentTypesRootSeen) {
+        contentTypesRootSeen = true;
+        contentTypesRoot =
+          element.local === "Types" &&
+          element.uri === templatePackageContentTypesNamespace;
+      }
+      if (element.uri !== templatePackageContentTypesNamespace) {
+        return;
+      }
+      const contentType = templateAttribute(element, "ContentType");
+      if (element.local === "Default") {
+        const extension = templateAttribute(
+          element,
+          "Extension"
+        )?.toLowerCase();
+        if (!extension || !contentType || defaultContentTypes.has(extension)) {
+          fail(422, "invalid_template", "The DOCX content types are invalid");
+        }
+        defaultContentTypes.set(extension, contentType);
+      } else if (element.local === "Override") {
+        const partName = templateAttribute(element, "PartName");
+        if (
+          !partName?.startsWith("/") ||
+          !contentType ||
+          overrideContentTypes.has(partName)
+        ) {
+          fail(422, "invalid_template", "The DOCX content types are invalid");
+        }
+        overrideContentTypes.set(partName, contentType);
+      }
+    },
+  });
+  const documentOverride =
+    overrideContentTypes.get("/word/document.xml") ===
+    templateDocumentContentType;
+
+  let relationshipsRoot = false;
+  let relationshipsRootSeen = false;
+  let officeDocumentRelationship = false;
+  parseTemplateXml(relationships, {
+    open: (element) => {
+      if (!relationshipsRootSeen) {
+        relationshipsRootSeen = true;
+        relationshipsRoot =
+          element.local === "Relationships" &&
+          element.uri === templatePackageRelationshipNamespace;
+      }
+      const target = templateAttribute(element, "Target");
+      if (
+        element.local === "Relationship" &&
+        element.uri === templatePackageRelationshipNamespace &&
+        templateOfficeDocumentRelationships.has(
+          templateAttribute(element, "Type") ?? ""
+        ) &&
+        templateAttribute(element, "TargetMode") === undefined &&
+        (target === "word/document.xml" || target === "/word/document.xml")
+      ) {
+        officeDocumentRelationship = true;
+      }
+    },
+  });
+
+  let documentBody = false;
+  let documentRoot = false;
+  let documentRootSeen = false;
+  parseTemplateXml(document, {
+    open: (element) => {
+      if (!documentRootSeen) {
+        documentRootSeen = true;
+        documentRoot =
+          element.local === "document" &&
+          templateWordNamespaces.has(element.uri);
+      }
+      if (element.local === "body" && templateWordNamespaces.has(element.uri)) {
+        documentBody = true;
+      }
+    },
+  });
+
+  if (
+    !contentTypesRoot ||
+    !documentOverride ||
+    !relationshipsRoot ||
+    !officeDocumentRelationship ||
+    !documentRoot ||
+    !documentBody
+  ) {
     fail(
       422,
       "invalid_template",
-      "The template is not a readable DOCX archive"
+      "The DOCX package is missing required document parts"
     );
   }
 
-  const controls: string[] = [];
-  const sdtPrPattern = /<w:sdtPr\b[\s\S]*?<\/w:sdtPr>/gu;
-  const tagPattern =
-    /<w:tag\b[^>]*\bw:val\s*=\s*(?<quote>['"])(?<tag>.*?)\k<quote>[^>]*\/?>/u;
+  const xmlPaths = new Set([
+    "[Content_Types].xml",
+    "_rels/.rels",
+    "word/document.xml",
+  ]);
+  for (const archivePath of Object.keys(archive)) {
+    const lowercasePath = archivePath.toLowerCase();
+    const extension = lowercasePath.slice(lowercasePath.lastIndexOf(".") + 1);
+    const contentType =
+      overrideContentTypes.get(`/${archivePath}`) ??
+      defaultContentTypes.get(extension);
+    if (
+      lowercasePath.endsWith(".xml") ||
+      lowercasePath.endsWith(".rels") ||
+      lowercasePath.endsWith(".vml") ||
+      isTemplateXmlContentType(contentType)
+    ) {
+      xmlPaths.add(archivePath);
+    }
+  }
+  for (const archivePath of xmlPaths) {
+    if (
+      archivePath !== "[Content_Types].xml" &&
+      archivePath !== "_rels/.rels" &&
+      archivePath !== "word/document.xml"
+    ) {
+      parseTemplateXml(templateArchiveText(archive, archivePath));
+    }
+  }
+  return xmlPaths;
+}
 
-  for (const [archivePath, content] of Object.entries(archive)) {
-    if (!archivePath.startsWith("word/") || !archivePath.endsWith(".xml")) {
+function safeTemplateArchive(bytes: Uint8Array): {
+  archive: Record<string, Uint8Array>;
+  xmlPaths: Set<string>;
+} {
+  const archive = readTemplateArchive(bytes, () => true);
+  return {
+    archive,
+    xmlPaths: validateTemplatePackageArchive(archive),
+  };
+}
+
+function validateTemplatePackage(bytes: Uint8Array): void {
+  safeTemplateArchive(bytes);
+}
+
+function validateTemplateControls(bytes: Uint8Array): string[] {
+  const { archive, xmlPaths } = safeTemplateArchive(bytes);
+  const controls: string[] = [];
+
+  for (const archivePath of xmlPaths) {
+    if (!archivePath.startsWith("word/")) {
       continue;
     }
-    const xml = new TextDecoder().decode(content);
-    for (const properties of xml.matchAll(sdtPrPattern)) {
-      const [propertyXml] = properties;
-      const tag = tagPattern.exec(propertyXml)?.groups?.tag;
-      if (!tag?.trim()) {
-        fail(422, "invalid_template", "Every content control must have a tag");
-      }
-      controls.push(decodeXmlAttribute(tag.trim()));
-    }
+    const taggedPropertyStack: boolean[] = [];
+    parseTemplateXml(templateArchiveText(archive, archivePath), {
+      close: (element) => {
+        if (
+          element.local === "sdtPr" &&
+          templateWordNamespaces.has(element.uri) &&
+          !taggedPropertyStack.pop()
+        ) {
+          fail(
+            422,
+            "invalid_template",
+            "Every content control must have a tag"
+          );
+        }
+      },
+      open: (element) => {
+        if (
+          element.local === "sdtPr" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          taggedPropertyStack.push(false);
+          return;
+        }
+        if (
+          taggedPropertyStack.length === 0 ||
+          element.local !== "tag" ||
+          !templateWordNamespaces.has(element.uri)
+        ) {
+          return;
+        }
+        const tag = element.attributes.find(
+          (attribute) =>
+            attribute.local === "val" &&
+            templateWordNamespaces.has(attribute.uri)
+        )?.value;
+        if (!tag?.trim()) {
+          fail(
+            422,
+            "invalid_template",
+            "Every content control must have a tag"
+          );
+        }
+        taggedPropertyStack[taggedPropertyStack.length - 1] = true;
+        controls.push(tag.trim());
+      },
+    });
   }
 
   if (controls.length === 0) {
@@ -1564,11 +2205,37 @@ async function createOperation(input: {
 }): Promise<Operation> {
   try {
     return await prisma.$transaction(async (tx) => {
+      const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
+        Prisma.sql`
+          SELECT "id"
+          FROM "forms"
+          WHERE "id" = ${input.formId}::uuid
+          FOR UPDATE
+        `
+      );
+      if (!lockedForm) {
+        fail(404, "not_found", "Form was not found");
+      }
       await lockActiveEditorLease(
         tx,
         input.authorization,
         input.capabilityScope
       );
+      const activeOperation = await tx.operation.findFirst({
+        select: { id: true },
+        where: {
+          status: { in: [OperationStatus.pending, OperationStatus.processing] },
+          targetId: input.targetId,
+          targetType: input.targetType,
+        },
+      });
+      if (activeOperation) {
+        fail(
+          409,
+          "operation_in_progress",
+          "Another document operation is already in progress"
+        );
+      }
       return tx.operation.create({
         data: {
           actorId: input.actorId,
@@ -1606,7 +2273,7 @@ async function updateOperationFailed(
 ): Promise<boolean> {
   const operation = await prisma.$transaction(async (tx) => {
     const current = await tx.operation.findUnique({
-      select: { metadata: true, stagingObjectKey: true },
+      select: { actorId: true, metadata: true, stagingObjectKey: true },
       where: { id: operationId },
     });
     if (!current) {
@@ -1627,6 +2294,27 @@ async function updateOperationFailed(
     });
     if (failed.count !== 1) {
       return null;
+    }
+    if (metadata.action === "save-template") {
+      let targetId =
+        typeof metadata.publicId === "string" &&
+        publicIdPattern.test(metadata.publicId)
+          ? metadata.publicId
+          : null;
+      if (!targetId) {
+        const targetForm = await tx.form.findUnique({
+          select: { publicId: true },
+          where: { id: metadata.formId },
+        });
+        targetId = targetForm?.publicId ?? null;
+      }
+      await createFormAudit(tx, {
+        action: "save_template_draft",
+        actorId: current.actorId,
+        outcome: AuditOutcome.failure,
+        safeMetadata: { errorCode },
+        targetId,
+      });
     }
     if (metadata.action === "submit" && metadata.responseId) {
       await tx.response.updateMany({
@@ -1692,6 +2380,7 @@ async function consumeCallbackClaim(
 }
 
 export async function reconcileRecoverableState(): Promise<void> {
+  await drainObjectCleanupIntents();
   const now = new Date();
   const staleBefore = new Date(now.getTime() - operationTimeoutMs);
   await prisma.editorLease.deleteMany({
@@ -1885,7 +2574,7 @@ async function completeTemplateOperation(
     );
   }
   const nextDocumentKey = metadata.nextDocumentKey ?? documentKey;
-  const result = { documentKey: nextDocumentKey, formId: form.id };
+  const result = { documentKey: nextDocumentKey, publicId: form.publicId };
   const cleanupObjectKeys = [metadata.stagedObjectKey, templateDraft.objectKey];
   await prisma.$transaction(
     async (tx) => {
@@ -1905,6 +2594,17 @@ async function completeTemplateOperation(
           "The template changed while this operation was running"
         );
       }
+      const formUpdated = await tx.form.updateMany({
+        data: { updatedAt: new Date() },
+        where: { id: form.id },
+      });
+      if (formUpdated.count !== 1) {
+        fail(
+          409,
+          "stale_operation",
+          "The form changed while this operation was running"
+        );
+      }
       await markOperationCompleted(
         tx,
         operation.id,
@@ -1912,6 +2612,13 @@ async function completeTemplateOperation(
         metadata,
         cleanupObjectKeys
       );
+      await createFormAudit(tx, {
+        action: "save_template_draft",
+        actorId: operation.actorId,
+        outcome: AuditOutcome.success,
+        safeMetadata: {},
+        targetId: form.publicId,
+      });
     },
     { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
   );
@@ -1952,7 +2659,6 @@ async function completePublishOperation(
   const hash = contentHash(bytes);
   const result = {
     documentKey: publishedKey,
-    formId: form.id,
     publicId: form.publicId,
     version: publishedVersion,
   };
@@ -2036,7 +2742,7 @@ async function completeDraftOperation(
   ) {
     fail(409, "stale_operation", "The response is no longer editable");
   }
-  const result = { formId: response.formId, responseId: response.id };
+  const result = { publicId: metadata.publicId, responseId: response.id };
   const cleanupObjectKeys = [
     metadata.stagedObjectKey,
     ...(response.draftObjectKey ? [response.draftObjectKey] : []),
@@ -2102,7 +2808,7 @@ async function completeSubmitOperation(
 
   const submissionDocumentKey = metadata.submissionDocumentKey ?? documentKey;
   const result = {
-    formId: response.formId,
+    publicId: metadata.publicId,
     responseId: response.id,
     submissionId,
   };
@@ -2222,6 +2928,11 @@ async function finalizeCallback(
 
   let completion: OperationCompletion | undefined;
   try {
+    if (metadata.action === "save-template") {
+      validateTemplatePackage(bytes);
+    } else if (metadata.action === "publish") {
+      validateTemplateControls(bytes);
+    }
     await putObject(metadata.stagedObjectKey, bytes, DOCX_CONTENT_TYPE);
     await putObject(metadata.finalObjectKey, bytes, DOCX_CONTENT_TYPE);
 
@@ -2243,22 +2954,10 @@ async function finalizeCallback(
   await deleteObjects(completion?.cleanupObjectKeys ?? []);
 }
 
-async function findFormById(id: string): Promise<FormWithDocuments> {
-  validateId(id, "Form");
-  const form = await prisma.form.findUnique({
-    include: { publishedTemplate: true, templateDraft: true },
-    where: { id },
-  });
-  if (!form) {
-    fail(404, "not_found", "Form was not found");
-  }
-  return form;
-}
-
 async function findFormByPublicId(
   publicId: string
 ): Promise<FormWithDocuments> {
-  if (!publicId || publicId.length > 128) {
+  if (!publicIdPattern.test(publicId)) {
     fail(404, "not_found", "Form was not found");
   }
   const form = await prisma.form.findUnique({
@@ -2345,7 +3044,8 @@ async function userEditorConfig(
   const lease = await claimEditorLease(
     identity,
     capabilityScope.targetType,
-    capabilityScope.targetId
+    capabilityScope.targetId,
+    form.id
   );
   return editorConfig(
     {
@@ -2370,7 +3070,6 @@ async function userEditorConfig(
         ),
       },
       documentKey: response.draftDocumentKey,
-      formId: form.id,
       lease: editorLeaseBridge(lease),
       prefill:
         requestedAction === "fill" && snapshot
@@ -2838,266 +3537,373 @@ export function createApp(options: AppOptions = {}) {
       requireAdmin(identity);
       const items = await prisma.form.findMany({
         include: {
-          _count: { select: { submissions: true } },
+          _count: {
+            select: {
+              responses: { where: { status: ResponseStatus.draft } },
+              submissions: true,
+            },
+          },
           publishedTemplate: true,
           templateDraft: true,
         },
         orderBy: { updatedAt: "desc" },
       });
-      return {
-        forms: items.map((item) => ({
-          ...formSummary(item),
+      const forms = items.map((item) =>
+        formDto(item, {
+          activeDraftCount: item._count.responses,
           submissionCount: item._count.submissions,
-        })),
-      };
+        })
+      );
+      return { forms };
     })
-    .delete("/api/admin/forms/:id", async ({ request, params }) => {
+    .delete("/api/admin/forms/:publicId", async ({ request, params }) => {
       const identity = await requireIdentity(request);
       requireAdmin(identity);
-      const formId = validateId(params.id, "Form");
-      const { objectKeys: objectKeysToDelete } = await prisma.$transaction(
-        async (tx) => {
-          const form = await tx.form.findUnique({
-            where: { id: formId },
-          });
-          if (!form) {
-            fail(404, "not_found", "Form was not found");
-          }
-          if (form.status !== FormStatus.draft || form.version > 0) {
-            fail(
-              409,
-              "form_not_draft",
-              "Only unpublished draft forms can be removed"
-            );
-          }
-
-          const activeOperations = await tx.operation.findMany({
-            select: { id: true, updatedAt: true },
-            where: {
-              formId: form.id,
-              status: {
-                in: [OperationStatus.pending, OperationStatus.processing],
-              },
-            },
-          });
-          const staleOperationIds = new Set<string>();
-          const now = Date.now();
-          for (const operation of activeOperations) {
-            if (now - operation.updatedAt.getTime() < operationTimeoutMs) {
-              continue;
+      const publicId = params.publicId;
+      const auditTarget = publicIdPattern.test(publicId) ? publicId : null;
+      try {
+        const { objectKeys: objectKeysToDelete } = await prisma.$transaction(
+          async (tx) => {
+            if (!publicIdPattern.test(publicId)) {
+              fail(404, "not_found", "Form was not found");
             }
-            staleOperationIds.add(operation.id);
-            await tx.operation.updateMany({
-              data: {
-                errorCode: "The document operation timed out. Try again.",
-                status: OperationStatus.failed,
-                updatedAt: new Date(),
+            const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
+              Prisma.sql`
+                  SELECT "id"
+                  FROM "forms"
+                  WHERE "public_id" = ${publicId}
+                  FOR UPDATE
+                `
+            );
+            if (!lockedForm) {
+              fail(404, "not_found", "Form was not found");
+            }
+            const form = await tx.form.findUnique({
+              include: {
+                publishedTemplate: true,
+                templateDraft: true,
+              },
+              where: { id: lockedForm.id },
+            });
+            if (!form) {
+              fail(404, "not_found", "Form was not found");
+            }
+            if (form.status !== FormStatus.draft || form.version > 0) {
+              fail(
+                409,
+                "form_not_draft",
+                "Only unpublished draft forms can be removed"
+              );
+            }
+            if (form.templateDraft) {
+              const now = new Date();
+              const activeLease = await tx.editorLease.findFirst({
+                select: {
+                  holderSessionId: true,
+                  holderUserId: true,
+                },
+                where: {
+                  expiresAt: { gt: now },
+                  holderSession: { expiresAt: { gt: now } },
+                  targetId: form.templateDraft.id,
+                  targetType: OperationTargetType.template_draft,
+                },
+              });
+              const competingLease =
+                activeLease &&
+                (activeLease.holderUserId !== identity.id ||
+                  activeLease.holderSessionId !== identity.sessionId);
+              if (competingLease) {
+                fail(
+                  409,
+                  "editor_in_use",
+                  "Another Admin is editing this Template Draft"
+                );
+              }
+            }
+
+            const activeOperations = await tx.operation.findMany({
+              select: {
+                actorId: true,
+                id: true,
+                metadata: true,
+                stagingObjectKey: true,
+                updatedAt: true,
               },
               where: {
-                id: operation.id,
+                formId: form.id,
                 status: {
                   in: [OperationStatus.pending, OperationStatus.processing],
                 },
               },
             });
-          }
-          if (activeOperations.some(({ id }) => !staleOperationIds.has(id))) {
-            fail(
-              409,
-              "operation_in_progress",
-              "Wait for the draft operation to finish before removing this form"
-            );
-          }
-
-          if ((await tx.response.count({ where: { formId: form.id } })) > 0) {
-            fail(
-              409,
-              "form_has_responses",
-              "A form with responses cannot be removed"
-            );
-          }
-          if (
-            (await tx.prefillSnapshot.count({
-              where: { formId: form.id },
-            })) > 0 ||
-            (await tx.submission.count({ where: { formId: form.id } })) > 0
-          ) {
-            fail(
-              409,
-              "form_has_responses",
-              "A form with responses cannot be removed"
-            );
-          }
-
-          const templateDraft = await tx.templateDraft.findUnique({
-            select: { objectKey: true },
-            where: { formId: form.id },
-          });
-          const formOperations = await tx.operation.findMany({
-            select: { metadata: true, stagingObjectKey: true },
-            where: { formId: form.id },
-          });
-          const objectKeys = [
-            templateDraft?.objectKey,
-            ...formOperations.flatMap((operation) => {
-              const metadata = asRecord(operation.metadata);
-              return [
-                operation.stagingObjectKey,
-                typeof metadata.finalObjectKey === "string"
-                  ? metadata.finalObjectKey
-                  : undefined,
-              ];
-            }),
-          ];
-          await tx.operation.deleteMany({ where: { formId: form.id } });
-          const deleted = await tx.form.deleteMany({
-            where: { id: form.id, status: FormStatus.draft },
-          });
-          if (deleted.count !== 1) {
-            fail(409, "form_not_draft", "Only draft forms can be removed");
-          }
-          return { objectKeys };
-        },
-        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
-      );
-
-      await deleteObjects(objectKeysToDelete);
-      return { deleted: true, formId };
-    })
-    .post("/api/admin/forms", async ({ request, body }) => {
-      const identity = await requireIdentity(request);
-      requireAdmin(identity);
-      const input = asRecord(body);
-      const title = requiredString(input, "title");
-      const description = optionalString(input, "description") ?? "";
-      if (title.length > 200 || description.length > 2000) {
-        fail(400, "invalid_request", "Title or description is too long");
-      }
-
-      const id = crypto.randomUUID();
-      const publicId = crypto.randomUUID().replaceAll("-", "");
-      const sourcePath = await findTemplateSource();
-      const templateBytes = sourcePath
-        ? await readTemplateSourceBytes(sourcePath)
-        : undefined;
-      const templateObjectKey = sourcePath
-        ? objectKey("forms", id, "template-draft", crypto.randomUUID(), "docx")
-        : undefined;
-      const templateDocumentKey = sourcePath
-        ? `form-${id}-draft-${crypto.randomUUID()}`
-        : undefined;
-      try {
-        if (templateBytes && templateObjectKey) {
-          await putObject(templateObjectKey, templateBytes, DOCX_CONTENT_TYPE);
-        }
-        const form = await prisma.form.create({
-          data: {
-            creator: { connect: { id: identity.id } },
-            description,
-            id,
-            publicId,
-            title,
-            ...(templateBytes && templateObjectKey && templateDocumentKey
-              ? {
-                  templateDraft: {
-                    create: {
-                      contentHash: contentHash(templateBytes),
-                      documentKey: templateDocumentKey,
-                      objectKey: templateObjectKey,
-                    },
+            for (const operation of activeOperations) {
+              if (
+                Date.now() - operation.updatedAt.getTime() <
+                operationTimeoutMs
+              ) {
+                fail(
+                  409,
+                  "operation_in_progress",
+                  "Wait for the draft operation to finish before removing this form"
+                );
+              }
+              const failed = await tx.operation.updateMany({
+                data: {
+                  errorCode: "operation_timeout",
+                  status: OperationStatus.failed,
+                  updatedAt: new Date(),
+                },
+                where: {
+                  id: operation.id,
+                  status: {
+                    in: [OperationStatus.pending, OperationStatus.processing],
                   },
+                },
+              });
+              if (failed.count === 1) {
+                const metadata = asRecord(operation.metadata);
+                if (metadata.action === "save-template") {
+                  await createFormAudit(tx, {
+                    action: "save_template_draft",
+                    actorId: operation.actorId,
+                    outcome: AuditOutcome.failure,
+                    safeMetadata: { errorCode: "operation_timeout" },
+                    targetId: form.publicId,
+                  });
                 }
-              : {}),
+              }
+            }
+
+            const [responseCount, snapshotCount, submissionCount] =
+              await Promise.all([
+                tx.response.count({ where: { formId: form.id } }),
+                tx.prefillSnapshot.count({ where: { formId: form.id } }),
+                tx.submission.count({ where: { formId: form.id } }),
+              ]);
+            if (responseCount > 0 || snapshotCount > 0 || submissionCount > 0) {
+              fail(
+                409,
+                "form_has_responses",
+                "A form with responses cannot be removed"
+              );
+            }
+
+            const formOperations = await tx.operation.findMany({
+              select: { metadata: true, stagingObjectKey: true },
+              where: { formId: form.id },
+            });
+            const objectKeys = uniqueObjectKeys([
+              form.templateDraft?.objectKey,
+              form.publishedTemplate?.objectKey,
+              ...formOperations.flatMap((operation) => {
+                const metadata = asRecord(operation.metadata);
+                return [
+                  operation.stagingObjectKey,
+                  typeof metadata.finalObjectKey === "string"
+                    ? metadata.finalObjectKey
+                    : undefined,
+                  ...(Array.isArray(metadata.cleanupObjectKeys)
+                    ? metadata.cleanupObjectKeys.filter(
+                        (key): key is string => typeof key === "string"
+                      )
+                    : []),
+                ];
+              }),
+            ]);
+            if (objectKeys.length > 0) {
+              await tx.objectCleanupIntent.createMany({
+                data: objectKeys.map((objectKeyValue) => ({
+                  objectKey: objectKeyValue,
+                })),
+                skipDuplicates: true,
+              });
+            }
+            if (form.templateDraft) {
+              await tx.editorLease.deleteMany({
+                where: {
+                  targetId: form.templateDraft.id,
+                  targetType: OperationTargetType.template_draft,
+                },
+              });
+            }
+            await tx.operation.deleteMany({ where: { formId: form.id } });
+            await createFormAudit(tx, {
+              action: "delete_form",
+              actorId: identity.id,
+              outcome: AuditOutcome.success,
+              safeMetadata: {},
+              targetId: form.publicId,
+            });
+            const deleted = await tx.form.deleteMany({
+              where: {
+                id: form.id,
+                status: FormStatus.draft,
+                version: 0,
+              },
+            });
+            if (deleted.count !== 1) {
+              fail(409, "form_not_draft", "Only draft forms can be removed");
+            }
+            return { objectKeys };
           },
-          include: { publishedTemplate: true, templateDraft: true },
-        });
-        return {
-          form: formSummary(form),
-          templateAvailable: Boolean(sourcePath),
-        };
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+        );
+        await drainObjectCleanupIntents(objectKeysToDelete);
+        return { deleted: true };
       } catch (error) {
-        if (templateObjectKey) {
-          await deleteObjectUnlessCanonical(templateObjectKey);
+        try {
+          await createFormFailureAudit({
+            action: "delete_form",
+            actorId: identity.id,
+            error,
+            targetId: auditTarget,
+          });
+        } catch {
+          // Preserve the route error if the failure audit cannot be persisted.
         }
         throw error;
       }
     })
-    .get("/api/admin/forms/:id", async ({ request, params }) => {
+    .post(
+      "/api/admin/forms",
+      async ({ request }) => {
+        const identity = await requireIdentity(request);
+        requireAdmin(identity);
+        const id = crypto.randomUUID();
+        const publicId = crypto.randomUUID().replaceAll("-", "");
+        let source: FormSource | undefined;
+        let templateObjectKey: string | undefined;
+        try {
+          const input = await readTemplateCreationInput(request);
+          source = input.source;
+          let templateBytes: Uint8Array | undefined = input.templateBytes;
+          if (input.source === "blank") {
+            const sourcePath = await findTemplateSource();
+            if (sourcePath) {
+              templateBytes = await readTemplateSourceBytes(sourcePath);
+            }
+          }
+          if (!templateBytes) {
+            fail(
+              409,
+              "blank_template_unavailable",
+              "The configured blank template is unavailable"
+            );
+          }
+          if (input.source === "upload") {
+            validateTemplatePackage(templateBytes);
+          }
+          templateObjectKey = objectKey(
+            "forms",
+            id,
+            "template-draft",
+            crypto.randomUUID(),
+            "docx"
+          );
+          const templateDocumentKey = `template-${crypto.randomUUID()}`;
+          await prisma.objectCleanupIntent.create({
+            data: {
+              cleanupAfter: new Date(Date.now() + objectCleanupIntentGraceMs),
+              objectKey: templateObjectKey,
+            },
+          });
+          await putObject(templateObjectKey, templateBytes, DOCX_CONTENT_TYPE);
+          const form = await prisma.$transaction(async (tx) => {
+            const created = await tx.form.create({
+              data: {
+                creator: { connect: { id: identity.id } },
+                description: input.description,
+                id,
+                publicId,
+                templateDraft: {
+                  create: {
+                    contentHash: contentHash(templateBytes),
+                    documentKey: templateDocumentKey,
+                    objectKey: templateObjectKey as string,
+                  },
+                },
+                title: input.title,
+              },
+              include: { publishedTemplate: true, templateDraft: true },
+            });
+            await createFormAudit(tx, {
+              action: "create_form",
+              actorId: identity.id,
+              outcome: AuditOutcome.success,
+              safeMetadata: { source: input.source },
+              targetId: publicId,
+            });
+            await tx.objectCleanupIntent.delete({
+              where: { objectKey: templateObjectKey },
+            });
+            return created;
+          });
+          return {
+            form: formDto(form, {
+              activeDraftCount: 0,
+              submissionCount: 0,
+            }),
+          };
+        } catch (error) {
+          if (templateObjectKey) {
+            await prisma.objectCleanupIntent.updateMany({
+              data: { cleanupAfter: new Date() },
+              where: { objectKey: templateObjectKey },
+            });
+            await drainObjectCleanupIntents([templateObjectKey]);
+          }
+          try {
+            await createFormFailureAudit({
+              action: "create_form",
+              actorId: identity.id,
+              error,
+              source,
+              targetId: null,
+            });
+          } catch {
+            // Preserve the route error if the failure audit cannot be persisted.
+          }
+          throw error;
+        }
+      },
+      { parse: "none" }
+    )
+    .get("/api/admin/forms/:publicId", async ({ request, params }) => {
       const identity = await requireIdentity(request);
       requireAdmin(identity);
-      const form = await findFormById(params.id);
-      const activeDraftCount = await prisma.response.count({
-        where: { formId: form.id, status: ResponseStatus.draft },
-      });
+      const form = await findFormByPublicId(params.publicId);
+      const [activeDraftCount, submissionCount] = await Promise.all([
+        prisma.response.count({
+          where: { formId: form.id, status: ResponseStatus.draft },
+        }),
+        prisma.submission.count({ where: { formId: form.id } }),
+      ]);
       return {
-        editorConfigUrl: `/api/admin/forms/${form.id}/editor-config`,
-        form: { ...formSummary(form), activeDraftCount },
+        editorConfigUrl: `/api/admin/forms/${form.publicId}/editor-config`,
+        form: formDto(form, { activeDraftCount, submissionCount }),
       };
     })
-    .get("/api/admin/forms/:id/editor-config", async ({ request, params }) => {
-      const identity = await requireIdentity(request);
-      requireAdmin(identity);
-      const form = await findFormById(params.id);
-      const templateDraft = form.templateDraft;
-      if (!templateDraft) {
-        fail(
-          409,
-          "document_unavailable",
-          "No template DOCX is configured; provide TEMPLATE_PATH or upload a template"
-        );
-      }
-      if (!(await objectExists(templateDraft.objectKey))) {
-        fail(
-          409,
-          "document_unavailable",
-          "The template DOCX artifact is unavailable"
-        );
-      }
-      const capabilityScope = {
-        documentKey: templateDraft.documentKey,
-        formId: form.id,
-        targetId: templateDraft.id,
-        targetType: "template-draft",
-      } as const;
-      const lease = await claimEditorLease(
-        identity,
-        capabilityScope.targetType,
-        capabilityScope.targetId
-      );
-      return editorConfig(
-        {
-          action: "template-edit",
-          capabilities: {
-            publish: actionEditorCapability(
-              identity,
-              capabilityScope,
-              "publish",
-              lease
-            ),
-            "save-template": actionEditorCapability(
-              identity,
-              capabilityScope,
-              "save-template",
-              lease
-            ),
-          },
-          documentKey: templateDraft.documentKey,
-          formId: form.id,
-          lease: editorLeaseBridge(lease),
-        },
-        identity
-      );
-    })
-    .post(
-      "/api/admin/forms/:id/save",
-      async ({ request, params, body, set }) => {
-        const authorization = await requireActionEditorAuthorization(request);
-        const { actor: identity } = authorization;
+    .get(
+      "/api/admin/forms/:publicId/editor-config",
+      async ({ request, params }) => {
+        const identity = await requireIdentity(request);
         requireAdmin(identity);
-        const form = await findFormById(params.id);
+        const form = await findFormByPublicId(params.publicId);
         const templateDraft = form.templateDraft;
         if (!templateDraft) {
-          fail(409, "document_unavailable", "No template DOCX is configured");
+          fail(
+            409,
+            "document_unavailable",
+            "No template DOCX is configured; provide TEMPLATE_PATH or upload a template"
+          );
+        }
+        if (!(await objectExists(templateDraft.objectKey))) {
+          fail(
+            409,
+            "document_unavailable",
+            "The template DOCX artifact is unavailable"
+          );
         }
         const capabilityScope = {
           documentKey: templateDraft.documentKey,
@@ -3105,83 +3911,147 @@ export function createApp(options: AppOptions = {}) {
           targetId: templateDraft.id,
           targetType: "template-draft",
         } as const;
-        requireEditorScope(authorization, {
-          ...capabilityScope,
-          action: "save-template",
-        });
-        await requireActiveEditorLease(authorization, capabilityScope);
-        const input = asRecord(body);
-        const documentKey = requiredString(input, "documentKey");
-        if (templateDraft.documentKey !== documentKey) {
-          fail(
-            409,
-            "stale_document",
-            "The editor document is no longer current"
-          );
-        }
-        if (await activeOperationForForm(form.id)) {
-          fail(
-            409,
-            "operation_in_progress",
-            "A template save is already in progress"
-          );
-        }
-        const operationId = crypto.randomUUID();
-        const nextDocumentKey = `form-${form.id}-draft-${crypto.randomUUID()}`;
-        const stagedObjectKey = objectKey(
-          "operations",
-          operationId,
-          "template",
-          crypto.randomUUID(),
-          "docx"
+        const lease = await claimEditorLease(
+          identity,
+          capabilityScope.targetType,
+          capabilityScope.targetId,
+          form.id
         );
-        const metadata: OperationMetadata = {
-          action: "save-template",
-          finalObjectKey: objectKey(
-            "forms",
-            form.id,
-            "template-draft",
-            crypto.randomUUID(),
-            "docx"
-          ),
-          formId: form.id,
-          nextDocumentKey,
-          result: { documentKey: nextDocumentKey },
-          stagedObjectKey,
-        };
-        const operation = await createOperation({
-          actorId: identity.id,
-          authorization,
-          capabilityScope,
-          documentKey,
-          formId: form.id,
-          metadata,
-          ownerUserId: identity.id,
-          stagingObjectKey: stagedObjectKey,
-          targetId: templateDraft.id,
-          targetType: OperationTargetType.template_draft,
-          type: operationTypeForAction["save-template"],
-        });
-        set.status = 202;
-        launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
-        return {
-          operationCapability: operationEditorCapability(
-            identity,
-            capabilityScope,
-            operation.id
-          ),
-          operationId: operation.id,
-          status: operation.status,
-        };
+        return editorConfig(
+          {
+            action: "template-edit",
+            capabilities: {
+              publish: actionEditorCapability(
+                identity,
+                capabilityScope,
+                "publish",
+                lease
+              ),
+              "save-template": actionEditorCapability(
+                identity,
+                capabilityScope,
+                "save-template",
+                lease
+              ),
+            },
+            documentKey: templateDraft.documentKey,
+            lease: editorLeaseBridge(lease),
+            publicId: form.publicId,
+          },
+          identity
+        );
       }
     )
     .post(
-      "/api/admin/forms/:id/publish",
-      async ({ request, params, body, set }) => {
+      "/api/admin/forms/:publicId/save",
+      async ({ request, params, set }) => {
         const authorization = await requireActionEditorAuthorization(request);
         const { actor: identity } = authorization;
         requireAdmin(identity);
-        const form = await findFormById(params.id);
+        const publicId = params.publicId;
+        try {
+          const form = await findFormByPublicId(publicId);
+          const templateDraft = form.templateDraft;
+          if (!templateDraft) {
+            fail(409, "document_unavailable", "No template DOCX is configured");
+          }
+          const capabilityScope = {
+            documentKey: templateDraft.documentKey,
+            formId: form.id,
+            targetId: templateDraft.id,
+            targetType: "template-draft",
+          } as const;
+          requireEditorScope(authorization, {
+            ...capabilityScope,
+            action: "save-template",
+          });
+          await requireActiveEditorLease(authorization, capabilityScope);
+          const documentKey = await readDocumentKeyInput(request);
+          if (templateDraft.documentKey !== documentKey) {
+            fail(
+              409,
+              "stale_document",
+              "The editor document is no longer current"
+            );
+          }
+          if (await activeOperationForForm(form.id)) {
+            fail(
+              409,
+              "operation_in_progress",
+              "A template save is already in progress"
+            );
+          }
+          const operationId = crypto.randomUUID();
+          const nextDocumentKey = `template-${crypto.randomUUID()}`;
+          const stagedObjectKey = objectKey(
+            "operations",
+            operationId,
+            "template",
+            crypto.randomUUID(),
+            "docx"
+          );
+          const metadata: OperationMetadata = {
+            action: "save-template",
+            finalObjectKey: objectKey(
+              "forms",
+              form.id,
+              "template-draft",
+              crypto.randomUUID(),
+              "docx"
+            ),
+            formId: form.id,
+            nextDocumentKey,
+            publicId: form.publicId,
+            result: { documentKey: nextDocumentKey },
+            stagedObjectKey,
+          };
+          const operation = await createOperation({
+            actorId: identity.id,
+            authorization,
+            capabilityScope,
+            documentKey,
+            formId: form.id,
+            metadata,
+            ownerUserId: identity.id,
+            stagingObjectKey: stagedObjectKey,
+            targetId: templateDraft.id,
+            targetType: OperationTargetType.template_draft,
+            type: operationTypeForAction["save-template"],
+          });
+          set.status = 202;
+          launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
+          return {
+            operationCapability: operationEditorCapability(
+              identity,
+              capabilityScope,
+              operation.id
+            ),
+            operationId: operation.id,
+            status: operation.status,
+          };
+        } catch (error) {
+          try {
+            await createFormFailureAudit({
+              action: "save_template_draft",
+              actorId: identity.id,
+              error,
+              targetId: publicIdPattern.test(publicId) ? publicId : null,
+            });
+          } catch {
+            // Preserve the route error if the failure audit cannot be persisted.
+          }
+          throw error;
+        }
+      },
+      { parse: "none" }
+    )
+    .post(
+      "/api/admin/forms/:publicId/publish",
+      async ({ request, params, set }) => {
+        const authorization = await requireActionEditorAuthorization(request);
+        const { actor: identity } = authorization;
+        requireAdmin(identity);
+        const form = await findFormByPublicId(params.publicId);
         const templateDraft = form.templateDraft;
         if (!templateDraft) {
           fail(409, "document_unavailable", "No template DOCX is configured");
@@ -3197,8 +4067,7 @@ export function createApp(options: AppOptions = {}) {
           action: "publish",
         });
         await requireActiveEditorLease(authorization, capabilityScope);
-        const input = asRecord(body);
-        const documentKey = requiredString(input, "documentKey");
+        const documentKey = await readDocumentKeyInput(request);
         if (templateDraft.documentKey !== documentKey) {
           fail(
             409,
@@ -3215,7 +4084,7 @@ export function createApp(options: AppOptions = {}) {
         }
         const operationId = crypto.randomUUID();
         const version = form.version + 1;
-        const publishedKey = `form-${form.id}-published-${version}-${crypto.randomUUID()}`;
+        const publishedKey = `published-${version}-${crypto.randomUUID()}`;
         const stagedObjectKey = objectKey(
           "operations",
           operationId,
@@ -3262,33 +4131,37 @@ export function createApp(options: AppOptions = {}) {
           operationId: operation.id,
           status: operation.status,
         };
+      },
+      { parse: "none" }
+    )
+    .get(
+      "/api/admin/forms/:publicId/submissions",
+      async ({ request, params }) => {
+        const identity = await requireIdentity(request);
+        requireAdmin(identity);
+        const form = await findFormByPublicId(params.publicId);
+        const submissions = await prisma.submission.findMany({
+          include: { form: true, owner: true },
+          orderBy: { createdAt: "desc" },
+          where: { formId: form.id },
+        });
+        return {
+          submissions: submissions.map((submission) =>
+            submissionSummary(submission, {
+              formPublicId: submission.form.publicId,
+              formTitle: submission.form.title,
+              userEmail: submission.owner.email,
+            })
+          ),
+        };
       }
     )
-    .get("/api/admin/forms/:id/submissions", async ({ request, params }) => {
-      const identity = await requireIdentity(request);
-      requireAdmin(identity);
-      const form = await findFormById(params.id);
-      const submissions = await prisma.submission.findMany({
-        include: { form: true, owner: true },
-        orderBy: { createdAt: "desc" },
-        where: { formId: form.id },
-      });
-      return {
-        submissions: submissions.map((submission) =>
-          submissionSummary(submission, {
-            formTitle: submission.form.title,
-            userEmail: submission.owner.email,
-          })
-        ),
-      };
-    })
     .get("/api/forms/:publicId", async ({ params, request }) => {
       await requireIdentity(request);
       const form = await findFormByPublicId(params.publicId);
       return {
         form: {
-          description: form.description,
-          id: form.id,
+          description: form.description ?? "",
           publicId: form.publicId,
           published: Boolean(
             form.publishedTemplate?.objectKey &&
@@ -3758,7 +4631,6 @@ export function createApp(options: AppOptions = {}) {
         operation: {
           createdAt: operation.createdAt,
           error: operation.errorCode,
-          formId: operation.formId,
           id: operation.id,
           responseId: operation.responseId,
           result:
@@ -3786,6 +4658,7 @@ export function createApp(options: AppOptions = {}) {
       return {
         data: jsonRecord(submission.data),
         submission: submissionSummary(submission, {
+          formPublicId: submission.form.publicId,
           formTitle: submission.form.title,
           userEmail: submission.owner.email,
         }),
@@ -3979,5 +4852,10 @@ async function readTemplateSourceBytes(
   if (!(await file.exists())) {
     fail(404, "not_found", "Template source was not found");
   }
-  return new Uint8Array(await file.arrayBuffer());
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (bytes.byteLength > maxTemplateUploadBytes) {
+    fail(413, "payload_too_large", "Template source is too large");
+  }
+  validateTemplatePackage(bytes);
+  return bytes;
 }

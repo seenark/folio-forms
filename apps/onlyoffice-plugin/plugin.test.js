@@ -499,3 +499,20 @@ test("ignores forged or malformed capability responses", async () => {
   harness.expireCapabilityRequests();
   await expect(action).resolves.toMatchObject({ ok: false });
 });
+
+test("uses the public Form identifier for Admin template actions", async () => {
+  const harness = createHarness({
+    action: "template-edit",
+    capabilityResponses: ["action-capability"],
+    responses: [{ ok: true }],
+  });
+  acknowledgeBridge(harness);
+
+  await expect(
+    harness.window.FormBridge.runAction("save-template")
+  ).resolves.toMatchObject({ ok: true });
+  expect(harness.requests[0]?.url).toBe(
+    "https://api.example.test/api/admin/forms/public-id/save"
+  );
+  expect(harness.requests[0]?.url).not.toContain("form-id");
+});
