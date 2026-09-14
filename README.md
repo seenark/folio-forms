@@ -40,7 +40,7 @@ The accepted deployment target is one private single-host Docker Compose stack.
 | Document editor | ONLYOFFICE Docs Community Edition 9.4.0.1 | `http://localhost:8080` |
 | Database | PostgreSQL 18 | `localhost:5432` |
 | ORM and migrations | Prisma | `packages/db` |
-| Authentication | Better Auth bearer sessions | API under `/api/auth/*` |
+| Authentication | Better Auth opaque bearer sessions | Explicit sign-in, sign-out, Session, and password routes |
 | Object storage | RustFS 1.0.0-rc.6, private S3 bucket | `localhost:9000` |
 
 ## Quick start
@@ -53,13 +53,17 @@ Use this mode when the API runs as a host Bun process and PostgreSQL, RustFS, an
 bun install
 ```
 
-### 2. Configure the API
+### 2. Configure API
 
 ```bash
 cp apps/server/.env.example apps/server/.env
 ```
 
-Replace `BETTER_AUTH_SECRET` with a random value of at least 32 characters. The checked-in example and Compose RustFS credentials are for isolated local setup only.
+Replace `BETTER_AUTH_SECRET` with a random value of at least 32 characters. Compose RustFS credentials are for isolated local setup only.
+
+For the first startup when no Admin exists, set all three `BOOTSTRAP_ADMIN_NAME`, `BOOTSTRAP_ADMIN_EMAIL`, and `BOOTSTRAP_ADMIN_PASSWORD` values in `apps/server/.env`. Together they create the first `Admin` only; the password must be 12–128 characters. The bootstrapped credential forces a password replacement on first successful entry. Remove all three variables after that entry. Do not commit `.env` or put a usable password in `.env.example`.
+
+There is no public registration or direct signup. Later accounts are provisioned by authenticated Admins, and later startups never mutate an existing Admin.
 
 Canonical Template and Response DOCX objects live in the private RustFS bucket. Database rows store opaque object keys; browsers and ONLYOFFICE read them only through short-lived API authorization.
 
@@ -127,7 +131,7 @@ bun run dev
 PostgreSQL, RustFS, ONLYOFFICE, and the API run in Docker. The web app remains a host process:
 
 ```bash
-docker compose -f compose.yaml up -d --build postgres rustfs rustfs-init onlyoffice server
+docker compose --env-file apps/server/.env -f compose.yaml up -d --build postgres rustfs rustfs-init onlyoffice server
 bun run --cwd apps/web dev
 ```
 
@@ -232,14 +236,12 @@ submissions/<submissionId>/filled/<uuid>/docx
 operations/<operationId>/<kind>/<uuid>/docx
 ```
 
-The bucket is private. The API authorizes each request and streams bytes to browsers or ONLYOFFICE; it never exposes a public or presigned bucket URL. New documents are staged under Operation-specific keys, database references advance only after the object is durable, and superseded staging/Draft objects are removed after the transition succeeds. PDF exports are rendered on demand and discarded after the response.
-
-## Authentication and security
-
 - Better Auth handles email/password sign-in and PostgreSQL-backed sessions.
 - Sessions use opaque Better Auth tokens, not JWTs.
 - The frontend sends `Authorization: Bearer <session-token>`.
 - The local web app stores the token at `localStorage["onlyoffice.sessionToken"]`.
+- Each session expires one hour after issuance; sessions do not refresh or slide. The client clears the token at expiry and warns during the final five minutes.
+- Logout and password replacement revoke sessions immediately. Password replacement revokes every session, so the Admin must sign in again.
 - The server derives identity and role from Better Auth, never from client-supplied role fields.
 - Admin routes require the `admin` role.
 - User response and submission routes enforce ownership.
@@ -249,7 +251,7 @@ The bucket is private. The API authorizes each request and streams bytes to brow
 - Response JSON is restricted to published content-control tags, scalar values, and a bounded payload size.
 - Operations expire and roll back submitting responses when they remain active too long.
 
-These protections make the local prototype behaviorally safe for the demo, but the deployment defaults below are not suitable for the public internet.
+These protections cover the current local stack, but the deployment defaults below are not suitable for the public internet.
 
 ## HTTP API
 
@@ -261,16 +263,19 @@ Authorization: Bearer <opaque-better-auth-session-token>
 
 ### Authentication and health
 
-| Method | Path          | Purpose              |
-| ------ | ------------- | -------------------- |
-| `*`    | `/api/auth/*` | Better Auth handlers |
-| `GET`  | `/health`     | API health check     |
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/auth/sign-in/email` | Provisioned email/password sign-in |
+| `POST` | `/api/auth/sign-out` | Revoke the current live Session |
+| `GET` | `/api/session` | Read the current live Session and absolute expiry |
+| `POST` | `/api/account/password` | Replace the authenticated account password and revoke its Sessions |
+| `GET` | `/health` | API health check |
 
-### Public and user form operations
+### Authenticated user form operations
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/forms/:publicId` | Read public form metadata |
+| `GET` | `/api/forms/:publicId` | Read Form metadata after authentication |
 | `GET` | `/api/forms/:publicId/editor-config` | Get protected user editor config |
 | `POST` | `/api/forms/:publicId/start` | Start or resume one user response |
 | `POST` | `/api/forms/:publicId/draft` | Save a draft through an asynchronous operation |

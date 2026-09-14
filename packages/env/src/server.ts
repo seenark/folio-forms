@@ -17,6 +17,17 @@ export const env = createEnv({
 
     BETTER_AUTH_URL: z.url().default(localServerOrigin),
 
+    BOOTSTRAP_ADMIN_EMAIL: z
+      .string()
+      .trim()
+      .toLowerCase()
+      .pipe(z.email())
+      .optional(),
+
+    BOOTSTRAP_ADMIN_NAME: z.string().trim().min(1).optional(),
+
+    BOOTSTRAP_ADMIN_PASSWORD: z.string().min(12).max(128).optional(),
+
     CONVERTER_MAX_RETRIES: z.coerce.number().int().nonnegative().default(3),
 
     CONVERTER_POLL_INTERVAL_MS: z.coerce

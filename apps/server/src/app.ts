@@ -1,5 +1,5 @@
 // oxlint-disable func-style prefer-destructuring no-await-in-loop no-use-before-define no-nested-ternary complexity no-shadow -- Route modules keep declaration order and sequential persistence invariants.
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import path from "node:path";
 
 import { cors } from "@elysiajs/cors";
@@ -65,6 +65,10 @@ const fallbackTemplatePath = path.resolve(
 const idPattern = /^[0-9a-f-]{36}$/iu;
 const operationTimeoutMs = 5 * 60_000;
 const maxCallbackDocumentBytes = 25 * 1024 * 1024;
+const loginFailureLimit = 5;
+const loginFailureWindowMs = 15 * 60_000;
+const passwordMinimumLength = 12;
+const passwordMaximumLength = 128;
 const maxResponseDataBytes = 256 * 1024;
 const callbackInternalOrigin = originOf(env.ONLYOFFICE_INTERNAL_URL);
 const callbackPublicOrigin = originOf(env.ONLYOFFICE_URL);
@@ -76,10 +80,13 @@ const callbackOrigins = new Set(
 
 type UserRole = "admin" | "user";
 interface Identity {
-  id: string;
-  name: string;
   email: string;
+  expiresAt: Date;
+  id: string;
+  mustChangePassword: boolean;
+  name: string;
   role: UserRole;
+  sessionId: string;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -129,6 +136,7 @@ interface CallbackPayload {
 export interface AppOptions {
   onlyOffice?: OnlyOfficeClient;
   onlyOfficeCallbackOrigins?: readonly string[];
+  requestIp?: (request: Request) => string | null | undefined;
 }
 
 class HttpError extends Error {
@@ -306,36 +314,51 @@ function editableFieldsForSnapshot(snapshot: PrefillSnapshot): JsonRecord {
 }
 
 async function identityFor(request: Request): Promise<Identity | null> {
-  try {
-    const session = await auth.api.getSession({ headers: request.headers });
-    if (!session?.user) {
-      return null;
-    }
-    const sessionUser = session.user as unknown as {
-      id?: unknown;
-      name?: unknown;
-      email?: unknown;
-      role?: unknown;
-    };
-    if (
-      typeof sessionUser.id !== "string" ||
-      typeof sessionUser.email !== "string"
-    ) {
-      return null;
-    }
-    const role: UserRole = sessionUser.role === "admin" ? "admin" : "user";
-    return {
-      email: sessionUser.email,
-      id: sessionUser.id,
-      name:
-        typeof sessionUser.name === "string" && sessionUser.name.length > 0
-          ? sessionUser.name
-          : sessionUser.email,
-      role,
-    };
-  } catch {
+  if (!bearerTokenFor(request)) {
     return null;
   }
+  const result = await auth.api.getSession({ headers: request.headers });
+  if (!result?.user || !result.session) {
+    return null;
+  }
+  const sessionUser = result.user as unknown as {
+    email?: unknown;
+    enabled?: unknown;
+    id?: unknown;
+    mustChangePassword?: unknown;
+    name?: unknown;
+    role?: unknown;
+  };
+  const liveSession = result.session as unknown as {
+    expiresAt?: unknown;
+    id?: unknown;
+  };
+  const expiresAt =
+    liveSession.expiresAt instanceof Date
+      ? liveSession.expiresAt
+      : new Date(String(liveSession.expiresAt));
+  if (
+    typeof sessionUser.id !== "string" ||
+    typeof sessionUser.email !== "string" ||
+    sessionUser.enabled !== true ||
+    typeof liveSession.id !== "string" ||
+    Number.isNaN(expiresAt.getTime()) ||
+    expiresAt.getTime() <= Date.now()
+  ) {
+    return null;
+  }
+  return {
+    email: sessionUser.email,
+    expiresAt,
+    id: sessionUser.id,
+    mustChangePassword: sessionUser.mustChangePassword === true,
+    name:
+      typeof sessionUser.name === "string" && sessionUser.name.length > 0
+        ? sessionUser.name
+        : sessionUser.email,
+    role: sessionUser.role === "admin" ? "admin" : "user",
+    sessionId: liveSession.id,
+  };
 }
 function bearerTokenFor(request: Request): string | undefined {
   const authorization = request.headers.get("authorization");
@@ -346,10 +369,146 @@ function bearerTokenFor(request: Request): string | undefined {
   return match?.groups?.token;
 }
 
+function normalizeEmail(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function loginDigest(kind: "email" | "ip", value: string): string {
+  return createHmac("sha256", env.BETTER_AUTH_SECRET)
+    .update(`${kind}:${value}`)
+    .digest("hex");
+}
+
+function loginFailureKey(email: string, sourceIp: string) {
+  return {
+    emailDigest: loginDigest("email", email),
+    ipDigest: loginDigest("ip", sourceIp.trim().toLowerCase() || "unknown"),
+  };
+}
+
+async function reserveLoginAttempt(
+  emailDigest: string,
+  ipDigest: string
+): Promise<number> {
+  const now = new Date();
+  await prisma.loginFailure.deleteMany({
+    where: { expiresAt: { lte: now } },
+  });
+  const expiresAt = new Date(now.getTime() + loginFailureWindowMs);
+  const [failure] = await prisma.$queryRaw<{ attempts: number }[]>`
+    INSERT INTO "login_failures" AS "login_failure" (
+      "id",
+      "email_digest",
+      "ip_digest",
+      "attempts",
+      "window_started_at",
+      "expires_at",
+      "updated_at"
+    )
+    VALUES (
+      ${crypto.randomUUID()}::uuid,
+      ${emailDigest},
+      ${ipDigest},
+      1,
+      ${now},
+      ${expiresAt},
+      ${now}
+    )
+    ON CONFLICT ("email_digest", "ip_digest") DO UPDATE SET
+      "attempts" = CASE
+        WHEN "login_failure"."expires_at" <= ${now} THEN 1
+        ELSE "login_failure"."attempts" + 1
+      END,
+      "window_started_at" = CASE
+        WHEN "login_failure"."expires_at" <= ${now} THEN ${now}
+        ELSE "login_failure"."window_started_at"
+      END,
+      "expires_at" = CASE
+        WHEN "login_failure"."expires_at" <= ${now} THEN ${expiresAt}
+        ELSE "login_failure"."expires_at"
+      END,
+      "updated_at" = ${now}
+    RETURNING "attempts"
+  `;
+  return failure?.attempts ?? loginFailureLimit + 1;
+}
+
+async function clearLoginFailures(
+  emailDigest: string,
+  ipDigest: string
+): Promise<void> {
+  await prisma.loginFailure.deleteMany({ where: { emailDigest, ipDigest } });
+}
+
+function loginError(
+  status: 401 | 429,
+  error: "invalid_credentials" | "login_throttled"
+): globalThis.Response {
+  return Response.json(
+    { error, message: "Email or password is invalid" },
+    {
+      headers: status === 429 ? { "Retry-After": "900" } : undefined,
+      status,
+    }
+  );
+}
+
+async function handleEmailSignIn(
+  request: Request,
+  body: unknown,
+  sourceIp: string
+): Promise<globalThis.Response> {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return loginError(401, "invalid_credentials");
+  }
+  const input = body as JsonRecord;
+  if (typeof input.email !== "string" || typeof input.password !== "string") {
+    return loginError(401, "invalid_credentials");
+  }
+  const email = normalizeEmail(input.email);
+  const { emailDigest, ipDigest } = loginFailureKey(email, sourceIp);
+  if ((await reserveLoginAttempt(emailDigest, ipDigest)) > loginFailureLimit) {
+    return loginError(429, "login_throttled");
+  }
+  if (
+    input.password.length < passwordMinimumLength ||
+    input.password.length > passwordMaximumLength
+  ) {
+    return loginError(401, "invalid_credentials");
+  }
+
+  const headers = new Headers(request.headers);
+  headers.delete("content-length");
+  const authResponse = await auth.handler(
+    new Request(request.url, {
+      body: JSON.stringify({ email, password: input.password }),
+      headers,
+      method: "POST",
+    })
+  );
+  if (!authResponse.ok) {
+    return loginError(401, "invalid_credentials");
+  }
+
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user?.enabled) {
+    if (user) {
+      await prisma.session.deleteMany({ where: { userId: user.id } });
+    }
+    return loginError(401, "invalid_credentials");
+  }
+
+  await clearLoginFailures(emailDigest, ipDigest);
+  return authResponse;
+}
+
 async function requireIdentity(request: Request): Promise<Identity> {
   const identity = await identityFor(request);
   if (!identity) {
     fail(401, "unauthorized", "Authentication is required");
+  }
+  if (identity.mustChangePassword) {
+    fail(403, "password_change_required", "Password replacement is required");
   }
   return identity;
 }
@@ -1377,7 +1536,113 @@ export function createApp(options: AppOptions = {}) {
         origin: env.CORS_ORIGIN,
       })
     )
-    .all("/api/auth/*", ({ request }) => auth.handler(request))
+    .post("/api/auth/sign-in/email", ({ body, request, server }) => {
+      const sourceIp =
+        options.requestIp?.(request) ??
+        server?.requestIP(request)?.address ??
+        "unknown";
+      return handleEmailSignIn(request, body, sourceIp);
+    })
+    .get("/api/session", async ({ request }) => {
+      const identity = await identityFor(request);
+      if (!identity) {
+        fail(401, "unauthorized", "Authentication is required");
+      }
+      return {
+        session: { expiresAt: identity.expiresAt },
+        user: {
+          email: identity.email,
+          id: identity.id,
+          mustChangePassword: identity.mustChangePassword,
+          name: identity.name,
+          role: identity.role,
+        },
+      };
+    })
+    .post("/api/account/password", async ({ body, request }) => {
+      const identity = await identityFor(request);
+      if (!identity) {
+        fail(401, "unauthorized", "Authentication is required");
+      }
+      const input = asRecord(body);
+      const { currentPassword, newPassword } = input;
+      if (
+        typeof currentPassword !== "string" ||
+        typeof newPassword !== "string"
+      ) {
+        fail(
+          400,
+          "invalid_request",
+          "currentPassword and newPassword are required"
+        );
+      }
+      if (newPassword.length < passwordMinimumLength) {
+        fail(
+          400,
+          "password_too_short",
+          `Password must contain at least ${passwordMinimumLength} characters`
+        );
+      }
+      if (newPassword.length > passwordMaximumLength) {
+        fail(
+          400,
+          "password_too_long",
+          `Password must contain at most ${passwordMaximumLength} characters`
+        );
+      }
+      if (
+        currentPassword.length < passwordMinimumLength ||
+        currentPassword.length > passwordMaximumLength
+      ) {
+        fail(400, "invalid_current_password", "Current password is invalid");
+      }
+      const authContext = await auth.$context;
+
+      const account = await prisma.account.findFirst({
+        where: { providerId: "credential", userId: identity.id },
+      });
+      const currentHash = account?.password;
+      if (
+        !account ||
+        !currentHash ||
+        !(await authContext.password.verify({
+          hash: currentHash,
+          password: currentPassword,
+        }))
+      ) {
+        fail(400, "invalid_current_password", "Current password is invalid");
+      }
+
+      const passwordHash = await authContext.password.hash(newPassword);
+      await prisma.$transaction(async (tx) => {
+        const update = await tx.account.updateMany({
+          data: { password: passwordHash },
+          where: { id: account.id, password: currentHash },
+        });
+        if (update.count !== 1) {
+          fail(409, "credential_changed", "Credential changed concurrently");
+        }
+        await tx.user.update({
+          data: { mustChangePassword: false },
+          where: { id: identity.id },
+        });
+        await tx.session.deleteMany({ where: { userId: identity.id } });
+      });
+      return { ok: true };
+    })
+    .post("/api/auth/sign-out", async ({ request }) => {
+      const identity = await identityFor(request);
+      if (identity) {
+        await prisma.session.deleteMany({ where: { id: identity.sessionId } });
+      }
+      return { ok: true };
+    })
+    .all("/api/auth/*", () =>
+      Response.json(
+        { error: "not_found", message: "Authentication route was not found" },
+        { status: 404 }
+      )
+    )
     .get("/health", () => ({ ok: true }))
     .get("/api/admin/forms", async ({ request }) => {
       const identity = await requireIdentity(request);
@@ -1766,7 +2031,8 @@ export function createApp(options: AppOptions = {}) {
         ),
       };
     })
-    .get("/api/forms/:publicId", async ({ params }) => {
+    .get("/api/forms/:publicId", async ({ params, request }) => {
+      await requireIdentity(request);
       const form = await findFormByPublicId(params.publicId);
       return {
         form: {

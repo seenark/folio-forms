@@ -114,7 +114,7 @@ export const Badge = ({
 export const Spinner = () => (
   <span
     className="inline-block size-4 animate-spin rounded-full border-2 border-current border-r-transparent"
-    aria-label="Loading"
+    aria-label="กำลังโหลด"
   />
 );
 export const Notice = ({

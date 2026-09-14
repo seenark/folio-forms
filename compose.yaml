@@ -101,6 +101,9 @@ services:
       NODE_ENV: production
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/onlyoffice
       BETTER_AUTH_SECRET: DxQKnIZCNcMT7LrVW2oHfXYqJFUHV3mB
+      BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
       BETTER_AUTH_URL: http://localhost:3000
       CORS_ORIGIN: http://localhost:5173
       SERVER_ORIGIN: http://localhost:3000

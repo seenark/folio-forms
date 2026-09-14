@@ -2,6 +2,7 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import {
   FilePlus2,
   FileText,
+  KeyRound,
   LogOut,
   Menu,
   ShieldCheck,
@@ -10,18 +11,37 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 
-import { Button } from "@/components/ui";
+import { Button, Notice, Spinner } from "@/components/ui";
 import { roleFor, useAuth } from "@/lib/auth";
 
 export const AppShell = ({ children }: { children: React.ReactNode }) => {
   const { user, signOut } = useAuth();
+  const [logoutError, setLogoutError] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
   const [open, setOpen] = useState(false);
   const navigate = useNavigate();
   const role = roleFor(user);
+
   const logout = async () => {
-    await signOut();
-    await navigate({ to: "/login" });
+    if (loggingOut) {
+      return;
+    }
+    setLoggingOut(true);
+    setLogoutError(false);
+    try {
+      await signOut();
+      await navigate({
+        replace: true,
+        search: { returnTo: undefined },
+        to: "/login",
+      });
+    } catch {
+      setLogoutError(true);
+    } finally {
+      setLoggingOut(false);
+    }
   };
+
   return (
     <div className="min-h-screen bg-[var(--canvas)] text-[var(--ink)]">
       <header className="border-b border-[var(--line)] bg-[var(--paper)]">
@@ -40,12 +60,16 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
           </Link>
           <button
             className="rounded-lg p-2 lg:hidden"
-            aria-label="Toggle navigation"
+            type="button"
+            aria-label="เปิดหรือปิดเมนูนำทาง"
+            aria-expanded={open}
+            aria-controls="main-navigation"
             onClick={() => setOpen((value) => !value)}
           >
             {open ? <X size={20} /> : <Menu size={20} />}
           </button>
           <nav
+            id="main-navigation"
             className={`${open ? "absolute inset-x-0 top-[73px] z-10 flex border-b border-[var(--line)] bg-[var(--paper)] p-5" : "hidden"} flex-col gap-2 lg:static lg:flex lg:flex-row lg:items-center lg:border-0 lg:bg-transparent lg:p-0`}
             aria-label="Main navigation"
           >
@@ -82,6 +106,17 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
                 My responses
               </Link>
             )}
+            <Link
+              to="/change-password"
+              search={{
+                returnTo: role === "admin" ? "/admin" : "/dashboard",
+              }}
+              className="rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)]"
+              onClick={() => setOpen(false)}
+            >
+              <KeyRound className="mr-1 inline" size={15} />
+              เปลี่ยนรหัสผ่าน
+            </Link>
             <span className="mx-1 hidden h-6 w-px bg-[var(--line)] lg:block" />
             <span className="flex items-center gap-2 px-3 py-2 text-sm text-[var(--ink-soft)]">
               <span className="grid size-7 place-items-center rounded-full bg-[var(--success-soft)] text-[var(--success)]">
@@ -95,13 +130,24 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
                 {user?.name ?? user?.email}
               </span>
             </span>
-            <Button variant="ghost" size="sm" onClick={logout}>
-              <LogOut size={15} />
-              Sign out
+            <Button
+              variant="ghost"
+              size="sm"
+              type="button"
+              disabled={loggingOut}
+              onClick={logout}
+            >
+              {loggingOut ? <Spinner /> : <LogOut size={15} />}
+              {loggingOut ? "กำลังออกจากระบบ…" : "ออกจากระบบ"}
             </Button>
           </nav>
         </div>
       </header>
+      {logoutError ? (
+        <div className="mx-auto max-w-[1240px] px-5 pt-4 lg:px-8">
+          <Notice tone="danger">ไม่สามารถออกจากระบบได้ กรุณาลองใหม่อีกครั้ง</Notice>
+        </div>
+      ) : null}
       <main className="mx-auto max-w-[1240px] px-5 py-8 lg:px-8 lg:py-12">
         {children}
       </main>

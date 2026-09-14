@@ -1,37 +1,32 @@
 import {
   createFileRoute,
-  useLocation,
   useNavigate,
+  useSearch,
 } from "@tanstack/react-router";
 import { ArrowRight, KeyRound, LockKeyhole } from "lucide-react";
 import type { FormEvent } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { Button, Card, Input, Notice, Spinner } from "@/components/ui";
-import { roleFor, useAuth } from "@/lib/auth";
-
-const safeReturnTo = (value: unknown) => {
-  if (
-    typeof value !== "string" ||
-    !value.startsWith("/") ||
-    value.startsWith("//")
-  ) {
-    return null;
-  }
-  return value;
-};
+import { safeReturnPath } from "@/lib/api";
+import { authErrorMessage, roleFor, useAuth } from "@/lib/auth";
 
 const LoginRoute = () => {
-  const { signIn, user } = useAuth();
+  const { loading: authLoading, signIn, user } = useAuth();
   const navigate = useNavigate();
-  const location = useLocation();
-  const returnTo = safeReturnTo(
-    new URLSearchParams(location.searchStr).get("returnTo")
-  );
-  const [email, setEmail] = useState("user-a@example.com");
+  const { returnTo } = useSearch({ from: "/login" });
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const errorRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (error) {
+      errorRef.current?.focus();
+    }
+  }, [error]);
 
   useEffect(() => {
     if (!user) {
@@ -39,43 +34,71 @@ const LoginRoute = () => {
     }
 
     const redirect = async () => {
+      if (user.mustChangePassword) {
+        await navigate({
+          replace: true,
+          search: { returnTo },
+          to: "/change-password",
+        });
+        return;
+      }
       if (returnTo) {
-        await navigate({ to: returnTo });
+        await navigate({ replace: true, to: returnTo });
         return;
       }
-      if (roleFor(user) === "admin") {
-        await navigate({ to: "/admin" });
-        return;
-      }
-      await navigate({ to: "/dashboard" });
+      await navigate({
+        replace: true,
+        to: roleFor(user) === "admin" ? "/admin" : "/dashboard",
+      });
     };
 
     void redirect();
   }, [navigate, returnTo, user]);
 
+  if (authLoading) {
+    return (
+      <div className="grid min-h-screen place-items-center gap-3 bg-[var(--ink)] text-sm text-[var(--paper)]">
+        <Spinner />
+        <span>กำลังตรวจสอบเซสชัน…</span>
+      </div>
+    );
+  }
+
   if (user) {
-    return null;
+    return (
+      <div className="grid min-h-screen place-items-center gap-3 bg-[var(--ink)] text-sm text-[var(--paper)]">
+        <Spinner />
+        <span>กำลังเปิดพื้นที่ทำงาน…</span>
+      </div>
+    );
   }
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    setBusy(true);
     setError(null);
+    setSuccess(null);
+    if (!email.trim() || !password) {
+      setError("กรุณากรอกอีเมลและรหัสผ่าน");
+      return;
+    }
+    setBusy(true);
     try {
-      const next = await signIn(email, password);
-      if (returnTo) {
-        await navigate({ to: returnTo });
-      } else if (roleFor(next) === "admin") {
-        await navigate({ to: "/admin" });
-      } else {
-        await navigate({ to: "/dashboard" });
+      const next = await signIn(email.trim(), password);
+      if (next.mustChangePassword) {
+        setSuccess("เข้าสู่ระบบสำเร็จ กำลังไปตั้งรหัสผ่านใหม่…");
+        await navigate({
+          replace: true,
+          search: { returnTo },
+          to: "/change-password",
+        });
+        return;
       }
+      setSuccess("เข้าสู่ระบบสำเร็จ กำลังเปิดพื้นที่ทำงาน…");
+      const destination =
+        returnTo ?? (roleFor(next) === "admin" ? "/admin" : "/dashboard");
+      await navigate({ replace: true, to: destination });
     } catch (caughtError) {
-      setError(
-        caughtError instanceof Error
-          ? caughtError.message
-          : "Sign in failed. Check your email and password."
-      );
+      setError(authErrorMessage(caughtError, "signIn"));
     } finally {
       setBusy(false);
     }
@@ -93,52 +116,75 @@ const LoginRoute = () => {
           </span>
         </div>
         <Card className="p-6 sm:p-8">
-          <h1 className="text-2xl font-bold tracking-[-0.04em]">
-            Sign in to continue
-          </h1>
+          <h1 className="text-2xl font-bold tracking-[-0.04em]">เข้าสู่ระบบ</h1>
           <p className="mt-2 text-sm text-[var(--ink-soft)]">
-            Your secure workspace for thoughtful, traceable forms.
+            เข้าสู่พื้นที่ทำงานของคุณเพื่อดำเนินการต่อ
           </p>
           {error ? (
-            <div className="mt-5">
+            <div ref={errorRef} id="login-error" className="mt-5" tabIndex={-1}>
               <Notice tone="danger">{error}</Notice>
             </div>
           ) : null}
-          <form className="mt-7 space-y-5" onSubmit={submit}>
-            <label className="block text-sm font-semibold">
-              Email
+          {success ? (
+            <div className="mt-5">
+              <Notice tone="success">{success}</Notice>
+            </div>
+          ) : null}
+          <form
+            className="mt-7 space-y-5"
+            onSubmit={submit}
+            aria-busy={busy}
+            noValidate
+          >
+            <label className="block text-sm font-semibold" htmlFor="email">
+              อีเมล
               <Input
+                id="email"
                 className="mt-2"
                 type="email"
                 autoComplete="email"
+                autoFocus
                 value={email}
                 onChange={(event) => setEmail(event.target.value)}
+                aria-describedby={error ? "login-error" : undefined}
+                aria-invalid={error ? "true" : undefined}
                 required
               />
             </label>
-            <label className="block text-sm font-semibold">
-              Password
+            <label className="block text-sm font-semibold" htmlFor="password">
+              รหัสผ่าน
               <Input
+                id="password"
                 className="mt-2"
                 type="password"
                 autoComplete="current-password"
+                minLength={12}
+                maxLength={128}
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
+                aria-describedby={error ? "login-error" : undefined}
+                aria-invalid={error ? "true" : undefined}
                 required
               />
             </label>
-            <Button className="w-full" size="lg" disabled={busy}>
+            <Button className="w-full" size="lg" type="submit" disabled={busy}>
               {busy ? <Spinner /> : <KeyRound size={17} />}
-              {busy ? "Signing in…" : "Sign in"}
+              {busy ? "กำลังเข้าสู่ระบบ…" : "เข้าสู่ระบบ"}
               <ArrowRight size={16} />
             </Button>
           </form>
         </Card>
         <p className="mt-5 text-center text-xs text-[#b8c5c5]">
-          Local workspace · Sessions use opaque bearer tokens
+          พื้นที่ทำงานภายใน · ใช้โทเค็นเซสชันแบบไม่เปิดเผยข้อมูล
         </p>
       </div>
     </div>
   );
 };
-export const Route = createFileRoute("/login")({ component: LoginRoute });
+
+export const Route = createFileRoute("/login")({
+  component: LoginRoute,
+  validateSearch: (search) => ({
+    returnTo: safeReturnPath(search.returnTo) ?? undefined,
+  }),
+});

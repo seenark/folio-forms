@@ -11,9 +11,16 @@ import { useEffect, useState } from "react";
 
 import { OnlyOfficeEditor } from "@/components/onlyoffice-editor";
 import { Button, Notice, Spinner } from "@/components/ui";
-import { apiGet, apiPost } from "@/lib/api";
+import { ApiError, apiGet, apiPost, safeReturnPath } from "@/lib/api";
 import type { Operation } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+
+const formRequestError = (error: unknown, fallback: string) => {
+  if (error instanceof ApiError && error.status === 401) {
+    return "เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่";
+  }
+  return fallback;
+};
 
 interface PublicForm {
   title: string;
@@ -49,7 +56,19 @@ const FillRoute = () => {
   const [success, setSuccess] = useState<string | null>(null);
 
   useEffect(() => {
+    if (authLoading) {
+      return;
+    }
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+
     let cancelled = false;
+    setLoading(true);
+    setForm(null);
+    setEditorConfigUrl(null);
+    setError(null);
     const loadForm = async () => {
       try {
         const payload = await apiGet<{ form: PublicForm } | PublicForm>(
@@ -60,11 +79,7 @@ const FillRoute = () => {
         }
       } catch (caughtError) {
         if (!cancelled) {
-          setError(
-            caughtError instanceof Error
-              ? caughtError.message
-              : "This form is unavailable."
-          );
+          setError(formRequestError(caughtError, "This form is unavailable."));
         }
       } finally {
         if (!cancelled) {
@@ -77,10 +92,9 @@ const FillRoute = () => {
     return () => {
       cancelled = true;
     };
-  }, [publicId]);
-
+  }, [authLoading, publicId, user]);
   useEffect(() => {
-    if (!user || !form || editorConfigUrl) {
+    if (authLoading || !user || !form || editorConfigUrl) {
       return;
     }
 
@@ -101,9 +115,7 @@ const FillRoute = () => {
       } catch (caughtError) {
         if (!cancelled) {
           setError(
-            caughtError instanceof Error
-              ? caughtError.message
-              : "Could not start this response."
+            formRequestError(caughtError, "Could not start this response.")
           );
         }
       }
@@ -113,7 +125,7 @@ const FillRoute = () => {
     return () => {
       cancelled = true;
     };
-  }, [activeResponseId, editorConfigUrl, form, publicId, user]);
+  }, [activeResponseId, authLoading, editorConfigUrl, form, publicId, user]);
 
   useEffect(() => {
     const handleBridgeMessage = async (event: MessageEvent<BridgeMessage>) => {
@@ -169,6 +181,8 @@ const FillRoute = () => {
     return () => window.removeEventListener("message", handleBridgeMessage);
   }, [navigate]);
 
+  const fillPath = safeReturnPath(`/forms/${publicId}/fill`);
+
   if (authLoading || loading) {
     return (
       <div className="grid min-h-screen place-items-center">
@@ -179,7 +193,11 @@ const FillRoute = () => {
 
   if (!user) {
     return (
-      <Navigate to="/login" search={{ returnTo: `/forms/${publicId}/fill` }} />
+      <Navigate
+        to="/login"
+        search={{ returnTo: fillPath ?? undefined }}
+        replace
+      />
     );
   }
 

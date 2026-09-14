@@ -27,10 +27,21 @@ export interface SessionUser {
   name?: string;
   email: string;
   role?: Role;
+  mustChangePassword: boolean;
 }
 export interface Session {
   user: SessionUser;
+  session: { expiresAt: string };
+}
+export interface SignInResponse {
+  error?: string;
+  code?: string;
+  token?: string;
   session?: { token?: string };
+  user?: SessionUser;
+}
+export interface PasswordReplacementResponse {
+  ok: true;
 }
 export interface FormSummary {
   id: string;
@@ -88,6 +99,98 @@ export const setToken = (token: string) => {
 export const clearToken = () => {
   localStorage.removeItem(SESSION_KEY);
 };
+const AUTH_ROUTE_PREFIXES = ["/login", "/change-password"] as const;
+const RETURN_PATH_MAX_LENGTH = 2048;
+
+const containsControlCharacter = (value: string): boolean => {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint <= 31 || codePoint === 127) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const errorCodeFor = (
+  body: ApiErrorBody | null | undefined,
+  fallback: string
+): string => {
+  if (typeof body?.error === "string") {
+    return body.error;
+  }
+  if (typeof body?.code === "string") {
+    return body.code;
+  }
+  return fallback;
+};
+
+export const safeReturnPath = (value: unknown): string | null => {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > RETURN_PATH_MAX_LENGTH ||
+    !value.startsWith("/") ||
+    value.startsWith("//") ||
+    value.includes("\\") ||
+    containsControlCharacter(value)
+  ) {
+    return null;
+  }
+
+  let decodedValue: string;
+  try {
+    decodedValue = decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+  if (
+    decodedValue.startsWith("//") ||
+    decodedValue.includes("\\") ||
+    containsControlCharacter(decodedValue)
+  ) {
+    return null;
+  }
+
+  const origin =
+    typeof window === "undefined" ? "http://localhost" : window.location.origin;
+  let parsed: URL;
+  try {
+    parsed = new URL(value, origin);
+  } catch {
+    return null;
+  }
+  if (parsed.origin !== origin) {
+    return null;
+  }
+
+  const { pathname } = parsed;
+  let decodedPathname: string;
+  try {
+    decodedPathname = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  if (
+    !decodedPathname.startsWith("/") ||
+    decodedPathname.startsWith("//") ||
+    decodedPathname.includes("\\")
+  ) {
+    return null;
+  }
+
+  const normalizedPathname = decodedPathname.toLowerCase();
+  if (
+    AUTH_ROUTE_PREFIXES.some(
+      (route) =>
+        normalizedPathname === route ||
+        normalizedPathname.startsWith(`${route}/`)
+    )
+  ) {
+    return null;
+  }
+  return pathname;
+};
 
 const request = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
   const headers = new Headers(init.headers);
@@ -110,26 +213,8 @@ const request = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
     const fallbackMessage = `Request failed (${response.status})`;
     const errorBody =
       body && typeof body === "object" ? (body as ApiErrorBody) : undefined;
-    const {
-      code: bodyCode,
-      error: bodyError,
-      message: bodyMessage,
-    } = errorBody ?? {};
-    let errorMessage = fallbackMessage;
-    if (typeof bodyMessage === "string") {
-      errorMessage = bodyMessage;
-    } else if (typeof bodyError === "string") {
-      errorMessage = bodyError;
-    } else if (typeof body === "string") {
-      errorMessage = body;
-    }
-    let code = "request_failed";
-    if (typeof bodyError === "string") {
-      code = bodyError;
-    } else if (typeof bodyCode === "string") {
-      code = bodyCode;
-    }
-    throw new ApiError(response.status, code, errorMessage);
+    const code = errorCodeFor(errorBody, "request_failed");
+    throw new ApiError(response.status, code, fallbackMessage);
   }
   return body as T;
 };
@@ -161,39 +246,30 @@ export const downloadArtifact = async (path: string, filename: string) => {
   URL.revokeObjectURL(href);
 };
 
-export const getSession = () => request<Session>("/api/auth/get-session");
+export const getSession = () => request<Session>("/api/session");
 
-export const signIn = async (email: string, password: string) => {
+export const signIn = async (
+  email: string,
+  password: string
+): Promise<SignInResponse> => {
   const response = await fetch(`${API_ORIGIN}/api/auth/sign-in/email`, {
     body: JSON.stringify({ email, password }),
     headers: { "Content-Type": "application/json" },
     method: "POST",
   });
-  let body: {
-    error?: string;
-    code?: string;
-    message?: string;
-    token?: string;
-    session?: { token?: string };
-    user?: SessionUser;
-  } | null;
+  let body: SignInResponse | null = null;
   try {
-    body = (await response.json()) as {
-      error?: string;
-      code?: string;
-      message?: string;
-      token?: string;
-      session?: { token?: string };
-      user?: SessionUser;
-    };
+    body = (await response.json()) as SignInResponse;
   } catch {
     body = null;
   }
   if (!response.ok) {
-    const errorMessage =
-      body?.error ?? body?.message ?? `Request failed (${response.status})`;
-    const code = body?.error ?? body?.code ?? "sign_in_failed";
-    throw new ApiError(response.status, code, errorMessage);
+    const code = errorCodeFor(body, "sign_in_failed");
+    throw new ApiError(
+      response.status,
+      code,
+      `Request failed (${response.status})`
+    );
   }
   const headerToken = response.headers
     .get("set-auth-token")
@@ -205,12 +281,15 @@ export const signIn = async (email: string, password: string) => {
   return body ?? {};
 };
 
+export const replacePassword = (currentPassword: string, newPassword: string) =>
+  apiPost<PasswordReplacementResponse>("/api/account/password", {
+    currentPassword,
+    newPassword,
+  });
+
 export const signOut = async () => {
-  try {
-    await apiPost("/api/auth/sign-out");
-  } finally {
-    clearToken();
-  }
+  await apiPost("/api/auth/sign-out");
+  clearToken();
 };
 
 export const waitForOperation = async (
