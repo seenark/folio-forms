@@ -19,6 +19,50 @@ services:
     volumes:
       - postgres-data-v18:/var/lib/postgresql
 
+  rustfs:
+    image: rustfs/rustfs:1.0.0-rc.6@sha256:97171b3d72cd47dc81000f92ea84de25608bfc35a94c965501afaeb5d99f6035
+    container_name: onlyoffice-rustfs
+    restart: unless-stopped
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY_ID:-folioforms-local}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_ACCESS_KEY:-folioforms-local-secret-change-me}
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "--fail",
+          "--silent",
+          "http://localhost:9000/health/ready",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - rustfs-data:/data
+
+  rustfs-init:
+    image: rustfs/rc:v0.1.35@sha256:adb45b56539006120f1d790bcc17ee5f9b4d93c1d7e71ed0a24f10267f9d6914
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY_ID:-folioforms-local}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_ACCESS_KEY:-folioforms-local-secret-change-me}
+      RUSTFS_BUCKET: ${RUSTFS_BUCKET:-folio-forms}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        rc alias set local http://rustfs:9000 "$$RUSTFS_ACCESS_KEY" "$$RUSTFS_SECRET_KEY" && rc bucket create "local/$$RUSTFS_BUCKET" --ignore-existing
+
   onlyoffice:
     image: onlyoffice/documentserver:9.4.0.1
     container_name: onlyoffice
@@ -49,6 +93,8 @@ services:
         condition: service_healthy
       onlyoffice:
         condition: service_started
+      rustfs-init:
+        condition: service_completed_successfully
     ports:
       - "3000:3000"
     environment:
@@ -63,19 +109,17 @@ services:
       ONLYOFFICE_API_BASE: http://localhost:8080
       ONLYOFFICE_INTERNAL_URL: http://onlyoffice
       ONLYOFFICE_DOCUMENT_BASE_URL: http://host.docker.internal:3000
-      STORAGE_ROOT: /app/onlyoffice-submissions
+      RUSTFS_ENDPOINT: http://rustfs:9000
+      RUSTFS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY_ID:-folioforms-local}
+      RUSTFS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_ACCESS_KEY:-folioforms-local-secret-change-me}
+      RUSTFS_BUCKET: ${RUSTFS_BUCKET:-folio-forms}
+      RUSTFS_REGION: us-east-1
       TEMPLATE_PATH: /app/onlyoffice-templates/template.docx
-    command:
-      [
-        "sh",
-        "-c",
-        "bun run db:migrate && bun dist/index.mjs",
-      ]
-    volumes:
-      - ./onlyoffice-submissions:/app/onlyoffice-submissions
+    command: ["sh", "-c", "bun run db:migrate && bun dist/index.mjs"]
 
 volumes:
   postgres-data-v18:
   onlyoffice-data:
   onlyoffice-logs:
   onlyoffice-cache:
+  rustfs-data:

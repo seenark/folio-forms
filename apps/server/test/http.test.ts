@@ -1,10 +1,16 @@
 // oxlint-disable no-await-in-loop -- Operation polling must observe each sequential state transition.
 import { expect, test } from "bun:test";
-import path from "node:path";
 
 import { prisma } from "@onlyoffice/db";
 
 import { createApp } from "../src/app";
+import {
+  DOCX_CONTENT_TYPE,
+  objectExists,
+  objectKey,
+  putObject,
+  readObject,
+} from "../src/storage";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
@@ -72,6 +78,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   const adminEmail = `ticket-02-admin-${crypto.randomUUID()}@example.com`;
   const userEmail = `ticket-02-user-${crypto.randomUUID()}@example.com`;
   const password = "Ticket02-password-for-test";
+  const otherUserEmail = `ticket-03-other-${crypto.randomUUID()}@example.com`;
 
   const healthResponse = await app.handle(
     new Request("http://test.local/health")
@@ -288,6 +295,26 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     submitBody.operationId
   );
   expect(submitOperation.status).toBe("completed");
+  const otherUserSignUp = await app.handle(
+    new Request("http://test.local/api/auth/sign-up/email", {
+      body: JSON.stringify({
+        email: otherUserEmail,
+        name: "Ticket 03 Other User",
+        password,
+      }),
+      headers: jsonHeaders,
+      method: "POST",
+    })
+  );
+  expect(otherUserSignUp.status).toBe(200);
+  const otherUserBearer = await bearerFor(otherUserEmail, password);
+  const forbiddenDocxResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/docx`,
+      { headers: { Authorization: `Bearer ${otherUserBearer}` } }
+    )
+  );
+  expect(forbiddenDocxResponse.status).toBe(403);
 
   const dataResponse = await app.handle(
     new Request(
@@ -312,17 +339,17 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(docxResponse.status).toBe(200);
+  expect(docxResponse.headers.get("content-type")).toBe(DOCX_CONTENT_TYPE);
   const submissionDocument = new Uint8Array(await docxResponse.arrayBuffer());
-  const sourceDocument = new Uint8Array(
-    await Bun.file(
-      process.env.TEMPLATE_PATH ??
-        path.resolve(
-          import.meta.dir,
-          "../../../onlyoffice-templates/template.docx"
-        )
-    ).arrayBuffer()
-  );
-  expect(submissionDocument).toEqual(sourceDocument);
+  const templateDraft = await prisma.templateDraft.findUnique({
+    select: { documentKey: true, id: true, objectKey: true },
+    where: { formId },
+  });
+  if (!templateDraft) {
+    throw new Error("The test template draft was not found");
+  }
+  const sourceDocument = await readObject(templateDraft.objectKey);
+  expect(submissionDocument).toEqual(Uint8Array.from(sourceDocument));
 
   const pdfResponse = await app.handle(
     new Request(
@@ -334,4 +361,53 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   );
   expect(pdfResponse.status).toBe(200);
   expect(await pdfResponse.text()).toBe("%PDF-test");
+  const staleOperationId = crypto.randomUUID();
+  const staleStagingObjectKey = objectKey(
+    "operations",
+    staleOperationId,
+    "staged.docx"
+  );
+  const staleFinalObjectKey = objectKey(
+    "operations",
+    staleOperationId,
+    "final.docx"
+  );
+  await Promise.all([
+    putObject(staleStagingObjectKey, sourceDocument, DOCX_CONTENT_TYPE),
+    putObject(staleFinalObjectKey, sourceDocument, DOCX_CONTENT_TYPE),
+  ]);
+  await prisma.operation.create({
+    data: {
+      actorId: adminId,
+      documentKey: templateDraft.documentKey,
+      errorCode: null,
+      formId,
+      id: staleOperationId,
+      metadata: {
+        action: "save-template",
+        finalObjectKey: staleFinalObjectKey,
+        formId,
+        stagedObjectKey: staleStagingObjectKey,
+      },
+      ownerUserId: adminId,
+      stagingObjectKey: staleStagingObjectKey,
+      status: "processing",
+      targetId: templateDraft.id,
+      targetType: "template_draft",
+      type: "save_template_draft",
+      updatedAt: new Date(0),
+    },
+  });
+  const expiredOperationResponse = await app.handle(
+    new Request(`http://test.local/api/operations/${staleOperationId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(expiredOperationResponse.status).toBe(200);
+  expect(await expiredOperationResponse.json()).toMatchObject({
+    operation: { id: staleOperationId, status: "failed" },
+  });
+  expect(await objectExists(staleStagingObjectKey)).toBe(false);
+  expect(await objectExists(staleFinalObjectKey)).toBe(false);
+  expect(await objectExists(templateDraft.objectKey)).toBe(true);
 });

@@ -8,12 +8,13 @@ Folio Forms เป็นระบบสร้างและกรอกแบ�
 - **Web** รันด้วย React + Vite ที่ port `5173`
 - **ONLYOFFICE Docs** รันใน Docker ที่ port `8080`
 - **PostgreSQL** รันใน Docker ที่ port `5432`
+- **RustFS** เก็บ DOCX ใน private S3 bucket ที่ port `9000` และมี console local ที่ port `9001`
 
 เอกสารนี้อธิบายการรันระบบ MMVP, การใช้ Share Link, การจัดการ Form และตำแหน่งข้อมูลสำคัญ
 
 ## 1. การรัน Development Mode
 
-โหมดที่แนะนำคือให้ PostgreSQL และ ONLYOFFICE อยู่ใน Docker แต่ให้ API และ Web รันบนเครื่องด้วย Bun
+โหมดที่แนะนำคือให้ PostgreSQL, RustFS และ ONLYOFFICE อยู่ใน Docker แต่ให้ API และ Web รันบนเครื่องด้วย Bun
 
 ### 1.1 เตรียม Environment ครั้งแรก
 
@@ -25,6 +26,8 @@ cp apps/server/.env.example apps/server/.env
 
 จากนั้นเปลี่ยนค่า `BETTER_AUTH_SECRET` เป็นค่าสุ่มที่ยาวอย่างน้อย 32 ตัวอักษร ห้ามแชร์ค่านี้
 
+ค่า `RUSTFS_ENDPOINT`, `RUSTFS_ACCESS_KEY_ID`, `RUSTFS_SECRET_ACCESS_KEY`, `RUSTFS_BUCKET` และ `RUSTFS_REGION` ในไฟล์ตัวอย่างตรงกับ Compose local เท่านั้น Bucket ต้องเป็น private และไม่ควรใช้ credential ชุดนี้นอกเครื่องพัฒนา
+
 ไฟล์ที่เกี่ยวข้อง:
 
 ```text
@@ -32,12 +35,12 @@ apps/server/.env          ค่าที่ใช้จริงในเคร
 apps/server/.env.example  ตัวอย่างค่าที่ต้องใช้
 ```
 
-### 1.2 เริ่ม PostgreSQL และ ONLYOFFICE
+### 1.2 เริ่ม PostgreSQL, RustFS และ ONLYOFFICE
 
 ถ้า Container ทำงานอยู่แล้ว ให้ข้ามคำสั่งนี้ได้:
 
 ```bash
-docker compose -f compose.yaml up -d postgres onlyoffice
+docker compose -f compose.yaml up -d postgres rustfs rustfs-init onlyoffice
 ```
 
 ใช้ `compose.yaml` โดยระบุ `-f` เสมอ เพราะ repository มี `docker-compose.yml` อีกไฟล์หนึ่งที่เป็นไฟล์เก่าและมีเฉพาะ Server
@@ -75,7 +78,7 @@ curl http://localhost:3000/health
 ผลลัพธ์ที่ถูกต้อง:
 
 ```json
-{"ok":true}
+{ "ok": true }
 ```
 
 จากนั้นเปิดเว็บ:
@@ -90,7 +93,7 @@ http://localhost:5173
 Ctrl+C
 ```
 
-ไม่ต้องหยุด PostgreSQL หรือ ONLYOFFICE หากยังต้องการใช้ต่อ
+ไม่ต้องหยุด PostgreSQL, RustFS หรือ ONLYOFFICE หากยังต้องการใช้ต่อ
 
 ### 1.5 ห้ามรัน API สองโหมดพร้อมกัน
 
@@ -244,6 +247,7 @@ Admin จะสามารถดูข้อมูล, เปิด Receipt แ
 | `http://localhost:5173/admin/forms/new` | สร้าง Form |
 | `http://localhost:3000/health` | ตรวจ API |
 | `http://localhost:8080` | ONLYOFFICE Document Server |
+| `http://localhost:9001` | RustFS console สำหรับ local development |
 
 ถ้าเปิด Share Link โดยยังไม่ Login ระบบจะพาไป `/login` ก่อน แล้วกลับมายัง Form เดิมหลัง Login สำเร็จ
 
@@ -254,7 +258,7 @@ apps/
   server/
     src/app.ts         API routes และ workflow หลัก
     src/index.ts       Production listen entrypoint
-    src/storage.ts     ตรวจสอบและเขียน Artifact
+    src/storage.ts     Private RustFS object primitives
     src/onlyoffice.ts  Document URL, HMAC, force-save และ PDF conversion
     .env               Environment local จริง
 
@@ -281,10 +285,7 @@ packages/
 onlyoffice-templates/
   template.docx         Template DOCX ต้นฉบับ
 
-onlyoffice-submissions/
-  forms/                 Template Draft และ Published Template
-  responses/             Draft ของ User
-  submissions/           DOCX/PDF/JSON หลัง Submit
+compose.yaml            PostgreSQL, RustFS, ONLYOFFICE และ API services
 ```
 
 ## 7. ที่เก็บข้อมูลและ Artifact
@@ -302,42 +303,21 @@ Operation / CallbackClaim / EditorLease
 AuditEvent / LoginFailure / DeletionTombstone
 ```
 
-### 7.2 ไฟล์ Artifact
+### 7.2 Private DOCX objects
 
-Host API mode ใช้โฟลเดอร์:
-
-```text
-onlyoffice-submissions/
-```
-
-โครงสร้างโดยทั่วไป:
+RustFS เก็บ Template Draft, Published Template, Response Draft, Submission และไฟล์ staging ของ Operation ใน bucket `RUSTFS_BUCKET` ตัวอย่าง object key:
 
 ```text
-onlyoffice-submissions/
-  forms/
-    <formId>/
-      template-draft.docx
-      published-1.docx
-
-  responses/
-    <responseId>/
-      draft-v1.docx
-      draft-<operationId>.docx
-
-  submissions/
-    <submissionId>/
-      filled.docx
+forms/<formId>/template-draft/<uuid>/docx
+forms/<formId>/published/<version>/<uuid>/docx
+responses/<responseId>/draft/<uuid>/docx
+submissions/<submissionId>/filled/<uuid>/docx
+operations/<operationId>/<kind>/<uuid>/docx
 ```
 
-ระหว่างการประมวลผลอาจมีไฟล์ชั่วคราวที่:
+Database เก็บ object key ไม่ใช่ Absolute path ของเครื่อง Bucket ไม่มี public access Browser และ ONLYOFFICE ต้องอ่านผ่าน API ที่ตรวจสิทธิ์และใช้ authorization อายุสั้นเท่านั้น ระบบเขียน staging object ให้สำเร็จก่อนเปลี่ยน reference ใน Database แล้วจึงลบ object เก่าหรือ staging ที่หมดหน้าที่
 
-```text
-operations/<operationId>/
-```
-
-Database เก็บ object key แบบ relative ไม่ได้เก็บ Absolute path ของเครื่อง
-
-`onlyoffice-submissions/` เป็น Runtime data และถูก ignore โดย Git
+PDF ถูกสร้างเมื่อดาวน์โหลด ส่งกลับใน response แล้วทิ้งทันที ไม่มี PDF object ถาวรหรือ path ใน Database
 
 ### 7.3 Docker volumes
 
@@ -346,6 +326,7 @@ postgres-data-v18   ข้อมูล PostgreSQL
 onlyoffice-data     ข้อมูล ONLYOFFICE
 onlyoffice-logs     Log ของ ONLYOFFICE
 onlyoffice-cache    Cache ของ ONLYOFFICE
+rustfs-data         Private DOCX objects
 ```
 
 อย่าใช้ `docker compose down -v` หากไม่ได้ตั้งใจลบข้อมูลใน Database และ Docker volumes ทั้งหมด
@@ -366,12 +347,13 @@ docker compose -f compose.yaml ps
 ตรวจว่า:
 
 1. PostgreSQL ทำงานอยู่
-2. ONLYOFFICE เปิดที่ `http://localhost:8080`
-3. API ตอบที่ `http://localhost:3000`
-4. `apps/server/.env` มี `ONLYOFFICE_DOCUMENT_BASE_URL=http://host.docker.internal:3000`
-5. `STORAGE_ROOT` ชี้ไปยังโฟลเดอร์ที่เขียนได้
-6. ใช้ Host API mode หรือ Compose API mode เพียงแบบเดียว
-
+2. RustFS และ `rustfs-init` พร้อมใช้งาน
+3. ONLYOFFICE เปิดที่ `http://localhost:8080`
+4. API ตอบที่ `http://localhost:3000`
+5. `apps/server/.env` มี `ONLYOFFICE_DOCUMENT_BASE_URL=http://host.docker.internal:3000`
+6. Host API ใช้ `RUSTFS_ENDPOINT=http://localhost:9000`; Compose API ใช้ `http://rustfs:9000`
+7. `RUSTFS_BUCKET` มีอยู่และ credential สามารถอ่านเขียนได้
+8. ใช้ Host API mode หรือ Compose API mode เพียงแบบเดียว
 
 ### ไม่เห็นปุ่ม Save Draft หรือ Submit
 
@@ -390,15 +372,15 @@ docker compose -f compose.yaml ps
 ถ้าต้องการให้ API รันใน Docker ทั้งหมด ให้หยุด Host API ก่อน แล้วใช้:
 
 ```bash
-docker compose -f compose.yaml up -d --build postgres onlyoffice server
+docker compose -f compose.yaml up -d --build postgres rustfs rustfs-init onlyoffice server
 bun run --cwd apps/web dev
 ```
 
 ในโหมดนี้ Container `server` จะทำสิ่งต่อไปนี้เอง:
 
 1. Run migration
-2. Start API ที่ port `3000`
-3. Mount `./onlyoffice-submissions` เข้า `/app/onlyoffice-submissions`
+2. Connect ไปยัง private RustFS bucket ที่ `rustfs-init` สร้างไว้
+3. Start API ที่ port `3000`
 
 อย่าใช้โหมดนี้พร้อมกับ `bun run dev` เพราะจะชน port `3000`
 

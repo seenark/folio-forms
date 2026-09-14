@@ -29,12 +29,13 @@ import {
 } from "./onlyoffice";
 import type { OnlyOfficeClient } from "./onlyoffice";
 import {
-  artifactExists,
-  artifactPath,
-  readArtifact,
-  removeArtifactDirectory,
-  resolveArtifactPath,
-  writeArtifact,
+  DOCX_CONTENT_TYPE,
+  deleteObject,
+  objectExists,
+  objectKey,
+  putObject,
+  readObject,
+  streamObject,
 } from "./storage";
 
 type Form = Prisma.FormGetPayload<Prisma.FormDefaultArgs>;
@@ -56,10 +57,11 @@ function originOf(value: string): string | null {
   }
 }
 
-const projectRoot = path.resolve(import.meta.dirname, "../../..");
-const pluginDir = path.resolve(projectRoot, "apps/onlyoffice-plugin");
-const templateDir = path.resolve(projectRoot, "onlyoffice-templates");
-const templateFileName = "template.docx";
+const pluginDir = path.resolve(import.meta.dirname, "../../onlyoffice-plugin");
+const fallbackTemplatePath = path.resolve(
+  import.meta.dirname,
+  "../../../onlyoffice-templates/template.docx"
+);
 const idPattern = /^[0-9a-f-]{36}$/iu;
 const operationTimeoutMs = 5 * 60_000;
 const maxCallbackDocumentBytes = 25 * 1024 * 1024;
@@ -90,6 +92,7 @@ const operationTypeForAction: Record<OperationAction, OperationType> = {
 };
 type OperationMetadata = JsonRecord & {
   action: OperationAction;
+  cleanupObjectKeys?: string[];
   formId: string;
   responseId?: string;
   submissionId?: string;
@@ -98,11 +101,15 @@ type OperationMetadata = JsonRecord & {
   publishedKey?: string;
   submissionDocumentKey?: string;
   stagedObjectKey: string;
-  finalObjectKey?: string;
+  finalObjectKey: string;
   nextDocumentKey?: string;
   data?: JsonRecord;
   result?: JsonRecord;
 };
+
+interface OperationCompletion {
+  cleanupObjectKeys: string[];
+}
 
 type FormWithDocuments = Form & {
   templateDraft: TemplateDraft | null;
@@ -178,14 +185,19 @@ function jsonRecord(
 
 function operationMetadata(value: unknown): OperationMetadata {
   const metadata = asRecord(value, "Operation metadata is invalid");
-  const { action, formId, stagedObjectKey } = metadata;
+  const { action, cleanupObjectKeys, finalObjectKey, formId, stagedObjectKey } =
+    metadata;
   if (
     (action !== "save-template" &&
       action !== "publish" &&
       action !== "save-draft" &&
       action !== "submit") ||
     typeof formId !== "string" ||
-    typeof stagedObjectKey !== "string"
+    typeof stagedObjectKey !== "string" ||
+    typeof finalObjectKey !== "string" ||
+    (cleanupObjectKeys !== undefined &&
+      (!Array.isArray(cleanupObjectKeys) ||
+        cleanupObjectKeys.some((key) => typeof key !== "string")))
   ) {
     fail(500, "invalid_operation", "Operation metadata is invalid");
   }
@@ -208,6 +220,75 @@ function databaseErrorCode(error: unknown): string | null {
 
 function contentHash(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+async function deleteObjects(
+  keys: readonly (string | null | undefined)[]
+): Promise<void> {
+  const uniqueKeys = [
+    ...new Set(
+      keys.filter(
+        (key): key is string => typeof key === "string" && key.length > 0
+      )
+    ),
+  ];
+  await Promise.all(
+    uniqueKeys.map(async (key) => {
+      try {
+        await deleteObject(key);
+      } catch (error) {
+        console.error(`Could not remove object ${key}`, error);
+      }
+    })
+  );
+}
+
+async function deleteObjectUnlessCanonical(key: string): Promise<void> {
+  try {
+    const references = await Promise.all([
+      prisma.templateDraft.findFirst({
+        select: { id: true },
+        where: { objectKey: key },
+      }),
+      prisma.publishedTemplate.findFirst({
+        select: { id: true },
+        where: { objectKey: key },
+      }),
+      prisma.response.findFirst({
+        select: { id: true },
+        where: { draftObjectKey: key },
+      }),
+      prisma.submission.findFirst({
+        select: { id: true },
+        where: { objectKey: key },
+      }),
+    ]);
+    if (references.every((reference) => reference === null)) {
+      await deleteObjects([key]);
+    }
+  } catch (error) {
+    console.error(`Could not verify whether object ${key} is canonical`, error);
+  }
+}
+
+async function cleanupTerminalOperationObjects(
+  operation: Operation
+): Promise<void> {
+  if (
+    operation.status !== OperationStatus.completed &&
+    operation.status !== OperationStatus.failed
+  ) {
+    return;
+  }
+  const metadata = operationMetadata(operation.metadata);
+  if (operation.status === OperationStatus.completed) {
+    await deleteObjects(
+      metadata.cleanupObjectKeys ?? [metadata.stagedObjectKey]
+    );
+    return;
+  }
+  await deleteObjects([metadata.stagedObjectKey]);
+  await deleteObjectUnlessCanonical(metadata.finalObjectKey);
 }
 
 function jsonValue(value: unknown): Prisma.InputJsonValue {
@@ -349,20 +430,12 @@ function submissionSummary(
 }
 
 async function findTemplateSource(): Promise<string | null> {
-  const candidates = [
-    env.TEMPLATE_PATH,
-    path.resolve(templateDir, templateFileName),
-    path.resolve(process.cwd(), "onlyoffice-templates", templateFileName),
-  ];
-  for (const candidate of candidates) {
-    if (!candidate) {
-      continue;
-    }
-    if (await Bun.file(candidate).exists()) {
-      return candidate;
-    }
+  const configuredSource = Bun.file(env.TEMPLATE_PATH);
+  if (await configuredSource.exists()) {
+    return env.TEMPLATE_PATH;
   }
-  return null;
+  const fallbackSource = Bun.file(fallbackTemplatePath);
+  return (await fallbackSource.exists()) ? fallbackTemplatePath : null;
 }
 function decodeXmlAttribute(value: string): string {
   return value
@@ -464,7 +537,6 @@ function validateTemplateControls(bytes: Uint8Array): string[] {
       "The template must contain at least one tagged content control"
     );
   }
-
   const duplicates = controls.filter(
     (tag, index) => controls.indexOf(tag) !== index
   );
@@ -491,7 +563,7 @@ async function normalizeResponseData(
   if (!publishedTemplate?.objectKey) {
     fail(409, "not_published", "This form has not been published");
   }
-  const templateBytes = await readArtifact(publishedTemplate.objectKey);
+  const templateBytes = await readObject(publishedTemplate.objectKey);
   const controls = new Set(validateTemplateControls(templateBytes));
   const unknownFields = Object.keys(data).filter(
     (field) => !controls.has(field)
@@ -591,7 +663,11 @@ async function updateOperationFailed(
   operationId: string,
   message: string
 ): Promise<void> {
-  await prisma.operation.updateMany({
+  const operation = await prisma.operation.findUnique({
+    select: { metadata: true, stagingObjectKey: true },
+    where: { id: operationId },
+  });
+  const failed = await prisma.operation.updateMany({
     data: {
       errorCode: message,
       status: OperationStatus.failed,
@@ -602,6 +678,10 @@ async function updateOperationFailed(
       status: { in: [OperationStatus.pending, OperationStatus.processing] },
     },
   });
+  if (failed.count === 1 && operation) {
+    const metadata = operationMetadata(operation.metadata);
+    await deleteObjects([operation.stagingObjectKey, metadata.finalObjectKey]);
+  }
 }
 
 async function expireOperationIfNeeded(
@@ -654,7 +734,7 @@ function launchForceSave(
         createCallbackUserdata(operation.id)
       );
       if (!hasChanges) {
-        const currentObjectKey = await operationDocumentPath(
+        const currentObjectKey = await operationDocumentKey(
           operation.documentKey
         );
         if (!currentObjectKey) {
@@ -667,7 +747,7 @@ function launchForceSave(
         await finalizeCallback(
           operation.id,
           { key: operation.documentKey, status: 6 },
-          await readArtifact(currentObjectKey),
+          await readObject(currentObjectKey),
           allowedCallbackOrigins
         );
       }
@@ -681,7 +761,7 @@ function launchForceSave(
   })();
 }
 
-async function operationDocumentPath(
+async function operationDocumentKey(
   documentKey: string
 ): Promise<string | null> {
   const pending = await prisma.operation.findMany({
@@ -695,7 +775,7 @@ async function operationDocumentPath(
   });
   for (const operation of pending) {
     const metadata = operationMetadata(operation.metadata);
-    if (await artifactExists(metadata.stagedObjectKey)) {
+    if (await objectExists(metadata.stagedObjectKey)) {
       return metadata.stagedObjectKey;
     }
   }
@@ -726,11 +806,35 @@ async function operationDocumentPath(
   return submission?.objectKey ?? null;
 }
 
+async function markOperationCompleted(
+  tx: Prisma.TransactionClient,
+  operationId: string,
+  result: JsonRecord,
+  metadata: OperationMetadata,
+  cleanupObjectKeys: string[],
+  submissionId?: string
+): Promise<void> {
+  const completed = await tx.operation.updateMany({
+    data: {
+      errorCode: null,
+      metadata: jsonValue({ ...metadata, cleanupObjectKeys }),
+      result: jsonValue(result),
+      status: OperationStatus.completed,
+      ...(submissionId ? { submissionId } : {}),
+      updatedAt: new Date(),
+    },
+    where: { id: operationId, status: OperationStatus.processing },
+  });
+  if (completed.count !== 1) {
+    fail(409, "stale_operation", "The document operation is no longer active");
+  }
+}
+
 async function completeTemplateOperation(
   operation: Operation,
   metadata: OperationMetadata,
   bytes: Uint8Array
-): Promise<JsonRecord> {
+): Promise<OperationCompletion> {
   const { documentKey } = operation;
   if (!documentKey) {
     fail(500, "invalid_operation", "Template operation has no document key");
@@ -750,35 +854,45 @@ async function completeTemplateOperation(
       "The template changed while this operation was running"
     );
   }
-  const finalObjectKey =
-    metadata.finalObjectKey ??
-    artifactPath("forms", form.id, "template-draft.docx");
   const nextDocumentKey = metadata.nextDocumentKey ?? documentKey;
-  await writeArtifact(finalObjectKey, bytes);
-  const updated = await prisma.templateDraft.updateMany({
-    data: {
-      contentHash: contentHash(bytes),
-      documentKey: nextDocumentKey,
-      objectKey: finalObjectKey,
-      updatedAt: new Date(),
+  const result = { documentKey: nextDocumentKey, formId: form.id };
+  const cleanupObjectKeys = [metadata.stagedObjectKey, templateDraft.objectKey];
+  await prisma.$transaction(
+    async (tx) => {
+      const updated = await tx.templateDraft.updateMany({
+        data: {
+          contentHash: contentHash(bytes),
+          documentKey: nextDocumentKey,
+          objectKey: metadata.finalObjectKey,
+          updatedAt: new Date(),
+        },
+        where: { documentKey, id: templateDraft.id },
+      });
+      if (updated.count !== 1) {
+        fail(
+          409,
+          "stale_operation",
+          "The template changed while this operation was running"
+        );
+      }
+      await markOperationCompleted(
+        tx,
+        operation.id,
+        result,
+        metadata,
+        cleanupObjectKeys
+      );
     },
-    where: { documentKey, id: templateDraft.id },
-  });
-  if (updated.count !== 1) {
-    fail(
-      409,
-      "stale_operation",
-      "The template changed while this operation was running"
-    );
-  }
-  return { documentKey: nextDocumentKey, formId: form.id };
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+  );
+  return { cleanupObjectKeys };
 }
 
 async function completePublishOperation(
   operation: Operation,
   metadata: OperationMetadata,
   bytes: Uint8Array
-): Promise<JsonRecord> {
+): Promise<OperationCompletion> {
   const { documentKey } = operation;
   if (!documentKey) {
     fail(500, "invalid_operation", "Publish operation has no document key");
@@ -801,11 +915,21 @@ async function completePublishOperation(
     fail(500, "invalid_operation", "Publish metadata is incomplete");
   }
   const controls = validateTemplateControls(bytes);
-  const finalObjectKey =
-    metadata.finalObjectKey ??
-    artifactPath("forms", form.id, `published-${publishedVersion}.docx`);
+  const previousPublished = await prisma.publishedTemplate.findUnique({
+    select: { objectKey: true },
+    where: { formId: form.id },
+  });
   const hash = contentHash(bytes);
-  await writeArtifact(finalObjectKey, bytes);
+  const result = {
+    documentKey: publishedKey,
+    formId: form.id,
+    publicId: form.publicId,
+    version: publishedVersion,
+  };
+  const cleanupObjectKeys = [
+    metadata.stagedObjectKey,
+    ...(previousPublished ? [previousPublished.objectKey] : []),
+  ];
   await prisma.$transaction(
     async (tx) => {
       await tx.publishedTemplate.create({
@@ -827,7 +951,7 @@ async function completePublishOperation(
               },
             },
           },
-          objectKey: finalObjectKey,
+          objectKey: metadata.finalObjectKey,
           version: publishedVersion,
         },
       });
@@ -846,22 +970,25 @@ async function completePublishOperation(
       if (updated.count !== 1) {
         fail(409, "stale_operation", "The form changed while publishing");
       }
+      await markOperationCompleted(
+        tx,
+        operation.id,
+        result,
+        metadata,
+        cleanupObjectKeys
+      );
     },
     { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
   );
-  return {
-    documentKey: publishedKey,
-    formId: form.id,
-    publicId: form.publicId,
-    version: publishedVersion,
-  };
+  return { cleanupObjectKeys };
 }
 
 async function completeDraftOperation(
   operation: Operation,
   metadata: OperationMetadata,
   bytes: Uint8Array
-): Promise<JsonRecord> {
+): Promise<OperationCompletion> {
+  void bytes;
   const { documentKey } = operation;
   if (!documentKey) {
     fail(500, "invalid_operation", "Draft operation has no document key");
@@ -879,46 +1006,55 @@ async function completeDraftOperation(
   ) {
     fail(409, "stale_operation", "The response is no longer editable");
   }
-  const finalObjectKey =
-    metadata.finalObjectKey ??
-    artifactPath("responses", response.id, "draft.docx");
-  await writeArtifact(finalObjectKey, bytes);
-  const updated = await prisma.response.updateMany({
-    data: {
-      draftData: jsonValue(metadata.data),
-      draftObjectKey: finalObjectKey,
-      updatedAt: new Date(),
+  const result = { formId: response.formId, responseId: response.id };
+  const cleanupObjectKeys = [
+    metadata.stagedObjectKey,
+    ...(response.draftObjectKey ? [response.draftObjectKey] : []),
+  ];
+  await prisma.$transaction(
+    async (tx) => {
+      const updated = await tx.response.updateMany({
+        data: {
+          draftData: jsonValue(metadata.data),
+          draftObjectKey: metadata.finalObjectKey,
+          updatedAt: new Date(),
+        },
+        where: {
+          draftDocumentKey: documentKey,
+          id: response.id,
+          status: ResponseStatus.draft,
+        },
+      });
+      if (updated.count !== 1) {
+        fail(409, "stale_operation", "The response is no longer editable");
+      }
+      await markOperationCompleted(
+        tx,
+        operation.id,
+        result,
+        metadata,
+        cleanupObjectKeys
+      );
     },
-    where: {
-      draftDocumentKey: documentKey,
-      id: response.id,
-      status: ResponseStatus.draft,
-    },
-  });
-  if (updated.count !== 1) {
-    fail(409, "stale_operation", "The response is no longer editable");
-  }
-  return { formId: response.formId, responseId: response.id };
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+  );
+  return { cleanupObjectKeys };
 }
 
 async function completeSubmitOperation(
   operation: Operation,
   metadata: OperationMetadata,
   bytes: Uint8Array
-): Promise<JsonRecord> {
+): Promise<OperationCompletion> {
+  void bytes;
   const { documentKey } = operation;
   if (!documentKey) {
     fail(500, "invalid_operation", "Submit operation has no document key");
   }
-  if (
-    !metadata.responseId ||
-    !metadata.submissionId ||
-    !metadata.data ||
-    !metadata.finalObjectKey
-  ) {
+  if (!metadata.responseId || !metadata.submissionId || !metadata.data) {
     fail(500, "invalid_operation", "Submit metadata is incomplete");
   }
-  const { responseId, submissionId, data, finalObjectKey } = metadata;
+  const { responseId, submissionId, data } = metadata;
   const response = await prisma.response.findUnique({
     where: { id: responseId },
   });
@@ -933,10 +1069,6 @@ async function completeSubmitOperation(
       "The response is no longer pending submission"
     );
   }
-  await writeArtifact(finalObjectKey, bytes);
-  if (!(await artifactExists(finalObjectKey))) {
-    fail(500, "artifact_failed", "Submission artifact was not persisted");
-  }
 
   const submissionDocumentKey = metadata.submissionDocumentKey ?? documentKey;
   const result = {
@@ -944,6 +1076,10 @@ async function completeSubmitOperation(
     responseId: response.id,
     submissionId,
   };
+  const cleanupObjectKeys = [
+    metadata.stagedObjectKey,
+    ...(response.draftObjectKey ? [response.draftObjectKey] : []),
+  ];
   await prisma.$transaction(
     async (tx) => {
       const claimed = await tx.operation.updateMany({
@@ -963,7 +1099,7 @@ async function completeSubmitOperation(
           documentKey: submissionDocumentKey,
           form: { connect: { id: response.formId } },
           id: submissionId,
-          objectKey: finalObjectKey,
+          objectKey: metadata.finalObjectKey,
           owner: { connect: { id: response.userId } },
           response: { connect: { id: response.id } },
         },
@@ -985,27 +1121,18 @@ async function completeSubmitOperation(
           "The response is no longer pending submission"
         );
       }
-      const completed = await tx.operation.updateMany({
-        data: {
-          errorCode: null,
-          result: jsonValue(result),
-          status: OperationStatus.completed,
-          submissionId,
-          updatedAt: new Date(),
-        },
-        where: { id: operation.id, status: OperationStatus.processing },
-      });
-      if (completed.count !== 1) {
-        fail(
-          409,
-          "stale_operation",
-          "The submission operation is no longer active"
-        );
-      }
+      await markOperationCompleted(
+        tx,
+        operation.id,
+        result,
+        metadata,
+        cleanupObjectKeys,
+        submissionId
+      );
     },
     { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
   );
-  return result;
+  return { cleanupObjectKeys };
 }
 
 async function finalizeCallback(
@@ -1017,11 +1144,14 @@ async function finalizeCallback(
   const operation = await prisma.operation.findUnique({
     where: { id: operationId },
   });
+  if (!operation) {
+    return;
+  }
   if (
-    !operation ||
     operation.status === OperationStatus.completed ||
     operation.status === OperationStatus.failed
   ) {
+    await cleanupTerminalOperationObjects(operation);
     return;
   }
   const metadata = operationMetadata(operation.metadata);
@@ -1067,27 +1197,28 @@ async function finalizeCallback(
   if (claimed.count !== 1) {
     return;
   }
-  await writeArtifact(metadata.stagedObjectKey, bytes);
 
-  let result: JsonRecord;
-  if (metadata.action === "save-template") {
-    result = await completeTemplateOperation(operation, metadata, bytes);
-  } else if (metadata.action === "publish") {
-    result = await completePublishOperation(operation, metadata, bytes);
-  } else if (metadata.action === "save-draft") {
-    result = await completeDraftOperation(operation, metadata, bytes);
-  } else {
-    result = await completeSubmitOperation(operation, metadata, bytes);
+  let completion: OperationCompletion | undefined;
+  try {
+    await putObject(metadata.stagedObjectKey, bytes, DOCX_CONTENT_TYPE);
+    await putObject(metadata.finalObjectKey, bytes, DOCX_CONTENT_TYPE);
+
+    if (metadata.action === "save-template") {
+      completion = await completeTemplateOperation(operation, metadata, bytes);
+    } else if (metadata.action === "publish") {
+      completion = await completePublishOperation(operation, metadata, bytes);
+    } else if (metadata.action === "save-draft") {
+      completion = await completeDraftOperation(operation, metadata, bytes);
+    } else {
+      completion = await completeSubmitOperation(operation, metadata, bytes);
+    }
+  } catch (error) {
+    await deleteObjects([metadata.stagedObjectKey]);
+    await deleteObjectUnlessCanonical(metadata.finalObjectKey);
+    throw error;
   }
-  await prisma.operation.updateMany({
-    data: {
-      errorCode: null,
-      result: jsonValue(result),
-      status: OperationStatus.completed,
-      updatedAt: new Date(),
-    },
-    where: { id: operation.id, status: OperationStatus.processing },
-  });
+
+  await deleteObjects(completion?.cleanupObjectKeys ?? []);
 }
 
 async function findFormById(id: string): Promise<FormWithDocuments> {
@@ -1176,7 +1307,7 @@ async function userEditorConfig(
   if (!response.draftDocumentKey || !response.draftObjectKey) {
     fail(409, "document_unavailable", "Response document is unavailable");
   }
-  if (!(await artifactExists(response.draftObjectKey))) {
+  if (!(await objectExists(response.draftObjectKey))) {
     fail(
       409,
       "document_unavailable",
@@ -1207,22 +1338,6 @@ async function userEditorConfig(
     },
     identity
   );
-}
-async function removeArtifactDirectoryWithRetry(
-  relativePath: string
-): Promise<void> {
-  try {
-    await removeArtifactDirectory(relativePath);
-  } catch {
-    try {
-      await removeArtifactDirectory(relativePath);
-    } catch (error) {
-      console.error(
-        `Could not remove artifact directory ${relativePath}`,
-        error
-      );
-    }
-  }
 }
 
 export function createApp(options: AppOptions = {}) {
@@ -1286,7 +1401,7 @@ export function createApp(options: AppOptions = {}) {
       const identity = await requireIdentity(request);
       requireAdmin(identity);
       const formId = validateId(params.id, "Form");
-      const { operationIds } = await prisma.$transaction(
+      const { objectKeys: objectKeysToDelete } = await prisma.$transaction(
         async (tx) => {
           const form = await tx.form.findUnique({
             where: { id: formId },
@@ -1360,10 +1475,26 @@ export function createApp(options: AppOptions = {}) {
             );
           }
 
-          const formOperations = await tx.operation.findMany({
-            select: { id: true },
+          const templateDraft = await tx.templateDraft.findUnique({
+            select: { objectKey: true },
             where: { formId: form.id },
           });
+          const formOperations = await tx.operation.findMany({
+            select: { metadata: true, stagingObjectKey: true },
+            where: { formId: form.id },
+          });
+          const objectKeys = [
+            templateDraft?.objectKey,
+            ...formOperations.flatMap((operation) => {
+              const metadata = asRecord(operation.metadata);
+              return [
+                operation.stagingObjectKey,
+                typeof metadata.finalObjectKey === "string"
+                  ? metadata.finalObjectKey
+                  : undefined,
+              ];
+            }),
+          ];
           await tx.operation.deleteMany({ where: { formId: form.id } });
           const deleted = await tx.form.deleteMany({
             where: { id: form.id, status: FormStatus.draft },
@@ -1371,19 +1502,12 @@ export function createApp(options: AppOptions = {}) {
           if (deleted.count !== 1) {
             fail(409, "form_not_draft", "Only draft forms can be removed");
           }
-          return { operationIds: formOperations.map(({ id }) => id) };
+          return { objectKeys };
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       );
 
-      await Promise.all([
-        removeArtifactDirectoryWithRetry(artifactPath("forms", formId)),
-        ...operationIds.map((operationId) =>
-          removeArtifactDirectoryWithRetry(
-            artifactPath("operations", operationId)
-          )
-        ),
-      ]);
+      await deleteObjects(objectKeysToDelete);
       return { deleted: true, formId };
     })
     .post("/api/admin/forms", async ({ request, body }) => {
@@ -1400,42 +1524,49 @@ export function createApp(options: AppOptions = {}) {
       const publicId = crypto.randomUUID().replaceAll("-", "");
       const sourcePath = await findTemplateSource();
       const templateBytes = sourcePath
-        ? await readArtifactFromAbsolute(sourcePath)
+        ? await readTemplateSourceBytes(sourcePath)
         : undefined;
       const templateObjectKey = sourcePath
-        ? artifactPath("forms", id, "template-draft.docx")
+        ? objectKey("forms", id, "template-draft", crypto.randomUUID(), "docx")
         : undefined;
       const templateDocumentKey = sourcePath
         ? `form-${id}-draft-${crypto.randomUUID()}`
         : undefined;
-      if (templateBytes && templateObjectKey) {
-        await writeArtifact(templateObjectKey, templateBytes);
-      }
-      const form = await prisma.form.create({
-        data: {
-          creator: { connect: { id: identity.id } },
-          description,
-          id,
-          publicId,
-          title,
-          ...(templateBytes && templateObjectKey && templateDocumentKey
-            ? {
-                templateDraft: {
-                  create: {
-                    contentHash: contentHash(templateBytes),
-                    documentKey: templateDocumentKey,
-                    objectKey: templateObjectKey,
+      try {
+        if (templateBytes && templateObjectKey) {
+          await putObject(templateObjectKey, templateBytes, DOCX_CONTENT_TYPE);
+        }
+        const form = await prisma.form.create({
+          data: {
+            creator: { connect: { id: identity.id } },
+            description,
+            id,
+            publicId,
+            title,
+            ...(templateBytes && templateObjectKey && templateDocumentKey
+              ? {
+                  templateDraft: {
+                    create: {
+                      contentHash: contentHash(templateBytes),
+                      documentKey: templateDocumentKey,
+                      objectKey: templateObjectKey,
+                    },
                   },
-                },
-              }
-            : {}),
-        },
-        include: { publishedTemplate: true, templateDraft: true },
-      });
-      return {
-        form: formSummary(form),
-        templateAvailable: Boolean(sourcePath),
-      };
+                }
+              : {}),
+          },
+          include: { publishedTemplate: true, templateDraft: true },
+        });
+        return {
+          form: formSummary(form),
+          templateAvailable: Boolean(sourcePath),
+        };
+      } catch (error) {
+        if (templateObjectKey) {
+          await deleteObjectUnlessCanonical(templateObjectKey);
+        }
+        throw error;
+      }
     })
     .get("/api/admin/forms/:id", async ({ request, params }) => {
       const identity = await requireIdentity(request);
@@ -1461,7 +1592,7 @@ export function createApp(options: AppOptions = {}) {
           "No template DOCX is configured; provide TEMPLATE_PATH or upload a template"
         );
       }
-      if (!(await artifactExists(templateDraft.objectKey))) {
+      if (!(await objectExists(templateDraft.objectKey))) {
         fail(
           409,
           "document_unavailable",
@@ -1511,17 +1642,21 @@ export function createApp(options: AppOptions = {}) {
         }
         const operationId = crypto.randomUUID();
         const nextDocumentKey = `form-${form.id}-draft-${crypto.randomUUID()}`;
-        const stagedObjectKey = artifactPath(
+        const stagedObjectKey = objectKey(
           "operations",
           operationId,
-          "template.docx"
+          "template",
+          crypto.randomUUID(),
+          "docx"
         );
         const metadata: OperationMetadata = {
           action: "save-template",
-          finalObjectKey: artifactPath(
+          finalObjectKey: objectKey(
             "forms",
             form.id,
-            `template-draft-${operationId}.docx`
+            "template-draft",
+            crypto.randomUUID(),
+            "docx"
           ),
           formId: form.id,
           nextDocumentKey,
@@ -1575,17 +1710,22 @@ export function createApp(options: AppOptions = {}) {
         const operationId = crypto.randomUUID();
         const version = form.version + 1;
         const publishedKey = `form-${form.id}-published-${version}-${crypto.randomUUID()}`;
-        const stagedObjectKey = artifactPath(
+        const stagedObjectKey = objectKey(
           "operations",
           operationId,
-          "published.docx"
+          "published",
+          crypto.randomUUID(),
+          "docx"
         );
         const metadata: OperationMetadata = {
           action: "publish",
-          finalObjectKey: artifactPath(
+          finalObjectKey: objectKey(
             "forms",
             form.id,
-            `published-${version}.docx`
+            "published",
+            String(version),
+            crypto.randomUUID(),
+            "docx"
           ),
           formId: form.id,
           publishedKey,
@@ -1694,7 +1834,7 @@ export function createApp(options: AppOptions = {}) {
         existing.draftObjectKey &&
         existing.draftDocumentKey
       ) {
-        if (!(await artifactExists(existing.draftObjectKey))) {
+        if (!(await objectExists(existing.draftObjectKey))) {
           fail(
             409,
             "document_unavailable",
@@ -1708,115 +1848,123 @@ export function createApp(options: AppOptions = {}) {
         };
       }
 
-      if (!(await artifactExists(publishedTemplate.objectKey))) {
+      if (!(await objectExists(publishedTemplate.objectKey))) {
         fail(
           409,
           "document_unavailable",
           "The published document artifact is unavailable"
         );
       }
-      const document = await readArtifact(publishedTemplate.objectKey);
+      const document = await readObject(publishedTemplate.objectKey);
       const responseId = existing?.id ?? crypto.randomUUID();
-      const draftObjectKey = artifactPath(
+      const draftObjectKey = objectKey(
         "responses",
         responseId,
-        `draft-v${form.version}.docx`
+        "draft",
+        crypto.randomUUID(),
+        "docx"
       );
       const draftDocumentKey = `response-${responseId}-${crypto.randomUUID()}`;
       const snapshotId = crypto.randomUUID();
-      await writeArtifact(draftObjectKey, document);
+      try {
+        await putObject(draftObjectKey, document, DOCX_CONTENT_TYPE);
 
-      const response = await prisma.$transaction(
-        async (tx) => {
-          const lockedForm = await tx.form.findUnique({
-            include: { publishedTemplate: true },
-            where: { id: form.id },
-          });
-          if (
-            !lockedForm ||
-            lockedForm.status !== FormStatus.published ||
-            lockedForm.version !== form.version ||
-            !lockedForm.publishedTemplate ||
-            lockedForm.publishedTemplate.id !== publishedTemplate.id
-          ) {
-            fail(409, "stale_form", "The form was published while starting");
-          }
-          const current = await tx.response.findUnique({
-            where: {
-              formId_userId: { formId: form.id, userId: identity.id },
-            },
-          });
-          if (current?.status === ResponseStatus.submitted) {
-            fail(
-              409,
-              "already_submitted",
-              "You have already submitted this form"
-            );
-          }
-          if (current?.status === ResponseStatus.submitting) {
-            fail(
-              409,
-              "operation_in_progress",
-              "Your submission is being processed"
-            );
-          }
-          if (!current) {
-            await tx.response.create({
+        const response = await prisma.$transaction(
+          async (tx) => {
+            const lockedForm = await tx.form.findUnique({
+              include: { publishedTemplate: true },
+              where: { id: form.id },
+            });
+            if (
+              !lockedForm ||
+              lockedForm.status !== FormStatus.published ||
+              lockedForm.version !== form.version ||
+              !lockedForm.publishedTemplate ||
+              lockedForm.publishedTemplate.id !== publishedTemplate.id
+            ) {
+              fail(409, "stale_form", "The form was published while starting");
+            }
+            const current = await tx.response.findUnique({
+              where: {
+                formId_userId: { formId: form.id, userId: identity.id },
+              },
+            });
+            if (current?.status === ResponseStatus.submitted) {
+              fail(
+                409,
+                "already_submitted",
+                "You have already submitted this form"
+              );
+            }
+            if (current?.status === ResponseStatus.submitting) {
+              fail(
+                409,
+                "operation_in_progress",
+                "Your submission is being processed"
+              );
+            }
+            if (!current) {
+              await tx.response.create({
+                data: {
+                  draftData: Prisma.DbNull,
+                  draftDocumentKey,
+                  draftObjectKey,
+                  form: { connect: { id: form.id } },
+                  id: responseId,
+                  owner: { connect: { id: identity.id } },
+                  publishedTemplate: {
+                    connect: { id: lockedForm.publishedTemplate.id },
+                  },
+                  publishedVersion: form.version,
+                  status: ResponseStatus.draft,
+                },
+              });
+            }
+            await tx.prefillSnapshot.deleteMany({
+              where: { responseId },
+            });
+            await tx.prefillSnapshot.create({
+              data: {
+                form: { connect: { id: form.id } },
+                id: snapshotId,
+                lockedFields: jsonValue({}),
+                owner: { connect: { id: identity.id } },
+                response: { connect: { id: responseId } },
+                values: jsonValue({}),
+              },
+            });
+            const updated = await tx.response.updateMany({
               data: {
                 draftData: Prisma.DbNull,
                 draftDocumentKey,
                 draftObjectKey,
-                form: { connect: { id: form.id } },
-                id: responseId,
-                owner: { connect: { id: identity.id } },
-                publishedTemplate: {
-                  connect: { id: lockedForm.publishedTemplate.id },
-                },
+                publishedTemplateId: lockedForm.publishedTemplate.id,
                 publishedVersion: form.version,
                 status: ResponseStatus.draft,
+                updatedAt: new Date(),
               },
+              where: { id: responseId },
             });
-          }
-          await tx.prefillSnapshot.deleteMany({
-            where: { responseId },
-          });
-          await tx.prefillSnapshot.create({
-            data: {
-              form: { connect: { id: form.id } },
-              id: snapshotId,
-              lockedFields: jsonValue({}),
-              owner: { connect: { id: identity.id } },
-              response: { connect: { id: responseId } },
-              values: jsonValue({}),
-            },
-          });
-          const updated = await tx.response.updateMany({
-            data: {
-              draftData: Prisma.DbNull,
-              draftDocumentKey,
-              draftObjectKey,
-              publishedTemplateId: lockedForm.publishedTemplate.id,
-              publishedVersion: form.version,
-              status: ResponseStatus.draft,
-              updatedAt: new Date(),
-            },
-            where: { id: responseId },
-          });
-          if (updated.count !== 1) {
-            fail(500, "start_failed", "Unable to start response");
-          }
-          return tx.response.findUnique({ where: { id: responseId } });
-        },
-        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
-      );
-      if (!response) {
-        fail(500, "start_failed", "Unable to start response");
+            if (updated.count !== 1) {
+              fail(500, "start_failed", "Unable to start response");
+            }
+            return tx.response.findUnique({ where: { id: responseId } });
+          },
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+        );
+        if (!response) {
+          fail(500, "start_failed", "Unable to start response");
+        }
+        await deleteObjects([existing?.draftObjectKey]);
+        return {
+          editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${response.id}&action=fill`,
+          prefill: { data: {}, editableFields: {} },
+          response: responseSummary(response),
+        };
+      } catch (error) {
+        await deleteObjectUnlessCanonical(draftObjectKey);
+        throw error;
       }
-      return {
-        editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${response.id}&action=fill`,
-        prefill: { data: {}, editableFields: {} },
-        response: responseSummary(response),
-      };
     })
     .get("/api/responses/me", async ({ request }) => {
       const identity = await requireIdentity(request);
@@ -1864,18 +2012,22 @@ export function createApp(options: AppOptions = {}) {
           );
         }
         const operationId = crypto.randomUUID();
-        const stagedObjectKey = artifactPath(
+        const stagedObjectKey = objectKey(
           "operations",
           operationId,
-          "draft.docx"
+          "draft",
+          crypto.randomUUID(),
+          "docx"
         );
         const metadata: OperationMetadata = {
           action: "save-draft",
           data,
-          finalObjectKey: artifactPath(
+          finalObjectKey: objectKey(
             "responses",
             response.id,
-            `draft-${operationId}.docx`
+            "draft",
+            crypto.randomUUID(),
+            "docx"
           ),
           formId: form.id,
           publicId: form.publicId,
@@ -1934,18 +2086,22 @@ export function createApp(options: AppOptions = {}) {
         const operationId = crypto.randomUUID();
         const submissionId = crypto.randomUUID();
         const submissionDocumentKey = `submission-${submissionId}-${crypto.randomUUID()}`;
-        const stagedObjectKey = artifactPath(
+        const stagedObjectKey = objectKey(
           "operations",
           operationId,
-          "submission.docx"
+          "submission",
+          crypto.randomUUID(),
+          "docx"
         );
         const metadata: OperationMetadata = {
           action: "submit",
           data,
-          finalObjectKey: artifactPath(
+          finalObjectKey: objectKey(
             "submissions",
             submissionId,
-            "filled.docx"
+            "filled",
+            crypto.randomUUID(),
+            "docx"
           ),
           formId: form.id,
           publicId: form.publicId,
@@ -2022,6 +2178,7 @@ export function createApp(options: AppOptions = {}) {
           fail(403, "forbidden", "You may not access this operation");
         }
       }
+      await cleanupTerminalOperationObjects(operation);
       return {
         operation: {
           createdAt: operation.createdAt,
@@ -2059,7 +2216,7 @@ export function createApp(options: AppOptions = {}) {
         }),
       };
     })
-    .get("/api/submissions/:id/docx", async ({ request, params, set }) => {
+    .get("/api/submissions/:id/docx", async ({ request, params }) => {
       const identity = await requireIdentity(request);
       validateId(params.id, "Submission");
       const submission = await prisma.submission.findUnique({
@@ -2069,14 +2226,15 @@ export function createApp(options: AppOptions = {}) {
         fail(404, "not_found", "Submission was not found");
       }
       canReadSubmission(identity, submission);
-      if (!(await artifactExists(submission.objectKey))) {
+      if (!(await objectExists(submission.objectKey))) {
         fail(404, "not_found", "Submission document was not found");
       }
-      set.headers["Content-Type"] =
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-      set.headers["Content-Disposition"] =
-        `attachment; filename="submission-${submission.id}.docx"`;
-      return Bun.file(resolveArtifactPath(submission.objectKey));
+      return new Response(streamObject(submission.objectKey), {
+        headers: {
+          "Content-Disposition": `attachment; filename="submission-${submission.id}.docx"`,
+          "Content-Type": DOCX_CONTENT_TYPE,
+        },
+      });
     })
     .get("/api/submissions/:id/pdf", async ({ request, params, set }) => {
       const identity = await requireIdentity(request);
@@ -2094,7 +2252,7 @@ export function createApp(options: AppOptions = {}) {
         `attachment; filename="submission-${submission.id}.pdf"`;
       return pdf;
     })
-    .get("/onlyoffice/document/:key", async ({ params, query, set }) => {
+    .get("/onlyoffice/document/:key", async ({ params, query }) => {
       const { key } = params;
       const token = typeof query.token === "string" ? query.token : "";
       if (!verifyDocumentAccessToken(token, key)) {
@@ -2104,13 +2262,13 @@ export function createApp(options: AppOptions = {}) {
           "Document access token is invalid or expired"
         );
       }
-      const objectKey = await operationDocumentPath(key);
-      if (!objectKey || !(await artifactExists(objectKey))) {
+      const objectKey = await operationDocumentKey(key);
+      if (!objectKey || !(await objectExists(objectKey))) {
         fail(404, "not_found", "Document was not found");
       }
-      set.headers["Content-Type"] =
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-      return Bun.file(resolveArtifactPath(objectKey));
+      return new Response(streamObject(objectKey), {
+        headers: { "Content-Type": DOCX_CONTENT_TYPE },
+      });
     })
     .get("/onlyoffice-plugin/config.json", ({ request, set }) => {
       const origin = request.headers.get("origin");
@@ -2162,11 +2320,14 @@ export function createApp(options: AppOptions = {}) {
       const operation = await prisma.operation.findUnique({
         where: { id: operationId },
       });
+      if (!operation) {
+        return { error: 0 };
+      }
       if (
-        !operation ||
         operation.status === OperationStatus.completed ||
         operation.status === OperationStatus.failed
       ) {
+        await cleanupTerminalOperationObjects(operation);
         return { error: 0 };
       }
       if (
@@ -2214,7 +2375,7 @@ export function createApp(options: AppOptions = {}) {
     });
 }
 
-async function readArtifactFromAbsolute(
+async function readTemplateSourceBytes(
   absolutePath: string
 ): Promise<Uint8Array> {
   const file = Bun.file(absolutePath);

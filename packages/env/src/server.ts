@@ -45,11 +45,21 @@ export const env = createEnv({
 
     ONLYOFFICE_URL: z.url().default(localOnlyOfficeUrl),
 
+    RUSTFS_ACCESS_KEY_ID: z.string().min(1),
+
+    RUSTFS_BUCKET: z.string().min(1),
+
+    RUSTFS_ENDPOINT: z.url(),
+
+    RUSTFS_REGION: z.string().min(1).default("us-east-1"),
+
+    RUSTFS_SECRET_ACCESS_KEY: z.string().min(1),
+
     SERVER_ORIGIN: z.url().default("http://host.docker.internal:3000"),
 
-    STORAGE_ROOT: z.string().default("./onlyoffice-submissions"),
-
-    TEMPLATE_PATH: z.string().default("./onlyoffice-templates/template.docx"),
+    TEMPLATE_PATH: z
+      .string()
+      .default("../../onlyoffice-templates/template.docx"),
   },
   skipValidation: !!process.env.SKIP_ENV_VALIDATION,
 });

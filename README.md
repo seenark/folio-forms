@@ -41,10 +41,11 @@ The accepted deployment target is one private single-host Docker Compose stack.
 | Database | PostgreSQL 18 | `localhost:5432` |
 | ORM and migrations | Prisma | `packages/db` |
 | Authentication | Better Auth bearer sessions | API under `/api/auth/*` |
+| Object storage | RustFS 1.0.0-rc.6, private S3 bucket | `localhost:9000` |
 
 ## Quick start
 
-Use this mode when the API runs as a host Bun process and PostgreSQL/ONLYOFFICE run in Docker.
+Use this mode when the API runs as a host Bun process and PostgreSQL, RustFS, and ONLYOFFICE run in Docker.
 
 ### 1. Install dependencies
 
@@ -58,14 +59,14 @@ bun install
 cp apps/server/.env.example apps/server/.env
 ```
 
-Replace `BETTER_AUTH_SECRET` with a random value of at least 32 characters. The checked-in example is for local setup only.
+Replace `BETTER_AUTH_SECRET` with a random value of at least 32 characters. The checked-in example and Compose RustFS credentials are for isolated local setup only.
 
-The host-mode environment stores artifacts in the repository-level `onlyoffice-submissions/` directory. Database rows store relative paths, not absolute machine paths.
+Canonical Template and Response DOCX objects live in the private RustFS bucket. Database rows store opaque object keys; browsers and ONLYOFFICE read them only through short-lived API authorization.
 
-### 3. Start PostgreSQL and ONLYOFFICE
+### 3. Start PostgreSQL, RustFS, and ONLYOFFICE
 
 ```bash
-docker compose -f compose.yaml up -d postgres onlyoffice
+docker compose -f compose.yaml up -d postgres rustfs rustfs-init onlyoffice
 ```
 
 ### 4. Apply the checked-in Prisma migration
@@ -113,28 +114,28 @@ Choose exactly one API mode.
 
 ### Host API mode
 
-PostgreSQL and ONLYOFFICE run in Docker. The API and web app run under Bun:
+PostgreSQL, RustFS, and ONLYOFFICE run in Docker. The API and web app run under Bun:
 
 ```bash
-docker compose -f compose.yaml up -d postgres onlyoffice
+docker compose -f compose.yaml up -d postgres rustfs rustfs-init onlyoffice
 bun run --cwd apps/server db:migrate
 bun run dev
 ```
 
 ### Compose API mode
 
-PostgreSQL, ONLYOFFICE, and the API run in Docker. The web app remains a host process:
+PostgreSQL, RustFS, ONLYOFFICE, and the API run in Docker. The web app remains a host process:
 
 ```bash
-docker compose -f compose.yaml up -d --build postgres onlyoffice server
+docker compose -f compose.yaml up -d --build postgres rustfs rustfs-init onlyoffice server
 bun run --cwd apps/web dev
 ```
 
 The Compose server:
 
 1. Applies checked-in Prisma migrations with `prisma migrate deploy`.
-2. Starts the compiled API on port `3000`.
-3. Mounts `./onlyoffice-submissions` at `/app/onlyoffice-submissions`.
+2. Connects to the initialized private RustFS bucket.
+3. Starts the compiled API on port `3000`.
 
 Check service state with:
 
@@ -219,18 +220,19 @@ Database constraints enforce:
 - One active Operation and one Editor Lease per target.
 - Accepted lifecycle, ownership, document-reference, and expiry invariants.
 
-### Artifact layout
+### Private object storage
 
-`STORAGE_ROOT` is private runtime storage. The database stores relative paths such as:
+RustFS stores canonical DOCX objects under opaque keys such as:
 
 ```text
-forms/<formId>/template-draft.docx
-forms/<formId>/published-<version>.docx
-responses/<responseId>/draft-<operationId>.docx
-submissions/<submissionId>/filled.docx
+forms/<formId>/template-draft/<uuid>/docx
+forms/<formId>/published/<version>/<uuid>/docx
+responses/<responseId>/draft/<uuid>/docx
+submissions/<submissionId>/filled/<uuid>/docx
+operations/<operationId>/<kind>/<uuid>/docx
 ```
 
-The API never statically exposes the storage root. Submission data and downloads require authentication and ownership, except Admin accounts may access all submissions.
+The bucket is private. The API authorizes each request and streams bytes to browsers or ONLYOFFICE; it never exposes a public or presigned bucket URL. New documents are staged under Operation-specific keys, database references advance only after the object is durable, and superseded staging/Draft objects are removed after the transition succeeds. PDF exports are rendered on demand and discarded after the response.
 
 ## Authentication and security
 
@@ -330,9 +332,10 @@ ONLYOFFICE is a desktop-oriented editor. The dashboard and administrative shell 
 apps/
   onlyoffice-plugin/       ONLYOFFICE plugin manifest, UI, extraction, prefill, actions
   server/
-    src/index.ts           Elysia routes and asynchronous operation orchestration
+    src/app.ts             Elysia routes and asynchronous operation orchestration
+    src/index.ts           Production listen entrypoint
     src/onlyoffice.ts      ONLYOFFICE URLs, HMAC tokens, force-save, PDF conversion
-    src/storage.ts         Private artifact path validation and atomic writes
+    src/storage.ts         Private RustFS object primitives
     Dockerfile             Production API image
   web/
     src/routes/            TanStack Router screens
@@ -344,8 +347,8 @@ packages/
   env/                     Server environment validation
   config/                  Shared TypeScript/project configuration
 onlyoffice-templates/
-  template.docx            Tracked tagged demo template
-compose.yaml               PostgreSQL, ONLYOFFICE, and API services
+  template.docx            Tracked tagged template
+compose.yaml               PostgreSQL, RustFS, ONLYOFFICE, and API services
 CONTEXT.md                 Canonical domain glossary
 ```
 
@@ -386,13 +389,13 @@ Docker:
 ```bash
 docker compose -f compose.yaml config --quiet
 docker compose -f compose.yaml build server
-docker compose -f compose.yaml up -d --build postgres onlyoffice server
+docker compose -f compose.yaml up -d --build postgres rustfs rustfs-init onlyoffice server
 docker compose -f compose.yaml ps
 docker compose -f compose.yaml logs --tail=100 server
 docker compose -f compose.yaml down
 ```
 
-There are currently no automated test/spec files in the repository. Browser/API smoke verification should cover login, role gates, prefill, draft save/resume, submit, receipt downloads, publish invalidation, and cross-user access denial.
+Run `bun run --cwd apps/server test:http` and `bun run --cwd apps/server test:storage` against an isolated PostgreSQL database and disposable private RustFS bucket.
 
 ## Troubleshooting
 
@@ -421,12 +424,11 @@ PostgreSQL 18 uses the `/var/lib/postgresql` volume mount in `compose.yaml`. Do 
 
 Confirm that:
 
-1. PostgreSQL and ONLYOFFICE are healthy.
-2. The API can reach the configured ONLYOFFICE URL.
+1. PostgreSQL, RustFS, and ONLYOFFICE are healthy.
+2. The API can reach the configured ONLYOFFICE and `RUSTFS_ENDPOINT` URLs.
 3. The configured template exists at `TEMPLATE_PATH`.
-4. The storage directory is writable.
-5. You are not mixing host API and Compose API modes with different storage roots.
-
+4. `RUSTFS_BUCKET` exists and the configured access key can read and write it.
+5. Host API mode uses `http://localhost:9000`; Compose API mode uses `http://rustfs:9000`.
 
 ### Form actions are missing
 
@@ -448,7 +450,7 @@ Before exposing this system outside an isolated local workstation:
 3. Use HTTPS behind a reverse proxy with strict host and origin allowlists.
 4. Replace localStorage bearer tokens with an httpOnly, secure session strategy where appropriate.
 5. Restrict PostgreSQL and ONLYOFFICE network exposure; do not publish them directly.
-6. Move artifacts to controlled private object storage or a protected persistent volume.
+6. Keep RustFS private, rotate its credentials, and monitor object durability.
 7. Add request rate limits, audit logging, observability, backup, and retention policies.
 8. Add automated integration tests for callback correlation, operation races, artifact completeness, authorization, and publish invalidation.
 9. Keep the callback URL allowlist narrow and review outbound network access.
