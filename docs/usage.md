@@ -9,7 +9,7 @@ Folio Forms เป็นระบบสร้างและกรอกแบ�
 - **ONLYOFFICE Docs** รันใน Docker ที่ port `8080`
 - **PostgreSQL** รันใน Docker ที่ port `5432`
 
-เอกสารนี้ใช้สำหรับ local prototype เท่านั้น ไม่ควรนำค่า Credentials และ Secret ในตัวอย่างไปใช้บนระบบจริง
+เอกสารนี้อธิบายการรันระบบ MMVP, การใช้ Share Link, การจัดการ Form และตำแหน่งข้อมูลสำคัญ
 
 ## 1. การรัน Development Mode
 
@@ -42,22 +42,16 @@ docker compose -f compose.yaml up -d postgres onlyoffice
 
 ใช้ `compose.yaml` โดยระบุ `-f` เสมอ เพราะ repository มี `docker-compose.yml` อีกไฟล์หนึ่งที่เป็นไฟล์เก่าและมีเฉพาะ Server
 
-### 1.3 ติดตั้งและเตรียมฐานข้อมูล
+### 1.3 Apply Prisma migration
+
+เปิด Terminal B:
 
 ```bash
-bun install
+bun run --cwd packages/db db:generate
 bun run --cwd apps/server db:migrate
-bun run --cwd apps/server db:seed
 ```
 
-คำสั่ง `db:seed` จะสร้างหรือซ่อมข้อมูล Demo แบบ idempotent ได้แก่:
-
-- Demo accounts 3 บัญชี
-- Prefill profile ของแต่ละ User
-- Form `demo-employee-intake`
-- Template Draft และ Published Template ของ Demo form
-
-การรัน Seed ซ้ำจะไม่ลบ Form หรือ Submission เดิม และถ้าบัญชีมีอยู่แล้วจะไม่เปลี่ยน Password เดิม
+Migration เริ่มต้นรองรับ PostgreSQL ว่างและสร้าง schema ที่ระบบต้องใช้ ไม่มีการ seed บัญชีหรือข้อมูล demo
 
 ### 1.4 รัน API และ Web
 
@@ -118,15 +112,7 @@ docker compose -f compose.yaml up -d --build server
 
 ### 2.1 Application accounts
 
-ระบบยังไม่มีหน้า Registration ให้ใช้บัญชีที่ Seed ไว้:
-
-| Role | Email | Password | Prefill |
-| --- | --- | --- | --- |
-| Admin | `admin@example.com` | `AdminPassword123!` | Demo Admin / finance / 2024-01-15 |
-| User | `user-a@example.com` | `UserAPassword123!` | User A / hr / 2024-02-01 |
-| User | `user-b@example.com` | `UserBPassword123!` | User B / engineering / 2024-03-01 |
-
-Credentials เหล่านี้ใช้สำหรับ local demo เท่านั้น
+การติดตั้งใหม่สร้าง Admin คนแรกจากค่า bootstrap เมื่อยังไม่มี Admin เท่านั้น หลังจากนั้น Admin สร้างและจัดการบัญชีทั้งหมด ระบบไม่มี public sign-up, บัญชี demo หรือรหัสผ่านคงที่
 
 ### 2.2 สิทธิ์ของแต่ละ Role
 
@@ -151,13 +137,9 @@ Credentials เหล่านี้ใช้สำหรับ local demo เ�
 - Submit Form
 - ดู Receipt และไฟล์ของตัวเอง
 
-### 2.3 บัญชีอยู่ที่ไหน
+### 2.3 บัญชีเก็บที่ไหน
 
-Demo accounts ถูกประกาศและสร้างใน:
-
-```text
-apps/server/src/seed.ts
-```
+บัญชีและ session เก็บใน PostgreSQL ผ่าน Better Auth และ Prisma
 
 การตั้งค่า Authentication อยู่ที่:
 
@@ -186,65 +168,20 @@ localStorage["onlyoffice.sessionToken"]
 
 ## 3. ทดลองใช้งานในฐานะ User
 
-ลิงก์ Demo:
+1. เปิด Share Link ที่ Admin คัดลอกจาก Form ที่ Publish แล้ว
+2. Login ด้วยบัญชี User ที่ provision ไว้
+3. ตรวจค่า Prefill และ Field ที่ถูก lock
+4. กด **Save Draft** เพื่อบันทึกและกลับมาทำต่อ
+5. กด **Submit** เพื่อสร้าง Submission แบบ immutable
+6. เปิด Receipt จาก Dashboard
+7. ดาวน์โหลด DOCX หรือขอ PDF export เมื่อจำเป็น
 
-```text
-http://localhost:5173/forms/demo-employee-intake/fill
-```
-
-1. เปิดลิงก์ Demo
-2. Login ด้วยบัญชี User เช่น:
-
-   ```text
-   Email:    user-a@example.com
-   Password: UserAPassword123!
-   ```
-
-3. รอ ONLYOFFICE Editor โหลด
-4. ตรวจข้อมูลที่ระบบ Prefill ให้
-5. เปิดแท็บ **Form** ด้านบนของ ONLYOFFICE
-6. กรอก Field ที่ยังว่าง
-7. กด **Save Draft** ในแท็บ Form
-8. รอข้อความว่าการบันทึกเสร็จสมบูรณ์
-9. กด **Exit**
-10. กลับไปที่ Dashboard
-11. กด **Resume** เพื่อกรอกต่อ
-12. เมื่อกรอกเสร็จ เปิดแท็บ **Form** อีกครั้ง
-13. กด **Submit**
-14. รอให้ระบบประมวลผลเสร็จ
-15. ระบบจะเปิดหน้า Receipt
-
-### 3.1 Field ของ Demo Form
-
-| Tag | ความหมาย | นโยบายของ Demo User |
-| --- | --- | --- |
-| `full_name` | ชื่อเต็ม | Prefill และล็อกไม่ให้แก้ |
-| `department` | แผนก | Prefill และล็อกไม่ให้แก้ |
-| `start_date` | วันที่เริ่มงาน | Prefill แต่แก้ไขได้ |
-| `accept_terms` | ยอมรับเงื่อนไข | User กรอกเอง |
-| `description_1` | รายละเอียดส่วนที่หนึ่ง | User กรอกเอง |
-| `description_2` | รายละเอียดส่วนที่สอง | User กรอกเอง |
-
-การกด Save Draft หรือ Submit ต้องกดจาก **แท็บ Form ใน ONLYOFFICE** ไม่ใช่ปุ่ม Save ปกติของ Word
-
-เมื่อ Submit สำเร็จ User จะเห็น Receipt และสามารถดาวน์โหลด:
-
-```text
-filled.docx
-filled.pdf
-data.json
-```
+Share Link เป็น opaque public ID ที่ระบบสร้างให้แต่ละ Form ไม่มีค่า demo แบบคงที่
 
 ## 4. ทดลองใช้งานในฐานะ Admin
 
 1. เปิด `http://localhost:5173/login`
-2. Login ด้วย:
-
-   ```text
-   Email:    admin@example.com
-   Password: AdminPassword123!
-   ```
-
+2. Login ด้วยบัญชีที่ถูก provision เป็น role `Admin`
 3. ระบบจะพาไปที่ `/admin`
 4. กด **New form**
 5. กรอก Title และ Description
@@ -305,7 +242,6 @@ Admin จะสามารถดูข้อมูล, เปิด Receipt แ
 | `http://localhost:5173/dashboard` | Dashboard ของ User |
 | `http://localhost:5173/admin` | Dashboard ของ Admin |
 | `http://localhost:5173/admin/forms/new` | สร้าง Form |
-| `http://localhost:5173/forms/demo-employee-intake/fill` | Demo Share Link |
 | `http://localhost:3000/health` | ตรวจ API |
 | `http://localhost:8080` | ONLYOFFICE Document Server |
 
@@ -316,8 +252,8 @@ Admin จะสามารถดูข้อมูล, เปิด Receipt แ
 ```text
 apps/
   server/
-    src/index.ts       API routes และ workflow หลัก
-    src/seed.ts        Demo accounts, profiles และ Demo form
+    src/app.ts         API routes และ workflow หลัก
+    src/index.ts       Production listen entrypoint
     src/storage.ts     ตรวจสอบและเขียน Artifact
     src/onlyoffice.ts  Document URL, HMAC, force-save และ PDF conversion
     .env               Environment local จริง
@@ -337,8 +273,8 @@ packages/
   auth/
     src/index.ts        Better Auth configuration
   db/
-    src/schema.ts       PostgreSQL schema
-    migrations/         SQL migrations
+    prisma/schema.prisma  Prisma schema
+    prisma/migrations/   SQL migrations ที่ checked in
   env/
     src/server.ts       ตรวจสอบ Environment variables
 
@@ -358,12 +294,12 @@ onlyoffice-submissions/
 ตาราง Application หลัก:
 
 ```text
-forms              Form, public ID, status, version และ path ของ Template
-prefill_profiles   Prefill data และนโยบาย Field ที่แก้ไขได้
-prefill_snapshots  ค่าที่ถูก snapshot ตอนเริ่ม Response
-responses          Response ของ User และ Draft data
-submissions        ข้อมูล Submit แบบแก้ไขไม่ได้ และ path ของ Artifact
-operations         สถานะงาน Save, Publish, Draft และ Submit แบบ asynchronous
+Form / TemplateDraft / PublishedTemplate / FieldManifest
+PrefillConfiguration / PrefillSnapshot
+Response / Submission / Correction
+Handoff / PendingClaim
+Operation / CallbackClaim / EditorLease
+AuditEvent / LoginFailure / DeletionTombstone
 ```
 
 ### 7.2 ไฟล์ Artifact
@@ -391,8 +327,6 @@ onlyoffice-submissions/
   submissions/
     <submissionId>/
       filled.docx
-      filled.pdf
-      data.json
 ```
 
 ระหว่างการประมวลผลอาจมีไฟล์ชั่วคราวที่:
@@ -401,7 +335,7 @@ onlyoffice-submissions/
 operations/<operationId>/
 ```
 
-Database เก็บ Relative path เช่น `submissions/<submissionId>/filled.pdf` ไม่ได้เก็บ Absolute path ของเครื่อง
+Database เก็บ object key แบบ relative ไม่ได้เก็บ Absolute path ของเครื่อง
 
 `onlyoffice-submissions/` เป็น Runtime data และถูก ignore โดย Git
 
@@ -438,11 +372,6 @@ docker compose -f compose.yaml ps
 5. `STORAGE_ROOT` ชี้ไปยังโฟลเดอร์ที่เขียนได้
 6. ใช้ Host API mode หรือ Compose API mode เพียงแบบเดียว
 
-ถ้า Demo form หรือ Artifact หาย ให้รัน:
-
-```bash
-bun run --cwd apps/server db:seed
-```
 
 ### ไม่เห็นปุ่ม Save Draft หรือ Submit
 
@@ -454,7 +383,7 @@ bun run --cwd apps/server db:seed
 
 ### Form หายจาก Admin
 
-Seed ไม่ได้ลบ Form เก่าออก ให้ตรวจรายการ Form ใน `/admin` และฐานข้อมูลก่อนรันคำสั่งลบใด ๆ
+สร้างและ Publish Form ผ่านหน้า Admin ก่อนเปิด Share Link
 
 ## 9. โหมด Compose API ทางเลือก
 
@@ -468,9 +397,8 @@ bun run --cwd apps/web dev
 ในโหมดนี้ Container `server` จะทำสิ่งต่อไปนี้เอง:
 
 1. Run migration
-2. Run seed
-3. Start API ที่ port `3000`
-4. Mount `./onlyoffice-submissions` เข้า `/app/onlyoffice-submissions`
+2. Start API ที่ port `3000`
+3. Mount `./onlyoffice-submissions` เข้า `/app/onlyoffice-submissions`
 
 อย่าใช้โหมดนี้พร้อมกับ `bun run dev` เพราะจะชน port `3000`
 
@@ -480,12 +408,11 @@ bun run --cwd apps/web dev
 
 - `README.md`
 - `CONTEXT.md`
-- `apps/server/src/seed.ts`
 - `apps/server/src/index.ts`
 - `apps/server/src/storage.ts`
 - `apps/server/src/onlyoffice.ts`
 - `apps/onlyoffice-plugin/plugin.js`
 - `packages/auth/src/index.ts`
-- `packages/db/src/schema.ts`
+- `packages/db/prisma/schema.prisma`
 - `packages/env/src/server.ts`
 - `compose.yaml`

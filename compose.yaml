@@ -69,7 +69,7 @@ services:
       [
         "sh",
         "-c",
-        "bun run db:migrate && bun run db:seed && bun dist/index.mjs",
+        "bun run db:migrate && bun dist/index.mjs",
       ]
     volumes:
       - ./onlyoffice-submissions:/app/onlyoffice-submissions

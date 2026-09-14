@@ -1,21 +1,21 @@
 // oxlint-disable func-style prefer-destructuring no-await-in-loop no-use-before-define no-nested-ternary complexity no-shadow -- Route modules keep declaration order and sequential persistence invariants.
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 import { cors } from "@elysiajs/cors";
 import { auth } from "@onlyoffice/auth";
-import {
-  db,
-  forms,
-  operations,
-  prefillProfiles,
-  prefillSnapshots,
-  responses,
-  submissions,
-  user,
-} from "@onlyoffice/db";
 import type { OperationType } from "@onlyoffice/db";
+import {
+  FieldType,
+  FormStatus,
+  OperationStatus,
+  OperationTargetType,
+  PrefillPolicy,
+  Prisma,
+  ResponseStatus,
+  prisma,
+} from "@onlyoffice/db";
 import { env } from "@onlyoffice/env/server";
-import { and, count, desc, eq, or } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { unzipSync } from "fflate";
 
@@ -32,11 +32,21 @@ import {
   artifactExists,
   artifactPath,
   readArtifact,
-  readArtifactJson,
   removeArtifactDirectory,
   resolveArtifactPath,
   writeArtifact,
 } from "./storage";
+
+type Form = Prisma.FormGetPayload<Prisma.FormDefaultArgs>;
+type Operation = Prisma.OperationGetPayload<Prisma.OperationDefaultArgs>;
+type PrefillSnapshot =
+  Prisma.PrefillSnapshotGetPayload<Prisma.PrefillSnapshotDefaultArgs>;
+type PublishedTemplate =
+  Prisma.PublishedTemplateGetPayload<Prisma.PublishedTemplateDefaultArgs>;
+type Response = Prisma.ResponseGetPayload<Prisma.ResponseDefaultArgs>;
+type Submission = Prisma.SubmissionGetPayload<Prisma.SubmissionDefaultArgs>;
+type TemplateDraft =
+  Prisma.TemplateDraftGetPayload<Prisma.TemplateDraftDefaultArgs>;
 
 function originOf(value: string): string | null {
   try {
@@ -86,12 +96,21 @@ type OperationMetadata = JsonRecord & {
   publicId?: string;
   publishedVersion?: number;
   publishedKey?: string;
-  stagedDocxPath: string;
-  finalDocxPath?: string;
-  finalDataPath?: string;
-  finalPdfPath?: string;
+  submissionDocumentKey?: string;
+  stagedObjectKey: string;
+  finalObjectKey?: string;
+  nextDocumentKey?: string;
   data?: JsonRecord;
   result?: JsonRecord;
+};
+
+type FormWithDocuments = Form & {
+  templateDraft: TemplateDraft | null;
+  publishedTemplate: PublishedTemplate | null;
+};
+
+type ResponseWithSnapshot = Response & {
+  prefillSnapshot: PrefillSnapshot | null;
 };
 interface CallbackPayload {
   key?: unknown;
@@ -159,16 +178,14 @@ function jsonRecord(
 
 function operationMetadata(value: unknown): OperationMetadata {
   const metadata = asRecord(value, "Operation metadata is invalid");
-  const { action } = metadata;
-  const { formId } = metadata;
-  const { stagedDocxPath } = metadata;
+  const { action, formId, stagedObjectKey } = metadata;
   if (
     (action !== "save-template" &&
       action !== "publish" &&
       action !== "save-draft" &&
       action !== "submit") ||
     typeof formId !== "string" ||
-    typeof stagedDocxPath !== "string"
+    typeof stagedObjectKey !== "string"
   ) {
     fail(500, "invalid_operation", "Operation metadata is invalid");
   }
@@ -187,6 +204,24 @@ function databaseErrorCode(error: unknown): string | null {
   }
   const code = error.code;
   return typeof code === "string" ? code : null;
+}
+
+function contentHash(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function jsonValue(value: unknown): Prisma.InputJsonValue {
+  return value as Prisma.InputJsonValue;
+}
+
+function editableFieldsForSnapshot(snapshot: PrefillSnapshot): JsonRecord {
+  const lockedFields = jsonRecord(snapshot.lockedFields);
+  return Object.fromEntries(
+    Object.entries(lockedFields).map(([field, locked]) => [
+      field,
+      locked !== true,
+    ])
+  );
 }
 
 async function identityFor(request: Request): Promise<Identity | null> {
@@ -251,18 +286,20 @@ function validateId(value: string, label: string): string {
   return value;
 }
 
-function formSummary(form: typeof forms.$inferSelect): JsonRecord {
+function formSummary(form: FormWithDocuments): JsonRecord {
+  const templateDraft = form.templateDraft;
+  const publishedTemplate = form.publishedTemplate;
   return {
     createdAt: form.createdAt,
     createdBy: form.createdBy,
     description: form.description,
-    hasPublishedDocument: Boolean(form.publishedPath),
-    hasTemplateDraft: Boolean(form.templateDraftPath),
+    hasPublishedDocument: Boolean(publishedTemplate?.objectKey),
+    hasTemplateDraft: Boolean(templateDraft?.objectKey),
     id: form.id,
     publicId: form.publicId,
-    publishedDocumentKey: form.publishedKey,
+    publishedDocumentKey: publishedTemplate?.documentKey,
     status: form.status,
-    templateDocumentKey: form.templateDraftKey,
+    templateDocumentKey: templateDraft?.documentKey,
     title: form.title,
     updatedAt: form.updatedAt,
     version: form.version,
@@ -270,7 +307,7 @@ function formSummary(form: typeof forms.$inferSelect): JsonRecord {
 }
 
 function responseSummary(
-  response: typeof responses.$inferSelect,
+  response: Response,
   extra: {
     formPublicId?: string;
     formTitle?: string;
@@ -282,7 +319,7 @@ function responseSummary(
     formId: response.formId,
     formPublicId: extra.formPublicId,
     formTitle: extra.formTitle,
-    hasDraft: Boolean(response.draftDocxPath && response.draftData),
+    hasDraft: Boolean(response.draftObjectKey && response.draftData),
     id: response.id,
     publishedVersion: response.publishedVersion,
     status: response.status,
@@ -293,7 +330,7 @@ function responseSummary(
 }
 
 function submissionSummary(
-  submission: typeof submissions.$inferSelect,
+  submission: Submission,
   extra: {
     formTitle?: string;
     userEmail?: string;
@@ -441,8 +478,8 @@ function validateTemplateControls(bytes: Uint8Array): string[] {
   return controls;
 }
 async function normalizeResponseData(
-  form: typeof forms.$inferSelect,
-  response: typeof responses.$inferSelect,
+  form: FormWithDocuments,
+  response: ResponseWithSnapshot,
   inputData: unknown
 ): Promise<JsonRecord> {
   const data = { ...jsonRecord(inputData) };
@@ -450,10 +487,11 @@ async function normalizeResponseData(
   if (serialized.length > maxResponseDataBytes) {
     fail(413, "response_too_large", "Response data exceeds the size limit");
   }
-  if (!form.publishedPath) {
+  const publishedTemplate = form.publishedTemplate;
+  if (!publishedTemplate?.objectKey) {
     fail(409, "not_published", "This form has not been published");
   }
-  const templateBytes = await readArtifact(form.publishedPath);
+  const templateBytes = await readArtifact(publishedTemplate.objectKey);
   const controls = new Set(validateTemplateControls(templateBytes));
   const unknownFields = Object.keys(data).filter(
     (field) => !controls.has(field)
@@ -475,26 +513,14 @@ async function normalizeResponseData(
       fail(422, "invalid_response_data", `${field} must be a scalar value`);
     }
   }
-  if (!response.prefillSnapshotId) {
+  const snapshot = response.prefillSnapshot;
+  if (!snapshot) {
     return data;
   }
-  const snapshotRows = await db
-    .select()
-    .from(prefillSnapshots)
-    .where(eq(prefillSnapshots.id, response.prefillSnapshotId))
-    .limit(1);
-  const snapshot = snapshotRows[0];
-  if (!snapshot) {
-    fail(
-      409,
-      "prefill_snapshot_missing",
-      "The response prefill is unavailable"
-    );
-  }
-  const snapshotData = jsonRecord(snapshot.data);
-  const editableFields = jsonRecord(snapshot.editableFields);
+  const snapshotData = jsonRecord(snapshot.values);
+  const lockedFields = jsonRecord(snapshot.lockedFields);
   for (const [field, value] of Object.entries(snapshotData)) {
-    if (editableFields[field] === false) {
+    if (lockedFields[field] === true) {
       data[field] = value;
     }
   }
@@ -505,91 +531,85 @@ async function activeOperationForForm(
   formId: string,
   action: OperationType
 ): Promise<boolean> {
-  const rows = await db
-    .select({ id: operations.id })
-    .from(operations)
-    .where(
-      and(
-        eq(operations.formId, formId),
-        eq(operations.type, action),
-        or(
-          eq(operations.status, "pending"),
-          eq(operations.status, "processing")
-        )
-      )
-    )
-    .limit(1);
-  return rows.length > 0;
+  const operation = await prisma.operation.findFirst({
+    select: { id: true },
+    where: {
+      formId,
+      status: { in: [OperationStatus.pending, OperationStatus.processing] },
+      type: action,
+    },
+  });
+  return Boolean(operation);
 }
 
 async function activeOperationForResponse(
   responseId: string
 ): Promise<boolean> {
-  const rows = await db
-    .select({ id: operations.id })
-    .from(operations)
-    .where(
-      and(
-        eq(operations.responseId, responseId),
-        or(
-          eq(operations.status, "pending"),
-          eq(operations.status, "processing")
-        )
-      )
-    )
-    .limit(1);
-  return rows.length > 0;
+  const operation = await prisma.operation.findFirst({
+    select: { id: true },
+    where: {
+      responseId,
+      status: { in: [OperationStatus.pending, OperationStatus.processing] },
+    },
+  });
+  return Boolean(operation);
 }
 
-async function createOperation(input: {
+function createOperation(input: {
   type: OperationType;
+  targetType: OperationTargetType;
+  targetId: string;
   formId: string;
+  actorId: string;
+  ownerUserId: string;
   responseId?: string;
   submissionId?: string;
   documentKey: string;
+  stagingObjectKey: string;
   metadata: OperationMetadata;
-}): Promise<typeof operations.$inferSelect> {
-  const rows = await db
-    .insert(operations)
-    .values({
+}): Promise<Operation> {
+  return prisma.operation.create({
+    data: {
+      actorId: input.actorId,
       documentKey: input.documentKey,
+      errorCode: null,
       formId: input.formId,
-      metadata: input.metadata,
+      metadata: jsonValue(input.metadata),
+      ownerUserId: input.ownerUserId,
       responseId: input.responseId,
-      status: "pending",
+      stagingObjectKey: input.stagingObjectKey,
+      status: OperationStatus.pending,
       submissionId: input.submissionId,
+      targetId: input.targetId,
+      targetType: input.targetType,
       type: input.type,
-    })
-    .returning();
-  const operation = rows[0];
-  if (!operation) {
-    fail(500, "operation_failed", "Unable to create operation");
-  }
-  return operation;
+    },
+  });
 }
 
 async function updateOperationFailed(
   operationId: string,
   message: string
 ): Promise<void> {
-  await db
-    .update(operations)
-    .set({ error: message, status: "failed", updatedAt: new Date() })
-    .where(
-      and(
-        eq(operations.id, operationId),
-        or(
-          eq(operations.status, "pending"),
-          eq(operations.status, "processing")
-        )
-      )
-    );
+  await prisma.operation.updateMany({
+    data: {
+      errorCode: message,
+      status: OperationStatus.failed,
+      updatedAt: new Date(),
+    },
+    where: {
+      id: operationId,
+      status: { in: [OperationStatus.pending, OperationStatus.processing] },
+    },
+  });
 }
+
 async function expireOperationIfNeeded(
-  operation: typeof operations.$inferSelect
-): Promise<typeof operations.$inferSelect> {
+  operation: Operation
+): Promise<Operation> {
   const active =
-    operation.status === "pending" || operation.status === "processing";
+    operation.status === OperationStatus.pending ||
+    operation.status === OperationStatus.processing;
   const stale =
     Date.now() - operation.updatedAt.getTime() >= operationTimeoutMs;
   if (!active || !stale) {
@@ -602,20 +622,18 @@ async function expireOperationIfNeeded(
   if (metadata.action === "submit" && metadata.responseId) {
     await rollbackSubmit(metadata.responseId);
   }
-  return { ...operation, error: message, status: "failed" };
+  return { ...operation, errorCode: message, status: OperationStatus.failed };
 }
 
 async function rollbackSubmit(responseId: string): Promise<void> {
-  await db
-    .update(responses)
-    .set({ status: "draft", updatedAt: new Date() })
-    .where(
-      and(eq(responses.id, responseId), eq(responses.status, "submitting"))
-    );
+  await prisma.response.updateMany({
+    data: { status: ResponseStatus.draft, updatedAt: new Date() },
+    where: { id: responseId, status: ResponseStatus.submitting },
+  });
 }
 
 function launchForceSave(
-  operation: typeof operations.$inferSelect,
+  operation: Operation,
   onlyOffice: OnlyOfficeClient,
   allowedCallbackOrigins: ReadonlySet<string>
 ): void {
@@ -624,19 +642,22 @@ function launchForceSave(
       if (!operation.documentKey) {
         fail(500, "invalid_operation", "Operation has no document key");
       }
-      await db
-        .update(operations)
-        .set({ status: "processing", updatedAt: new Date() })
-        .where(
-          and(eq(operations.id, operation.id), eq(operations.status, "pending"))
-        );
+      const claimed = await prisma.operation.updateMany({
+        data: { status: OperationStatus.processing, updatedAt: new Date() },
+        where: { id: operation.id, status: OperationStatus.pending },
+      });
+      if (claimed.count !== 1) {
+        return;
+      }
       const hasChanges = await onlyOffice.forceSave(
         operation.documentKey,
         createCallbackUserdata(operation.id)
       );
       if (!hasChanges) {
-        const currentPath = await operationDocumentPath(operation.documentKey);
-        if (!currentPath) {
+        const currentObjectKey = await operationDocumentPath(
+          operation.documentKey
+        );
+        if (!currentObjectKey) {
           fail(
             500,
             "document_unavailable",
@@ -646,8 +667,7 @@ function launchForceSave(
         await finalizeCallback(
           operation.id,
           { key: operation.documentKey, status: 6 },
-          await readArtifact(currentPath),
-          onlyOffice,
+          await readArtifact(currentObjectKey),
           allowedCallbackOrigins
         );
       }
@@ -664,57 +684,50 @@ function launchForceSave(
 async function operationDocumentPath(
   documentKey: string
 ): Promise<string | null> {
-  const pending = await db
-    .select()
-    .from(operations)
-    .where(
-      and(
-        eq(operations.documentKey, documentKey),
-        or(
-          eq(operations.status, "pending"),
-          eq(operations.status, "processing")
-        )
-      )
-    )
-    .orderBy(desc(operations.updatedAt))
-    .limit(10);
+  const pending = await prisma.operation.findMany({
+    orderBy: { updatedAt: "desc" },
+    select: { metadata: true },
+    take: 10,
+    where: {
+      documentKey,
+      status: { in: [OperationStatus.pending, OperationStatus.processing] },
+    },
+  });
   for (const operation of pending) {
     const metadata = operationMetadata(operation.metadata);
-    if (await artifactExists(metadata.stagedDocxPath)) {
-      return metadata.stagedDocxPath;
+    if (await artifactExists(metadata.stagedObjectKey)) {
+      return metadata.stagedObjectKey;
     }
   }
 
-  const formRows = await db
-    .select()
-    .from(forms)
-    .where(
-      or(
-        eq(forms.templateDraftKey, documentKey),
-        eq(forms.publishedKey, documentKey)
-      )
-    )
-    .limit(1);
-  const form = formRows[0];
-  if (form) {
-    if (form.templateDraftKey === documentKey && form.templateDraftPath) {
-      return form.templateDraftPath;
-    }
-    if (form.publishedKey === documentKey && form.publishedPath) {
-      return form.publishedPath;
-    }
+  const templateDraft = await prisma.templateDraft.findUnique({
+    where: { documentKey },
+  });
+  if (templateDraft) {
+    return templateDraft.objectKey;
   }
-
-  const responseRows = await db
-    .select()
-    .from(responses)
-    .where(eq(responses.draftDocumentKey, documentKey))
-    .limit(1);
-  return responseRows[0]?.draftDocxPath ?? null;
+  const publishedTemplate = await prisma.publishedTemplate.findUnique({
+    where: { documentKey },
+  });
+  if (publishedTemplate) {
+    return publishedTemplate.objectKey;
+  }
+  const response = await prisma.response.findUnique({
+    select: { draftObjectKey: true },
+    where: { draftDocumentKey: documentKey },
+  });
+  if (response?.draftObjectKey) {
+    return response.draftObjectKey;
+  }
+  const submission = await prisma.submission.findUnique({
+    select: { objectKey: true },
+    where: { documentKey },
+  });
+  return submission?.objectKey ?? null;
 }
 
 async function completeTemplateOperation(
-  operation: typeof operations.$inferSelect,
+  operation: Operation,
   metadata: OperationMetadata,
   bytes: Uint8Array
 ): Promise<JsonRecord> {
@@ -722,38 +735,47 @@ async function completeTemplateOperation(
   if (!documentKey) {
     fail(500, "invalid_operation", "Template operation has no document key");
   }
-  const formRows = await db
-    .select()
-    .from(forms)
-    .where(eq(forms.id, metadata.formId))
-    .limit(1);
-  const form = formRows[0];
+  const form = await prisma.form.findUnique({
+    include: { templateDraft: true },
+    where: { id: metadata.formId },
+  });
   if (!form) {
     fail(404, "not_found", "Form was not found");
   }
-  if (form.templateDraftKey !== documentKey) {
+  const templateDraft = form.templateDraft;
+  if (!templateDraft || templateDraft.documentKey !== documentKey) {
     fail(
       409,
       "stale_operation",
       "The template changed while this operation was running"
     );
   }
-  const finalPath =
-    metadata.finalDocxPath ??
+  const finalObjectKey =
+    metadata.finalObjectKey ??
     artifactPath("forms", form.id, "template-draft.docx");
-  await writeArtifact(finalPath, bytes);
-  await db
-    .update(forms)
-    .set({
-      templateDraftKey: documentKey,
-      templateDraftPath: finalPath,
+  const nextDocumentKey = metadata.nextDocumentKey ?? documentKey;
+  await writeArtifact(finalObjectKey, bytes);
+  const updated = await prisma.templateDraft.updateMany({
+    data: {
+      contentHash: contentHash(bytes),
+      documentKey: nextDocumentKey,
+      objectKey: finalObjectKey,
       updatedAt: new Date(),
-    })
-    .where(eq(forms.id, form.id));
-  return { documentKey, formId: form.id };
+    },
+    where: { documentKey, id: templateDraft.id },
+  });
+  if (updated.count !== 1) {
+    fail(
+      409,
+      "stale_operation",
+      "The template changed while this operation was running"
+    );
+  }
+  return { documentKey: nextDocumentKey, formId: form.id };
 }
+
 async function completePublishOperation(
-  operation: typeof operations.$inferSelect,
+  operation: Operation,
   metadata: OperationMetadata,
   bytes: Uint8Array
 ): Promise<JsonRecord> {
@@ -761,54 +783,72 @@ async function completePublishOperation(
   if (!documentKey) {
     fail(500, "invalid_operation", "Publish operation has no document key");
   }
-  const formRows = await db
-    .select()
-    .from(forms)
-    .where(eq(forms.id, metadata.formId))
-    .limit(1);
-  const form = formRows[0];
+  const form = await prisma.form.findUnique({
+    include: { templateDraft: true },
+    where: { id: metadata.formId },
+  });
   if (!form) {
     fail(404, "not_found", "Form was not found");
   }
-  if (form.templateDraftKey !== documentKey) {
+  if (!form.templateDraft || form.templateDraft.documentKey !== documentKey) {
     fail(409, "stale_operation", "The template changed while publishing");
   }
-  const { publishedVersion } = metadata;
-  const { publishedKey } = metadata;
+  const { publishedVersion, publishedKey } = metadata;
   if (
     typeof publishedVersion !== "number" ||
     typeof publishedKey !== "string"
   ) {
     fail(500, "invalid_operation", "Publish metadata is incomplete");
   }
-  validateTemplateControls(bytes);
-  const publishedPath =
-    metadata.finalDocxPath ??
+  const controls = validateTemplateControls(bytes);
+  const finalObjectKey =
+    metadata.finalObjectKey ??
     artifactPath("forms", form.id, `published-${publishedVersion}.docx`);
-  await writeArtifact(publishedPath, bytes);
-  await db.transaction(async (tx) => {
-    await tx
-      .update(forms)
-      .set({
-        publishedKey,
-        publishedPath,
-        status: "published",
-        updatedAt: new Date(),
-        version: publishedVersion,
-      })
-      .where(eq(forms.id, form.id));
-    await tx
-      .update(responses)
-      .set({
-        draftData: null,
-        draftDocumentKey: null,
-        draftDocxPath: null,
-        prefillSnapshotId: null,
-        status: "invalidated",
-        updatedAt: new Date(),
-      })
-      .where(and(eq(responses.formId, form.id), eq(responses.status, "draft")));
-  });
+  const hash = contentHash(bytes);
+  await writeArtifact(finalObjectKey, bytes);
+  await prisma.$transaction(
+    async (tx) => {
+      await tx.publishedTemplate.create({
+        data: {
+          contentHash: hash,
+          documentKey: publishedKey,
+          form: { connect: { id: form.id } },
+          id: crypto.randomUUID(),
+          manifest: {
+            create: {
+              configurationHash: hash,
+              fields: {
+                create: controls.map((tag) => ({
+                  prefillPolicy: PrefillPolicy.editable,
+                  required: false,
+                  tag,
+                  type: FieldType.text,
+                })),
+              },
+            },
+          },
+          objectKey: finalObjectKey,
+          version: publishedVersion,
+        },
+      });
+      const updated = await tx.form.updateMany({
+        data: {
+          status: FormStatus.published,
+          updatedAt: new Date(),
+          version: publishedVersion,
+        },
+        where: {
+          id: form.id,
+          status: { in: [FormStatus.draft, FormStatus.published] },
+          version: form.version,
+        },
+      });
+      if (updated.count !== 1) {
+        fail(409, "stale_operation", "The form changed while publishing");
+      }
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+  );
   return {
     documentKey: publishedKey,
     formId: form.id,
@@ -816,8 +856,9 @@ async function completePublishOperation(
     version: publishedVersion,
   };
 }
+
 async function completeDraftOperation(
-  operation: typeof operations.$inferSelect,
+  operation: Operation,
   metadata: OperationMetadata,
   bytes: Uint8Array
 ): Promise<JsonRecord> {
@@ -828,38 +869,42 @@ async function completeDraftOperation(
   if (!metadata.responseId || !metadata.data) {
     fail(500, "invalid_operation", "Draft metadata is incomplete");
   }
-  const responseRows = await db
-    .select()
-    .from(responses)
-    .where(eq(responses.id, metadata.responseId))
-    .limit(1);
-  const response = responseRows[0];
+  const response = await prisma.response.findUnique({
+    where: { id: metadata.responseId },
+  });
   if (
     !response ||
-    response.status !== "draft" ||
+    response.status !== ResponseStatus.draft ||
     response.draftDocumentKey !== documentKey
   ) {
     fail(409, "stale_operation", "The response is no longer editable");
   }
-  const finalPath =
-    metadata.finalDocxPath ??
+  const finalObjectKey =
+    metadata.finalObjectKey ??
     artifactPath("responses", response.id, "draft.docx");
-  await writeArtifact(finalPath, bytes);
-  await db
-    .update(responses)
-    .set({
-      draftData: metadata.data,
-      draftDocxPath: finalPath,
+  await writeArtifact(finalObjectKey, bytes);
+  const updated = await prisma.response.updateMany({
+    data: {
+      draftData: jsonValue(metadata.data),
+      draftObjectKey: finalObjectKey,
       updatedAt: new Date(),
-    })
-    .where(and(eq(responses.id, response.id), eq(responses.status, "draft")));
+    },
+    where: {
+      draftDocumentKey: documentKey,
+      id: response.id,
+      status: ResponseStatus.draft,
+    },
+  });
+  if (updated.count !== 1) {
+    fail(409, "stale_operation", "The response is no longer editable");
+  }
   return { formId: response.formId, responseId: response.id };
 }
+
 async function completeSubmitOperation(
-  operation: typeof operations.$inferSelect,
+  operation: Operation,
   metadata: OperationMetadata,
-  bytes: Uint8Array,
-  onlyOffice: OnlyOfficeClient
+  bytes: Uint8Array
 ): Promise<JsonRecord> {
   const { documentKey } = operation;
   if (!documentKey) {
@@ -869,27 +914,17 @@ async function completeSubmitOperation(
     !metadata.responseId ||
     !metadata.submissionId ||
     !metadata.data ||
-    !metadata.finalDataPath ||
-    !metadata.finalPdfPath ||
-    !metadata.finalDocxPath
+    !metadata.finalObjectKey
   ) {
     fail(500, "invalid_operation", "Submit metadata is incomplete");
   }
-  const { responseId } = metadata;
-  const { submissionId } = metadata;
-  const { data } = metadata;
-  const { finalDataPath } = metadata;
-  const { finalPdfPath } = metadata;
-  const { finalDocxPath } = metadata;
-  const responseRows = await db
-    .select()
-    .from(responses)
-    .where(eq(responses.id, responseId))
-    .limit(1);
-  const response = responseRows[0];
+  const { responseId, submissionId, data, finalObjectKey } = metadata;
+  const response = await prisma.response.findUnique({
+    where: { id: responseId },
+  });
   if (
     !response ||
-    response.status !== "submitting" ||
+    response.status !== ResponseStatus.submitting ||
     response.draftDocumentKey !== documentKey
   ) {
     fail(
@@ -898,110 +933,94 @@ async function completeSubmitOperation(
       "The response is no longer pending submission"
     );
   }
-
-  // The converter reads this active operation's staged artifact through the signed document route.
-  const pdf = await onlyOffice.convertDocxToPdf(documentKey);
-  await writeArtifact(finalDocxPath, bytes);
-  await writeArtifact(finalPdfPath, pdf);
-  await writeArtifact(finalDataPath, JSON.stringify(data, null, 2));
-  if (
-    !(await artifactExists(finalDocxPath)) ||
-    !(await artifactExists(finalPdfPath)) ||
-    !(await artifactExists(finalDataPath))
-  ) {
-    fail(500, "artifact_failed", "Submission artifacts were not persisted");
+  await writeArtifact(finalObjectKey, bytes);
+  if (!(await artifactExists(finalObjectKey))) {
+    fail(500, "artifact_failed", "Submission artifact was not persisted");
   }
 
+  const submissionDocumentKey = metadata.submissionDocumentKey ?? documentKey;
   const result = {
     formId: response.formId,
     responseId: response.id,
     submissionId,
   };
-  await db.transaction(async (tx) => {
-    const claimed = await tx
-      .update(operations)
-      .set({ updatedAt: new Date() })
-      .where(
-        and(
-          eq(operations.id, operation.id),
-          eq(operations.status, "processing")
-        )
-      )
-      .returning({ id: operations.id });
-    if (!claimed[0]) {
-      fail(
-        409,
-        "stale_operation",
-        "The submission operation is no longer active"
-      );
-    }
-    await tx.insert(submissions).values({
-      data,
-      dataPath: finalDataPath,
-      docxPath: finalDocxPath,
-      formId: response.formId,
-      id: submissionId,
-      pdfPath: finalPdfPath,
-      responseId: response.id,
-      userId: response.userId,
-    });
-    const updatedResponses = await tx
-      .update(responses)
-      .set({ status: "submitted", updatedAt: new Date() })
-      .where(
-        and(eq(responses.id, response.id), eq(responses.status, "submitting"))
-      )
-      .returning({ id: responses.id });
-    if (!updatedResponses[0]) {
-      fail(
-        409,
-        "stale_operation",
-        "The response is no longer pending submission"
-      );
-    }
-    const completed = await tx
-      .update(operations)
-      .set({
-        error: null,
-        metadata: { ...metadata, result },
-        status: "completed",
-        submissionId,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(operations.id, operation.id),
-          eq(operations.status, "processing")
-        )
-      )
-      .returning({ id: operations.id });
-    if (!completed[0]) {
-      fail(
-        409,
-        "stale_operation",
-        "The submission operation is no longer active"
-      );
-    }
-  });
+  await prisma.$transaction(
+    async (tx) => {
+      const claimed = await tx.operation.updateMany({
+        data: { updatedAt: new Date() },
+        where: { id: operation.id, status: OperationStatus.processing },
+      });
+      if (claimed.count !== 1) {
+        fail(
+          409,
+          "stale_operation",
+          "The submission operation is no longer active"
+        );
+      }
+      await tx.submission.create({
+        data: {
+          data: jsonValue(data),
+          documentKey: submissionDocumentKey,
+          form: { connect: { id: response.formId } },
+          id: submissionId,
+          objectKey: finalObjectKey,
+          owner: { connect: { id: response.userId } },
+          response: { connect: { id: response.id } },
+        },
+      });
+      const updatedResponse = await tx.response.updateMany({
+        data: {
+          draftData: Prisma.DbNull,
+          draftDocumentKey: null,
+          draftObjectKey: null,
+          status: ResponseStatus.submitted,
+          updatedAt: new Date(),
+        },
+        where: { id: response.id, status: ResponseStatus.submitting },
+      });
+      if (updatedResponse.count !== 1) {
+        fail(
+          409,
+          "stale_operation",
+          "The response is no longer pending submission"
+        );
+      }
+      const completed = await tx.operation.updateMany({
+        data: {
+          errorCode: null,
+          result: jsonValue(result),
+          status: OperationStatus.completed,
+          submissionId,
+          updatedAt: new Date(),
+        },
+        where: { id: operation.id, status: OperationStatus.processing },
+      });
+      if (completed.count !== 1) {
+        fail(
+          409,
+          "stale_operation",
+          "The submission operation is no longer active"
+        );
+      }
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+  );
   return result;
 }
+
 async function finalizeCallback(
   operationId: string,
   payload: CallbackPayload,
   snapshot: Uint8Array | undefined,
-  onlyOffice: OnlyOfficeClient,
   allowedCallbackOrigins: ReadonlySet<string>
 ): Promise<void> {
-  const rows = await db
-    .select()
-    .from(operations)
-    .where(eq(operations.id, operationId))
-    .limit(1);
-  const operation = rows[0];
+  const operation = await prisma.operation.findUnique({
+    where: { id: operationId },
+  });
   if (
     !operation ||
-    operation.status === "completed" ||
-    operation.status === "failed"
+    operation.status === OperationStatus.completed ||
+    operation.status === OperationStatus.failed
   ) {
     return;
   }
@@ -1038,23 +1057,17 @@ async function finalizeCallback(
     }
     bytes = await readCallbackDocument(callbackUrl);
   }
-  const claimed = await db
-    .update(operations)
-    .set({ status: "processing", updatedAt: new Date() })
-    .where(
-      and(
-        eq(operations.id, operation.id),
-        or(
-          eq(operations.status, "pending"),
-          eq(operations.status, "processing")
-        )
-      )
-    )
-    .returning({ id: operations.id });
-  if (!claimed[0]) {
+  const claimed = await prisma.operation.updateMany({
+    data: { status: OperationStatus.processing, updatedAt: new Date() },
+    where: {
+      id: operation.id,
+      status: { in: [OperationStatus.pending, OperationStatus.processing] },
+    },
+  });
+  if (claimed.count !== 1) {
     return;
   }
-  await writeArtifact(metadata.stagedDocxPath, bytes);
+  await writeArtifact(metadata.stagedObjectKey, bytes);
 
   let result: JsonRecord;
   if (metadata.action === "save-template") {
@@ -1064,30 +1077,25 @@ async function finalizeCallback(
   } else if (metadata.action === "save-draft") {
     result = await completeDraftOperation(operation, metadata, bytes);
   } else {
-    result = await completeSubmitOperation(
-      operation,
-      metadata,
-      bytes,
-      onlyOffice
-    );
+    result = await completeSubmitOperation(operation, metadata, bytes);
   }
-  await db
-    .update(operations)
-    .set({
-      error: null,
-      metadata: { ...metadata, result },
-      status: "completed",
+  await prisma.operation.updateMany({
+    data: {
+      errorCode: null,
+      result: jsonValue(result),
+      status: OperationStatus.completed,
       updatedAt: new Date(),
-    })
-    .where(
-      and(eq(operations.id, operation.id), eq(operations.status, "processing"))
-    );
+    },
+    where: { id: operation.id, status: OperationStatus.processing },
+  });
 }
 
-async function findFormById(id: string): Promise<typeof forms.$inferSelect> {
+async function findFormById(id: string): Promise<FormWithDocuments> {
   validateId(id, "Form");
-  const rows = await db.select().from(forms).where(eq(forms.id, id)).limit(1);
-  const form = rows[0];
+  const form = await prisma.form.findUnique({
+    include: { publishedTemplate: true, templateDraft: true },
+    where: { id },
+  });
   if (!form) {
     fail(404, "not_found", "Form was not found");
   }
@@ -1096,16 +1104,14 @@ async function findFormById(id: string): Promise<typeof forms.$inferSelect> {
 
 async function findFormByPublicId(
   publicId: string
-): Promise<typeof forms.$inferSelect> {
+): Promise<FormWithDocuments> {
   if (!publicId || publicId.length > 128) {
     fail(404, "not_found", "Form was not found");
   }
-  const rows = await db
-    .select()
-    .from(forms)
-    .where(eq(forms.publicId, publicId))
-    .limit(1);
-  const form = rows[0];
+  const form = await prisma.form.findUnique({
+    include: { publishedTemplate: true, templateDraft: true },
+    where: { publicId },
+  });
   if (!form) {
     fail(404, "not_found", "Form was not found");
   }
@@ -1116,30 +1122,19 @@ async function findOwnedResponse(
   responseId: string,
   formId: string,
   userId: string
-): Promise<typeof responses.$inferSelect> {
+): Promise<ResponseWithSnapshot> {
   validateId(responseId, "Response");
-  const rows = await db
-    .select()
-    .from(responses)
-    .where(
-      and(
-        eq(responses.id, responseId),
-        eq(responses.formId, formId),
-        eq(responses.userId, userId)
-      )
-    )
-    .limit(1);
-  const response = rows[0];
+  const response = await prisma.response.findFirst({
+    include: { prefillSnapshot: true },
+    where: { formId, id: responseId, userId },
+  });
   if (!response) {
     fail(404, "not_found", "Response was not found");
   }
   return response;
 }
 
-function canReadSubmission(
-  identity: Identity,
-  submission: typeof submissions.$inferSelect
-): void {
+function canReadSubmission(identity: Identity, submission: Submission): void {
   if (identity.role === "admin") {
     return;
   }
@@ -1149,60 +1144,46 @@ function canReadSubmission(
 }
 
 async function userEditorConfig(
-  form: typeof forms.$inferSelect,
+  form: FormWithDocuments,
   identity: Identity,
   responseId: string | undefined,
   requestedAction?: string,
   authToken?: string
 ): Promise<Record<string, unknown>> {
-  if (!form.publishedPath || !form.publishedKey) {
+  const publishedTemplate = form.publishedTemplate;
+  if (!publishedTemplate?.objectKey || !publishedTemplate.documentKey) {
     fail(409, "not_published", "This form has no published document");
   }
-  const responseRows = responseId
-    ? await db
-        .select()
-        .from(responses)
-        .where(
-          and(
-            eq(responses.id, responseId),
-            eq(responses.formId, form.id),
-            eq(responses.userId, identity.id)
-          )
-        )
-        .limit(1)
-    : await db
-        .select()
-        .from(responses)
-        .where(
-          and(eq(responses.formId, form.id), eq(responses.userId, identity.id))
-        )
-        .limit(1);
-  const response = responseRows[0];
+  const response = responseId
+    ? await prisma.response.findFirst({
+        include: { prefillSnapshot: true },
+        where: {
+          formId: form.id,
+          id: responseId,
+          userId: identity.id,
+        },
+      })
+    : await prisma.response.findFirst({
+        include: { prefillSnapshot: true },
+        where: { formId: form.id, userId: identity.id },
+      });
   if (!response) {
     fail(404, "not_found", "Start a response before opening the editor");
   }
-  if (response.status === "submitted") {
+  if (response.status === ResponseStatus.submitted) {
     fail(409, "already_submitted", "This response has already been submitted");
   }
-  if (!response.draftDocumentKey || !response.draftDocxPath) {
+  if (!response.draftDocumentKey || !response.draftObjectKey) {
     fail(409, "document_unavailable", "Response document is unavailable");
   }
-  if (!(await artifactExists(response.draftDocxPath))) {
+  if (!(await artifactExists(response.draftObjectKey))) {
     fail(
       409,
       "document_unavailable",
       "Response document artifact is unavailable"
     );
   }
-  let snapshot: typeof prefillSnapshots.$inferSelect | undefined;
-  if (response.prefillSnapshotId) {
-    const snapshotRows = await db
-      .select()
-      .from(prefillSnapshots)
-      .where(eq(prefillSnapshots.id, response.prefillSnapshotId))
-      .limit(1);
-    snapshot = snapshotRows[0];
-  }
+  const snapshot = response.prefillSnapshot;
   return editorConfig(
     {
       action:
@@ -1215,13 +1196,11 @@ async function userEditorConfig(
       documentKey: response.draftDocumentKey,
       formId: form.id,
       prefill:
-        requestedAction === "fill"
-          ? snapshot
-            ? {
-                data: jsonRecord(snapshot.data),
-                editableFields: jsonRecord(snapshot.editableFields),
-              }
-            : undefined
+        requestedAction === "fill" && snapshot
+          ? {
+              data: jsonRecord(snapshot.values),
+              editableFields: editableFieldsForSnapshot(snapshot),
+            }
           : undefined,
       publicId: form.publicId,
       responseId: response.id,
@@ -1261,7 +1240,7 @@ export function createApp(options: AppOptions = {}) {
           message: error.message,
         });
       }
-      if (databaseErrorCode(error) === "23505") {
+      if (databaseErrorCode(error) === "P2002") {
         set.status = 409;
         return Response.json({
           error: "operation_conflict",
@@ -1288,135 +1267,114 @@ export function createApp(options: AppOptions = {}) {
     .get("/api/admin/forms", async ({ request }) => {
       const identity = await requireIdentity(request);
       requireAdmin(identity);
-      const items = await db
-        .select({ form: forms, submissionCount: count(submissions.id) })
-        .from(forms)
-        .leftJoin(submissions, eq(submissions.formId, forms.id))
-        .groupBy(forms.id)
-        .orderBy(desc(forms.updatedAt));
-      const payload = {
-        forms: items.map(({ form, submissionCount }) => ({
-          ...formSummary(form),
-          submissionCount: Number(submissionCount),
+      const items = await prisma.form.findMany({
+        include: {
+          _count: { select: { submissions: true } },
+          publishedTemplate: true,
+          templateDraft: true,
+        },
+        orderBy: { updatedAt: "desc" },
+      });
+      return {
+        forms: items.map((item) => ({
+          ...formSummary(item),
+          submissionCount: item._count.submissions,
         })),
       };
-      return payload;
     })
     .delete("/api/admin/forms/:id", async ({ request, params }) => {
       const identity = await requireIdentity(request);
       requireAdmin(identity);
       const formId = validateId(params.id, "Form");
-      const { operationIds } = await db.transaction(async (tx) => {
-        const formRows = await tx
-          .select()
-          .from(forms)
-          .where(eq(forms.id, formId))
-          .for("update")
-          .limit(1);
-        const form = formRows[0];
-        if (!form) {
-          fail(404, "not_found", "Form was not found");
-        }
-        if (
-          form.status !== "draft" ||
-          form.publishedPath ||
-          form.publishedKey ||
-          form.version > 0
-        ) {
-          fail(
-            409,
-            "form_not_draft",
-            "Only unpublished draft forms can be removed"
-          );
-        }
-
-        const activeOperations = await tx
-          .select({ id: operations.id, updatedAt: operations.updatedAt })
-          .from(operations)
-          .where(
-            and(
-              eq(operations.formId, form.id),
-              or(
-                eq(operations.status, "pending"),
-                eq(operations.status, "processing")
-              )
-            )
-          );
-        const staleOperationIds = new Set<string>();
-        const now = Date.now();
-        for (const operation of activeOperations) {
-          if (now - operation.updatedAt.getTime() >= operationTimeoutMs) {
-            staleOperationIds.add(operation.id);
-            await tx
-              .update(operations)
-              .set({
-                error: "The document operation timed out. Try again.",
-                status: "failed",
-                updatedAt: new Date(),
-              })
-              .where(
-                and(
-                  eq(operations.id, operation.id),
-                  or(
-                    eq(operations.status, "pending"),
-                    eq(operations.status, "processing")
-                  )
-                )
-              );
+      const { operationIds } = await prisma.$transaction(
+        async (tx) => {
+          const form = await tx.form.findUnique({
+            where: { id: formId },
+          });
+          if (!form) {
+            fail(404, "not_found", "Form was not found");
           }
-        }
-        if (activeOperations.some(({ id }) => !staleOperationIds.has(id))) {
-          fail(
-            409,
-            "operation_in_progress",
-            "Wait for the draft operation to finish before removing this form"
-          );
-        }
+          if (form.status !== FormStatus.draft || form.version > 0) {
+            fail(
+              409,
+              "form_not_draft",
+              "Only unpublished draft forms can be removed"
+            );
+          }
 
-        const responsesForForm = await tx
-          .select({ id: responses.id })
-          .from(responses)
-          .where(eq(responses.formId, form.id))
-          .limit(1);
-        if (responsesForForm[0]) {
-          fail(
-            409,
-            "form_has_responses",
-            "A form with responses cannot be removed"
-          );
-        }
-        const snapshotsForForm = await tx
-          .select({ id: prefillSnapshots.id })
-          .from(prefillSnapshots)
-          .where(eq(prefillSnapshots.formId, form.id))
-          .limit(1);
-        const submissionsForForm = await tx
-          .select({ id: submissions.id })
-          .from(submissions)
-          .where(eq(submissions.formId, form.id))
-          .limit(1);
-        if (snapshotsForForm[0] || submissionsForForm[0]) {
-          fail(
-            409,
-            "form_has_responses",
-            "A form with responses cannot be removed"
-          );
-        }
+          const activeOperations = await tx.operation.findMany({
+            select: { id: true, updatedAt: true },
+            where: {
+              formId: form.id,
+              status: {
+                in: [OperationStatus.pending, OperationStatus.processing],
+              },
+            },
+          });
+          const staleOperationIds = new Set<string>();
+          const now = Date.now();
+          for (const operation of activeOperations) {
+            if (now - operation.updatedAt.getTime() < operationTimeoutMs) {
+              continue;
+            }
+            staleOperationIds.add(operation.id);
+            await tx.operation.updateMany({
+              data: {
+                errorCode: "The document operation timed out. Try again.",
+                status: OperationStatus.failed,
+                updatedAt: new Date(),
+              },
+              where: {
+                id: operation.id,
+                status: {
+                  in: [OperationStatus.pending, OperationStatus.processing],
+                },
+              },
+            });
+          }
+          if (activeOperations.some(({ id }) => !staleOperationIds.has(id))) {
+            fail(
+              409,
+              "operation_in_progress",
+              "Wait for the draft operation to finish before removing this form"
+            );
+          }
 
-        const formOperations = await tx
-          .select({ id: operations.id })
-          .from(operations)
-          .where(eq(operations.formId, form.id));
-        await tx.delete(operations).where(eq(operations.formId, form.id));
-        const deletedForms = await tx
-          .delete(forms)
-          .where(and(eq(forms.id, form.id), eq(forms.status, "draft")))
-          .returning({ id: forms.id });
-        if (!deletedForms[0]) {
-          fail(409, "form_not_draft", "Only draft forms can be removed");
-        }
-        return { operationIds: formOperations.map(({ id }) => id) };
-      });
+          if ((await tx.response.count({ where: { formId: form.id } })) > 0) {
+            fail(
+              409,
+              "form_has_responses",
+              "A form with responses cannot be removed"
+            );
+          }
+          if (
+            (await tx.prefillSnapshot.count({
+              where: { formId: form.id },
+            })) > 0 ||
+            (await tx.submission.count({ where: { formId: form.id } })) > 0
+          ) {
+            fail(
+              409,
+              "form_has_responses",
+              "A form with responses cannot be removed"
+            );
+          }
+
+          const formOperations = await tx.operation.findMany({
+            select: { id: true },
+            where: { formId: form.id },
+          });
+          await tx.operation.deleteMany({ where: { formId: form.id } });
+          const deleted = await tx.form.deleteMany({
+            where: { id: form.id, status: FormStatus.draft },
+          });
+          if (deleted.count !== 1) {
+            fail(409, "form_not_draft", "Only draft forms can be removed");
+          }
+          return { operationIds: formOperations.map(({ id }) => id) };
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+      );
 
       await Promise.all([
         removeArtifactDirectoryWithRetry(artifactPath("forms", formId)),
@@ -1441,35 +1399,39 @@ export function createApp(options: AppOptions = {}) {
       const id = crypto.randomUUID();
       const publicId = crypto.randomUUID().replaceAll("-", "");
       const sourcePath = await findTemplateSource();
-      const templateDraftPath = sourcePath
+      const templateBytes = sourcePath
+        ? await readArtifactFromAbsolute(sourcePath)
+        : undefined;
+      const templateObjectKey = sourcePath
         ? artifactPath("forms", id, "template-draft.docx")
-        : null;
-      const templateDraftKey = sourcePath
+        : undefined;
+      const templateDocumentKey = sourcePath
         ? `form-${id}-draft-${crypto.randomUUID()}`
-        : null;
-      if (sourcePath && templateDraftPath) {
-        await writeArtifact(
-          templateDraftPath,
-          await readArtifactFromAbsolute(sourcePath)
-        );
+        : undefined;
+      if (templateBytes && templateObjectKey) {
+        await writeArtifact(templateObjectKey, templateBytes);
       }
-      const rows = await db
-        .insert(forms)
-        .values({
-          createdBy: identity.id,
+      const form = await prisma.form.create({
+        data: {
+          creator: { connect: { id: identity.id } },
           description,
           id,
           publicId,
-          templateDraftKey,
-          templateDraftPath,
           title,
-          version: 0,
-        })
-        .returning();
-      const form = rows[0];
-      if (!form) {
-        fail(500, "create_failed", "Unable to create form");
-      }
+          ...(templateBytes && templateObjectKey && templateDocumentKey
+            ? {
+                templateDraft: {
+                  create: {
+                    contentHash: contentHash(templateBytes),
+                    documentKey: templateDocumentKey,
+                    objectKey: templateObjectKey,
+                  },
+                },
+              }
+            : {}),
+        },
+        include: { publishedTemplate: true, templateDraft: true },
+      });
       return {
         form: formSummary(form),
         templateAvailable: Boolean(sourcePath),
@@ -1479,13 +1441,9 @@ export function createApp(options: AppOptions = {}) {
       const identity = await requireIdentity(request);
       requireAdmin(identity);
       const form = await findFormById(params.id);
-      const draftRows = await db
-        .select({ count: count() })
-        .from(responses)
-        .where(
-          and(eq(responses.formId, form.id), eq(responses.status, "draft"))
-        );
-      const activeDraftCount = Number(draftRows[0]?.count ?? 0);
+      const activeDraftCount = await prisma.response.count({
+        where: { formId: form.id, status: ResponseStatus.draft },
+      });
       return {
         editorConfigUrl: `/api/admin/forms/${form.id}/editor-config`,
         form: { ...formSummary(form), activeDraftCount },
@@ -1495,14 +1453,15 @@ export function createApp(options: AppOptions = {}) {
       const identity = await requireIdentity(request);
       requireAdmin(identity);
       const form = await findFormById(params.id);
-      if (!form.templateDraftPath || !form.templateDraftKey) {
+      const templateDraft = form.templateDraft;
+      if (!templateDraft) {
         fail(
           409,
           "document_unavailable",
-          "No template DOCX is configured; provide TEMPLATE_PATH or restore the demo template"
+          "No template DOCX is configured; provide TEMPLATE_PATH or upload a template"
         );
       }
-      if (!(await artifactExists(form.templateDraftPath))) {
+      if (!(await artifactExists(templateDraft.objectKey))) {
         fail(
           409,
           "document_unavailable",
@@ -1513,7 +1472,7 @@ export function createApp(options: AppOptions = {}) {
         {
           action: "template-edit",
           authToken: bearerTokenFor(request),
-          documentKey: form.templateDraftKey,
+          documentKey: templateDraft.documentKey,
           formId: form.id,
         },
         identity
@@ -1525,9 +1484,13 @@ export function createApp(options: AppOptions = {}) {
         const identity = await requireIdentity(request);
         requireAdmin(identity);
         const form = await findFormById(params.id);
+        const templateDraft = form.templateDraft;
+        if (!templateDraft) {
+          fail(409, "document_unavailable", "No template DOCX is configured");
+        }
         const input = asRecord(body);
         const documentKey = requiredString(input, "documentKey");
-        if (!form.templateDraftKey || form.templateDraftKey !== documentKey) {
+        if (templateDraft.documentKey !== documentKey) {
           fail(
             409,
             "stale_document",
@@ -1547,25 +1510,33 @@ export function createApp(options: AppOptions = {}) {
           );
         }
         const operationId = crypto.randomUUID();
-        const nextKey = `form-${form.id}-draft-${crypto.randomUUID()}`;
+        const nextDocumentKey = `form-${form.id}-draft-${crypto.randomUUID()}`;
+        const stagedObjectKey = artifactPath(
+          "operations",
+          operationId,
+          "template.docx"
+        );
+        const metadata: OperationMetadata = {
+          action: "save-template",
+          finalObjectKey: artifactPath(
+            "forms",
+            form.id,
+            `template-draft-${operationId}.docx`
+          ),
+          formId: form.id,
+          nextDocumentKey,
+          result: { documentKey: nextDocumentKey },
+          stagedObjectKey,
+        };
         const operation = await createOperation({
+          actorId: identity.id,
           documentKey,
           formId: form.id,
-          metadata: {
-            action: "save-template",
-            finalDocxPath: artifactPath(
-              "forms",
-              form.id,
-              `template-draft-${operationId}.docx`
-            ),
-            formId: form.id,
-            result: { documentKey: nextKey },
-            stagedDocxPath: artifactPath(
-              "operations",
-              operationId,
-              "template.docx"
-            ),
-          },
+          metadata,
+          ownerUserId: identity.id,
+          stagingObjectKey: stagedObjectKey,
+          targetId: templateDraft.id,
+          targetType: OperationTargetType.template_draft,
           type: operationTypeForAction["save-template"],
         });
         set.status = 202;
@@ -1579,9 +1550,13 @@ export function createApp(options: AppOptions = {}) {
         const identity = await requireIdentity(request);
         requireAdmin(identity);
         const form = await findFormById(params.id);
+        const templateDraft = form.templateDraft;
+        if (!templateDraft) {
+          fail(409, "document_unavailable", "No template DOCX is configured");
+        }
         const input = asRecord(body);
         const documentKey = requiredString(input, "documentKey");
-        if (!form.templateDraftKey || form.templateDraftKey !== documentKey) {
+        if (templateDraft.documentKey !== documentKey) {
           fail(
             409,
             "stale_document",
@@ -1600,25 +1575,32 @@ export function createApp(options: AppOptions = {}) {
         const operationId = crypto.randomUUID();
         const version = form.version + 1;
         const publishedKey = `form-${form.id}-published-${version}-${crypto.randomUUID()}`;
+        const stagedObjectKey = artifactPath(
+          "operations",
+          operationId,
+          "published.docx"
+        );
+        const metadata: OperationMetadata = {
+          action: "publish",
+          finalObjectKey: artifactPath(
+            "forms",
+            form.id,
+            `published-${version}.docx`
+          ),
+          formId: form.id,
+          publishedKey,
+          publishedVersion: version,
+          stagedObjectKey,
+        };
         const operation = await createOperation({
+          actorId: identity.id,
           documentKey,
           formId: form.id,
-          metadata: {
-            action: "publish",
-            finalDocxPath: artifactPath(
-              "forms",
-              form.id,
-              `published-${version}.docx`
-            ),
-            formId: form.id,
-            publishedKey,
-            publishedVersion: version,
-            stagedDocxPath: artifactPath(
-              "operations",
-              operationId,
-              "published.docx"
-            ),
-          },
+          metadata,
+          ownerUserId: identity.id,
+          stagingObjectKey: stagedObjectKey,
+          targetId: templateDraft.id,
+          targetType: OperationTargetType.template_draft,
           type: operationTypeForAction.publish,
         });
         set.status = 202;
@@ -1630,20 +1612,17 @@ export function createApp(options: AppOptions = {}) {
       const identity = await requireIdentity(request);
       requireAdmin(identity);
       const form = await findFormById(params.id);
-      const rows = await db
-        .select({
-          formTitle: forms.title,
-          submission: submissions,
-          userEmail: user.email,
-        })
-        .from(submissions)
-        .innerJoin(forms, eq(submissions.formId, forms.id))
-        .innerJoin(user, eq(submissions.userId, user.id))
-        .where(eq(submissions.formId, form.id))
-        .orderBy(desc(submissions.createdAt));
+      const submissions = await prisma.submission.findMany({
+        include: { form: true, owner: true },
+        orderBy: { createdAt: "desc" },
+        where: { formId: form.id },
+      });
       return {
-        submissions: rows.map(({ submission, formTitle, userEmail }) =>
-          submissionSummary(submission, { formTitle, userEmail })
+        submissions: submissions.map((submission) =>
+          submissionSummary(submission, {
+            formTitle: submission.form.title,
+            userEmail: submission.owner.email,
+          })
         ),
       };
     })
@@ -1654,7 +1633,10 @@ export function createApp(options: AppOptions = {}) {
           description: form.description,
           id: form.id,
           publicId: form.publicId,
-          published: Boolean(form.publishedPath && form.publishedKey),
+          published: Boolean(
+            form.publishedTemplate?.objectKey &&
+            form.publishedTemplate.documentKey
+          ),
           title: form.title,
           version: form.version,
         },
@@ -1681,22 +1663,25 @@ export function createApp(options: AppOptions = {}) {
     .post("/api/forms/:publicId/start", async ({ request, params }) => {
       const identity = await requireIdentity(request);
       const form = await findFormByPublicId(params.publicId);
-      if (!form.publishedPath || !form.publishedKey) {
+      const publishedTemplate = form.publishedTemplate;
+      if (
+        form.status !== FormStatus.published ||
+        !publishedTemplate?.objectKey ||
+        !publishedTemplate.documentKey
+      ) {
         fail(409, "not_published", "This form has not been published");
       }
 
-      const existingRows = await db
-        .select()
-        .from(responses)
-        .where(
-          and(eq(responses.formId, form.id), eq(responses.userId, identity.id))
-        )
-        .limit(1);
-      const existing = existingRows[0];
-      if (existing?.status === "submitted") {
+      const existing = await prisma.response.findUnique({
+        include: { prefillSnapshot: true },
+        where: {
+          formId_userId: { formId: form.id, userId: identity.id },
+        },
+      });
+      if (existing?.status === ResponseStatus.submitted) {
         fail(409, "already_submitted", "You have already submitted this form");
       }
-      if (existing && existing.status === "submitting") {
+      if (existing?.status === ResponseStatus.submitting) {
         fail(
           409,
           "operation_in_progress",
@@ -1704,13 +1689,12 @@ export function createApp(options: AppOptions = {}) {
         );
       }
       if (
-        existing &&
-        existing.status === "draft" &&
+        existing?.status === ResponseStatus.draft &&
         existing.publishedVersion === form.version &&
-        existing.draftDocxPath &&
+        existing.draftObjectKey &&
         existing.draftDocumentKey
       ) {
-        if (!(await artifactExists(existing.draftDocxPath))) {
+        if (!(await artifactExists(existing.draftObjectKey))) {
           fail(
             409,
             "document_unavailable",
@@ -1724,124 +1708,130 @@ export function createApp(options: AppOptions = {}) {
         };
       }
 
-      const profileRows = await db
-        .select()
-        .from(prefillProfiles)
-        .where(eq(prefillProfiles.userId, identity.id))
-        .limit(1);
-      const profile = profileRows[0];
-      const prefillData = profile ? jsonRecord(profile.data) : {};
-      const editableFields = profile ? jsonRecord(profile.editableFields) : {};
-      const responseId = existing?.id ?? crypto.randomUUID();
-      const draftPath = artifactPath(
-        "responses",
-        responseId,
-        `draft-v${form.version}.docx`
-      );
-      const draftKey = `response-${responseId}-${crypto.randomUUID()}`;
-      const snapshotId = crypto.randomUUID();
-      if (!(await artifactExists(form.publishedPath))) {
+      if (!(await artifactExists(publishedTemplate.objectKey))) {
         fail(
           409,
           "document_unavailable",
           "The published document artifact is unavailable"
         );
       }
-      const document = await readArtifact(form.publishedPath);
-      await writeArtifact(draftPath, document);
+      const document = await readArtifact(publishedTemplate.objectKey);
+      const responseId = existing?.id ?? crypto.randomUUID();
+      const draftObjectKey = artifactPath(
+        "responses",
+        responseId,
+        `draft-v${form.version}.docx`
+      );
+      const draftDocumentKey = `response-${responseId}-${crypto.randomUUID()}`;
+      const snapshotId = crypto.randomUUID();
+      await writeArtifact(draftObjectKey, document);
 
-      const response = await db.transaction(async (tx) => {
-        const lockedForm = await tx
-          .select({ id: forms.id })
-          .from(forms)
-          .where(
-            and(
-              eq(forms.id, form.id),
-              eq(forms.status, "published"),
-              eq(forms.version, form.version)
-            )
-          )
-          .for("update")
-          .limit(1);
-        if (!lockedForm[0]) {
-          fail(409, "stale_form", "The form was published while starting");
-        }
-        if (!existing) {
-          const inserted = await tx
-            .insert(responses)
-            .values({
-              draftData: null,
-              draftDocumentKey: draftKey,
-              draftDocxPath: draftPath,
-              formId: form.id,
-              id: responseId,
-              prefillSnapshotId: null,
+      const response = await prisma.$transaction(
+        async (tx) => {
+          const lockedForm = await tx.form.findUnique({
+            include: { publishedTemplate: true },
+            where: { id: form.id },
+          });
+          if (
+            !lockedForm ||
+            lockedForm.status !== FormStatus.published ||
+            lockedForm.version !== form.version ||
+            !lockedForm.publishedTemplate ||
+            lockedForm.publishedTemplate.id !== publishedTemplate.id
+          ) {
+            fail(409, "stale_form", "The form was published while starting");
+          }
+          const current = await tx.response.findUnique({
+            where: {
+              formId_userId: { formId: form.id, userId: identity.id },
+            },
+          });
+          if (current?.status === ResponseStatus.submitted) {
+            fail(
+              409,
+              "already_submitted",
+              "You have already submitted this form"
+            );
+          }
+          if (current?.status === ResponseStatus.submitting) {
+            fail(
+              409,
+              "operation_in_progress",
+              "Your submission is being processed"
+            );
+          }
+          if (!current) {
+            await tx.response.create({
+              data: {
+                draftData: Prisma.DbNull,
+                draftDocumentKey,
+                draftObjectKey,
+                form: { connect: { id: form.id } },
+                id: responseId,
+                owner: { connect: { id: identity.id } },
+                publishedTemplate: {
+                  connect: { id: lockedForm.publishedTemplate.id },
+                },
+                publishedVersion: form.version,
+                status: ResponseStatus.draft,
+              },
+            });
+          }
+          await tx.prefillSnapshot.deleteMany({
+            where: { responseId },
+          });
+          await tx.prefillSnapshot.create({
+            data: {
+              form: { connect: { id: form.id } },
+              id: snapshotId,
+              lockedFields: jsonValue({}),
+              owner: { connect: { id: identity.id } },
+              response: { connect: { id: responseId } },
+              values: jsonValue({}),
+            },
+          });
+          const updated = await tx.response.updateMany({
+            data: {
+              draftData: Prisma.DbNull,
+              draftDocumentKey,
+              draftObjectKey,
+              publishedTemplateId: lockedForm.publishedTemplate.id,
               publishedVersion: form.version,
-              status: "draft",
-              userId: identity.id,
-            })
-            .returning();
-          if (!inserted[0]) {
+              status: ResponseStatus.draft,
+              updatedAt: new Date(),
+            },
+            where: { id: responseId },
+          });
+          if (updated.count !== 1) {
             fail(500, "start_failed", "Unable to start response");
           }
-        }
-        const snapshotRows = await tx
-          .insert(prefillSnapshots)
-          .values({
-            data: prefillData,
-            editableFields,
-            formId: form.id,
-            id: snapshotId,
-            profileId: profile?.id,
-            responseId,
-            userId: identity.id,
-          })
-          .returning();
-        if (!snapshotRows[0]) {
-          fail(500, "start_failed", "Unable to save prefill snapshot");
-        }
-        const updated = await tx
-          .update(responses)
-          .set({
-            draftData: null,
-            draftDocumentKey: draftKey,
-            draftDocxPath: draftPath,
-            prefillSnapshotId: snapshotId,
-            publishedVersion: form.version,
-            status: "draft",
-            updatedAt: new Date(),
-          })
-          .where(eq(responses.id, responseId))
-          .returning();
-        return updated[0];
-      });
+          return tx.response.findUnique({ where: { id: responseId } });
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+      );
       if (!response) {
         fail(500, "start_failed", "Unable to start response");
       }
       return {
         editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${response.id}&action=fill`,
-        prefill: { data: prefillData, editableFields },
+        prefill: { data: {}, editableFields: {} },
         response: responseSummary(response),
       };
     })
     .get("/api/responses/me", async ({ request }) => {
       const identity = await requireIdentity(request);
-      const rows = await db
-        .select({
-          formPublicId: forms.publicId,
-          formTitle: forms.title,
-          response: responses,
-          submissionId: submissions.id,
-        })
-        .from(responses)
-        .innerJoin(forms, eq(responses.formId, forms.id))
-        .leftJoin(submissions, eq(submissions.responseId, responses.id))
-        .where(eq(responses.userId, identity.id))
-        .orderBy(desc(responses.updatedAt));
+      const responses = await prisma.response.findMany({
+        include: { form: true, submission: true },
+        orderBy: { updatedAt: "desc" },
+        where: { userId: identity.id },
+      });
       return {
-        responses: rows.map(
-          ({ response, formPublicId, formTitle, submissionId }) =>
-            responseSummary(response, { formPublicId, formTitle, submissionId })
+        responses: responses.map((response) =>
+          responseSummary(response, {
+            formPublicId: response.form.publicId,
+            formTitle: response.form.title,
+            submissionId: response.submission?.id,
+          })
         ),
       };
     })
@@ -1851,7 +1841,6 @@ export function createApp(options: AppOptions = {}) {
         const identity = await requireIdentity(request);
         const form = await findFormByPublicId(params.publicId);
         const input = asRecord(body);
-        const inputData = input.data;
         const responseId = requiredString(input, "responseId");
         const documentKey = requiredString(input, "documentKey");
         const response = await findOwnedResponse(
@@ -1860,13 +1849,13 @@ export function createApp(options: AppOptions = {}) {
           identity.id
         );
         if (
-          response.status !== "draft" ||
+          response.status !== ResponseStatus.draft ||
           response.draftDocumentKey !== documentKey ||
           response.publishedVersion !== form.version
         ) {
           fail(409, "stale_response", "The response is no longer editable");
         }
-        const data = await normalizeResponseData(form, response, inputData);
+        const data = await normalizeResponseData(form, response, input.data);
         if (await activeOperationForResponse(response.id)) {
           fail(
             409,
@@ -1875,27 +1864,34 @@ export function createApp(options: AppOptions = {}) {
           );
         }
         const operationId = crypto.randomUUID();
+        const stagedObjectKey = artifactPath(
+          "operations",
+          operationId,
+          "draft.docx"
+        );
+        const metadata: OperationMetadata = {
+          action: "save-draft",
+          data,
+          finalObjectKey: artifactPath(
+            "responses",
+            response.id,
+            `draft-${operationId}.docx`
+          ),
+          formId: form.id,
+          publicId: form.publicId,
+          responseId: response.id,
+          stagedObjectKey,
+        };
         const operation = await createOperation({
+          actorId: identity.id,
           documentKey,
           formId: form.id,
-          metadata: {
-            action: "save-draft",
-            data,
-            finalDocxPath: artifactPath(
-              "responses",
-              response.id,
-              `draft-${operationId}.docx`
-            ),
-            formId: form.id,
-            publicId: form.publicId,
-            responseId: response.id,
-            stagedDocxPath: artifactPath(
-              "operations",
-              operationId,
-              "draft.docx"
-            ),
-          },
+          metadata,
+          ownerUserId: identity.id,
           responseId: response.id,
+          stagingObjectKey: stagedObjectKey,
+          targetId: response.id,
+          targetType: OperationTargetType.response,
           type: operationTypeForAction["save-draft"],
         });
         set.status = 202;
@@ -1913,7 +1909,6 @@ export function createApp(options: AppOptions = {}) {
         const identity = await requireIdentity(request);
         const form = await findFormByPublicId(params.publicId);
         const input = asRecord(body);
-        const inputData = input.data;
         const responseId = requiredString(input, "responseId");
         const documentKey = requiredString(input, "documentKey");
         const response = await findOwnedResponse(
@@ -1922,13 +1917,13 @@ export function createApp(options: AppOptions = {}) {
           identity.id
         );
         if (
-          response.status !== "draft" ||
+          response.status !== ResponseStatus.draft ||
           response.draftDocumentKey !== documentKey ||
           response.publishedVersion !== form.version
         ) {
           fail(409, "stale_response", "The response is no longer editable");
         }
-        const data = await normalizeResponseData(form, response, inputData);
+        const data = await normalizeResponseData(form, response, input.data);
         if (await activeOperationForResponse(response.id)) {
           fail(
             409,
@@ -1938,61 +1933,63 @@ export function createApp(options: AppOptions = {}) {
         }
         const operationId = crypto.randomUUID();
         const submissionId = crypto.randomUUID();
+        const submissionDocumentKey = `submission-${submissionId}-${crypto.randomUUID()}`;
+        const stagedObjectKey = artifactPath(
+          "operations",
+          operationId,
+          "submission.docx"
+        );
         const metadata: OperationMetadata = {
           action: "submit",
           data,
-          finalDataPath: artifactPath("submissions", submissionId, "data.json"),
-          finalDocxPath: artifactPath(
+          finalObjectKey: artifactPath(
             "submissions",
             submissionId,
             "filled.docx"
           ),
-          finalPdfPath: artifactPath("submissions", submissionId, "filled.pdf"),
           formId: form.id,
           publicId: form.publicId,
           responseId: response.id,
-          stagedDocxPath: artifactPath(
-            "operations",
-            operationId,
-            "submission.docx"
-          ),
+          stagedObjectKey,
+          submissionDocumentKey,
           submissionId,
         };
-        const operation = await db.transaction(async (tx) => {
-          const claimed = await tx
-            .update(responses)
-            .set({ status: "submitting", updatedAt: new Date() })
-            .where(
-              and(eq(responses.id, response.id), eq(responses.status, "draft"))
-            )
-            .returning();
-          if (!claimed[0]) {
-            fail(
-              409,
-              "operation_in_progress",
-              "Another response operation is already in progress"
-            );
-          }
-          const rows = await tx
-            .insert(operations)
-            .values({
-              documentKey,
-              formId: form.id,
-              metadata,
-              responseId: response.id,
-              status: "pending",
-              type: operationTypeForAction.submit,
-            })
-            .returning();
-          return rows[0];
-        });
-        if (!operation) {
-          fail(
-            500,
-            "operation_failed",
-            "Unable to create submission operation"
-          );
-        }
+        const operation = await prisma.$transaction(
+          async (tx) => {
+            const claimed = await tx.response.updateMany({
+              data: {
+                status: ResponseStatus.submitting,
+                updatedAt: new Date(),
+              },
+              where: { id: response.id, status: ResponseStatus.draft },
+            });
+            if (claimed.count !== 1) {
+              fail(
+                409,
+                "operation_in_progress",
+                "Another response operation is already in progress"
+              );
+            }
+            return tx.operation.create({
+              data: {
+                actorId: identity.id,
+                documentKey,
+                errorCode: null,
+                formId: form.id,
+                metadata: jsonValue(metadata),
+                ownerUserId: identity.id,
+                responseId: response.id,
+                stagingObjectKey: stagedObjectKey,
+                status: OperationStatus.pending,
+                submissionId: null,
+                targetId: response.id,
+                targetType: OperationTargetType.response,
+                type: operationTypeForAction.submit,
+              },
+            });
+          },
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+        );
         set.status = 202;
         launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
         return {
@@ -2006,12 +2003,9 @@ export function createApp(options: AppOptions = {}) {
     .get("/api/operations/:id", async ({ request, params }) => {
       const identity = await requireIdentity(request);
       validateId(params.id, "Operation");
-      const rows = await db
-        .select()
-        .from(operations)
-        .where(eq(operations.id, params.id))
-        .limit(1);
-      let operation = rows[0];
+      let operation = await prisma.operation.findUnique({
+        where: { id: params.id },
+      });
       if (!operation) {
         fail(404, "not_found", "Operation was not found");
       }
@@ -2020,27 +2014,25 @@ export function createApp(options: AppOptions = {}) {
         if (!operation.responseId) {
           fail(403, "forbidden", "You may not access this operation");
         }
-        const responseRows = await db
-          .select({ userId: responses.userId })
-          .from(responses)
-          .where(eq(responses.id, operation.responseId))
-          .limit(1);
-        if (responseRows[0]?.userId !== identity.id) {
+        const response = await prisma.response.findUnique({
+          select: { userId: true },
+          where: { id: operation.responseId },
+        });
+        if (response?.userId !== identity.id) {
           fail(403, "forbidden", "You may not access this operation");
         }
       }
-      const completedMetadata =
-        operation.status === "completed"
-          ? operationMetadata(operation.metadata)
-          : undefined;
       return {
         operation: {
           createdAt: operation.createdAt,
-          error: operation.error,
+          error: operation.errorCode,
           formId: operation.formId,
           id: operation.id,
           responseId: operation.responseId,
-          result: completedMetadata?.result,
+          result:
+            operation.status === OperationStatus.completed
+              ? operation.result
+              : undefined,
           status: operation.status,
           submissionId: operation.submissionId,
           type: operation.type,
@@ -2051,72 +2043,56 @@ export function createApp(options: AppOptions = {}) {
     .get("/api/submissions/:id/data", async ({ request, params }) => {
       const identity = await requireIdentity(request);
       validateId(params.id, "Submission");
-      const rows = await db
-        .select({
-          formTitle: forms.title,
-          submission: submissions,
-          userEmail: user.email,
-        })
-        .from(submissions)
-        .innerJoin(forms, eq(submissions.formId, forms.id))
-        .innerJoin(user, eq(submissions.userId, user.id))
-        .where(eq(submissions.id, params.id))
-        .limit(1);
-      const row = rows[0];
-      const submission = row?.submission;
+      const submission = await prisma.submission.findUnique({
+        include: { form: true, owner: true },
+        where: { id: params.id },
+      });
       if (!submission) {
         fail(404, "not_found", "Submission was not found");
       }
-      await canReadSubmission(identity, submission);
-      const data =
-        submission.data ??
-        (submission.dataPath
-          ? await readArtifactJson<JsonRecord>(submission.dataPath)
-          : {});
+      canReadSubmission(identity, submission);
       return {
-        data,
+        data: jsonRecord(submission.data),
         submission: submissionSummary(submission, {
-          formTitle: row.formTitle,
-          userEmail: row.userEmail,
+          formTitle: submission.form.title,
+          userEmail: submission.owner.email,
         }),
       };
     })
     .get("/api/submissions/:id/docx", async ({ request, params, set }) => {
       const identity = await requireIdentity(request);
       validateId(params.id, "Submission");
-      const rows = await db
-        .select()
-        .from(submissions)
-        .where(eq(submissions.id, params.id))
-        .limit(1);
-      const submission = rows[0];
+      const submission = await prisma.submission.findUnique({
+        where: { id: params.id },
+      });
       if (!submission) {
         fail(404, "not_found", "Submission was not found");
       }
-      await canReadSubmission(identity, submission);
+      canReadSubmission(identity, submission);
+      if (!(await artifactExists(submission.objectKey))) {
+        fail(404, "not_found", "Submission document was not found");
+      }
       set.headers["Content-Type"] =
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
       set.headers["Content-Disposition"] =
         `attachment; filename="submission-${submission.id}.docx"`;
-      return Bun.file(resolveArtifactPath(submission.docxPath));
+      return Bun.file(resolveArtifactPath(submission.objectKey));
     })
     .get("/api/submissions/:id/pdf", async ({ request, params, set }) => {
       const identity = await requireIdentity(request);
       validateId(params.id, "Submission");
-      const rows = await db
-        .select()
-        .from(submissions)
-        .where(eq(submissions.id, params.id))
-        .limit(1);
-      const submission = rows[0];
+      const submission = await prisma.submission.findUnique({
+        where: { id: params.id },
+      });
       if (!submission) {
         fail(404, "not_found", "Submission was not found");
       }
-      await canReadSubmission(identity, submission);
+      canReadSubmission(identity, submission);
+      const pdf = await onlyOffice.convertDocxToPdf(submission.documentKey);
       set.headers["Content-Type"] = "application/pdf";
       set.headers["Content-Disposition"] =
         `attachment; filename="submission-${submission.id}.pdf"`;
-      return Bun.file(resolveArtifactPath(submission.pdfPath));
+      return pdf;
     })
     .get("/onlyoffice/document/:key", async ({ params, query, set }) => {
       const { key } = params;
@@ -2128,13 +2104,13 @@ export function createApp(options: AppOptions = {}) {
           "Document access token is invalid or expired"
         );
       }
-      const relativePath = await operationDocumentPath(key);
-      if (!relativePath || !(await artifactExists(relativePath))) {
+      const objectKey = await operationDocumentPath(key);
+      if (!objectKey || !(await artifactExists(objectKey))) {
         fail(404, "not_found", "Document was not found");
       }
       set.headers["Content-Type"] =
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-      return Bun.file(resolveArtifactPath(relativePath));
+      return Bun.file(resolveArtifactPath(objectKey));
     })
     .get("/onlyoffice-plugin/config.json", ({ request, set }) => {
       const origin = request.headers.get("origin");
@@ -2183,16 +2159,13 @@ export function createApp(options: AppOptions = {}) {
         typeof payload.status === "number"
           ? payload.status
           : Number(payload.status);
-      const rows = await db
-        .select()
-        .from(operations)
-        .where(eq(operations.id, operationId))
-        .limit(1);
-      const operation = rows[0];
+      const operation = await prisma.operation.findUnique({
+        where: { id: operationId },
+      });
       if (
         !operation ||
-        operation.status === "completed" ||
-        operation.status === "failed"
+        operation.status === OperationStatus.completed ||
+        operation.status === OperationStatus.failed
       ) {
         return { error: 0 };
       }
@@ -2225,7 +2198,6 @@ export function createApp(options: AppOptions = {}) {
           operationId,
           payload,
           undefined,
-          onlyOffice,
           allowedCallbackOrigins
         );
         return { error: 0 };

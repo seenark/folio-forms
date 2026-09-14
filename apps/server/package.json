@@ -6,8 +6,7 @@
     "build": "tsdown",
     "check-types": "tsc -b",
     "compile": "bun build --compile --minify --sourcemap --bytecode ./src/index.ts --outfile server",
-    "db:migrate": "bun run ../../packages/db/src/migrate-cli.ts",
-    "db:seed": "bun run src/seed.ts",
+    "db:migrate": "bun run --cwd ../../packages/db db:migrate",
     "dev": "bun run --hot src/index.ts",
     "start": "bun run dist/index.mjs",
     "test:http": "test -n \"$DATABASE_URL\" || (echo 'DATABASE_URL must point to an isolated PostgreSQL database' >&2; exit 1); bun test test/http.test.ts"
@@ -20,7 +19,6 @@
     "@sinclair/typebox": "^0.34.52",
     "better-auth": "catalog:",
     "dotenv": "catalog:",
-    "drizzle-orm": "^0.45.2",
     "elysia": "^1.4.29",
     "fflate": "^0.8.3",
     "zod": "catalog:"

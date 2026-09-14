@@ -133,14 +133,6 @@ const LoginRoute = () => {
               <ArrowRight size={16} />
             </Button>
           </form>
-          <div className="mt-7 border-t border-[var(--line)] pt-5">
-            <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[var(--ink-soft)]">
-              Seeded demo accounts
-            </p>
-            <p className="mt-2 text-sm text-[var(--ink-soft)]">
-              admin@example.com · user-a@example.com · user-b@example.com
-            </p>
-          </div>
         </Card>
         <p className="mt-5 text-center text-xs text-[#b8c5c5]">
           Local workspace · Sessions use opaque bearer tokens

@@ -1,18 +1,17 @@
 # Database setup
 
-The backend uses PostgreSQL and checked-in Drizzle migrations.
+PostgreSQL state is managed only by Prisma. The checked-in initial migration creates the complete accepted MMVP schema on an empty database; prototype data is intentionally not migrated.
 
 ```sh
 cp apps/server/.env.example apps/server/.env
-bun run --cwd apps/server db:migrate
-bun run --cwd apps/server db:seed
+bun install
+bun run --cwd packages/db db:generate
+bun run --cwd packages/db db:migrate
 bun run dev
 ```
 
-`apps/server db:seed` creates the Better Auth demo accounts and PostgreSQL-backed prefill profiles idempotently:
+`db:migrate` runs `prisma migrate deploy` and is the production startup command. Use `bun run --cwd packages/db db:migrate:dev -- --name <change>` only when authoring a new checked-in migration.
 
-- `admin@example.com` / `AdminPassword123!`
-- `user-a@example.com` / `UserAPassword123!`
-- `user-b@example.com` / `UserBPassword123!`
+There is no database seed or demo account. The application creates the first Admin from one-time bootstrap configuration only when no Admin exists; authenticated Admins provision later accounts.
 
-For the complete local stack, run `docker compose -f compose.yaml up --build`; its server service applies migrations and runs the same idempotent seed before starting on port 3000. Keep `STORAGE_ROOT` on a persistent private volume or directory; database rows store only relative artifact paths.
+The Prisma baseline includes Better Auth Sessions and Accounts; Forms with Template Draft field rules and immutable Published Templates/Field Manifests; one Response per User/Form with a stable external-reference digest; repeatable one-time Handoffs and immutable Prefill snapshots; append-only Corrections; Operations and Editor Leases; Audit Events, Login Failures, and Deletion Tombstones. Canonical document columns are opaque object keys; generated PDFs are not durable database state.

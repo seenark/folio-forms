@@ -1,6 +1,6 @@
 # Folio Forms
 
-Local prototype for designing, publishing, and completing DOCX forms with ONLYOFFICE Docs.
+Production-oriented MMVP for designing, publishing, and completing DOCX forms with ONLYOFFICE Docs.
 
 The application provides:
 
@@ -9,17 +9,16 @@ The application provides:
 - Authenticated user form completion.
 - User-specific prefill with locked and editable field policies.
 - Explicit draft save and resume.
-- Immutable submissions with extracted JSON, filled DOCX, and PDF artifacts.
+- Immutable submissions with extracted JSON, canonical filled DOCX, and on-demand PDF exports.
 - Admin submission review and authorized downloads.
 
-This repository is a local prototype, not a production deployment.
+The accepted deployment target is one private single-host Docker Compose stack.
 
 ## Contents
 
 - [Stack and ports](#stack-and-ports)
 - [Quick start](#quick-start)
-- [Demo accounts](#demo-accounts)
-- [Open the prototype](#open-the-prototype)
+- [Open the application](#open-the-application)
 - [Run modes](#run-modes)
 - [Roles and workflow](#roles-and-workflow)
 - [DOCX template requirements](#docx-template-requirements)
@@ -40,7 +39,7 @@ This repository is a local prototype, not a production deployment.
 | API | Bun, Elysia, TypeScript | `http://localhost:3000` |
 | Document editor | ONLYOFFICE Docs Community Edition 9.4.0.1 | `http://localhost:8080` |
 | Database | PostgreSQL 18 | `localhost:5432` |
-| ORM and migrations | Drizzle ORM | `packages/db` |
+| ORM and migrations | Prisma | `packages/db` |
 | Authentication | Better Auth bearer sessions | API under `/api/auth/*` |
 
 ## Quick start
@@ -69,19 +68,14 @@ The host-mode environment stores artifacts in the repository-level `onlyoffice-s
 docker compose -f compose.yaml up -d postgres onlyoffice
 ```
 
-### 4. Apply migrations and seed demo data
+### 4. Apply the checked-in Prisma migration
 
 ```bash
+bun run --cwd packages/db db:generate
 bun run --cwd apps/server db:migrate
-bun run --cwd apps/server db:seed
 ```
 
-The seed is idempotent. It creates or updates:
-
-- Three demo users.
-- One `demo` prefill profile per user.
-- The published `demo-employee-intake` form.
-- The tracked DOCX template and published artifact when the demo form exists but its artifacts are missing.
+The initial migration creates the accepted MMVP schema on an empty PostgreSQL database. Prototype data and demo accounts are intentionally not migrated or seeded.
 
 ### 5. Start the web app and host API
 
@@ -93,19 +87,7 @@ This runs the API and web app through Turborepo. Open `http://localhost:5173`.
 
 Do not run the Compose `server` service at the same time as the host API; both use port `3000`.
 
-## Demo accounts
-
-There is no registration UI. Use one of the seeded accounts:
-
-| Role | Email | Password | Demo prefill |
-| --- | --- | --- | --- |
-| Admin | `admin@example.com` | `AdminPassword123!` | `Demo Admin`, `finance`, `2024-01-15` |
-| User | `user-a@example.com` | `UserAPassword123!` | `User A`, `hr`, `2024-02-01` |
-| User | `user-b@example.com` | `UserBPassword123!` | `User B`, `engineering`, `2024-03-01` |
-
-For the seeded profiles, `full_name` and `department` are locked and `start_date` is editable. Server-side validation also restores locked prefill values if a client attempts to submit altered values.
-
-## Open the prototype
+## Open the application
 
 Main application:
 
@@ -113,13 +95,7 @@ Main application:
 http://localhost:5173
 ```
 
-Seeded share link:
-
-```text
-http://localhost:5173/forms/demo-employee-intake/fill
-```
-
-The share link is publicly reachable, but opening the editor requires login. Unauthenticated users are redirected to `/login` with a `returnTo` value.
+Create and publish a Form from the Admin interface, then use its generated opaque share link. No seeded Form or fixed share ID exists.
 
 Main screens:
 
@@ -142,7 +118,6 @@ PostgreSQL and ONLYOFFICE run in Docker. The API and web app run under Bun:
 ```bash
 docker compose -f compose.yaml up -d postgres onlyoffice
 bun run --cwd apps/server db:migrate
-bun run --cwd apps/server db:seed
 bun run dev
 ```
 
@@ -157,10 +132,9 @@ bun run --cwd apps/web dev
 
 The Compose server:
 
-1. Applies checked-in Drizzle migrations.
-2. Runs the idempotent application seed.
-3. Starts the compiled API on port `3000`.
-4. Mounts `./onlyoffice-submissions` at `/app/onlyoffice-submissions`.
+1. Applies checked-in Prisma migrations with `prisma migrate deploy`.
+2. Starts the compiled API on port `3000`.
+3. Mounts `./onlyoffice-submissions` at `/app/onlyoffice-submissions`.
 
 Check service state with:
 
@@ -208,26 +182,13 @@ The admin editor also warns before publishing when saved drafts will be invalida
 
 The prefill is snapshotted when the response starts. Resuming a draft does not refresh the profile. Starting again after publication invalidates an old draft and creates a new snapshot for the new published version.
 
-Submission is complete only after all three artifacts are persisted:
-
-- Extracted field JSON.
-- Filled DOCX.
-- Converted PDF.
+Submission is complete only after the extracted field JSON and canonical filled DOCX are persisted. PDF is an on-demand export and is not durable submission state.
 
 ## DOCX template requirements
 
 Fields are ONLYOFFICE content controls. Their tags are the stable field keys used in JSON and prefill data.
 
-The seeded template contains:
-
-| Tag             | Control purpose |
-| --------------- | --------------- |
-| `full_name`     | Text            |
-| `department`    | Dropdown        |
-| `start_date`    | Date            |
-| `accept_terms`  | Checkbox        |
-| `description_1` | Multiline text  |
-| `description_2` | Multiline text  |
+Each Form defines its own unique, non-empty tags. Supported controls include text, checkbox, date, dropdown, combo box, and picture fields.
 
 The plugin extracts:
 
@@ -242,24 +203,21 @@ The plugin applies prefill through ONLYOFFICE's command API, then restricts resp
 
 ### PostgreSQL tables
 
-`packages/db/src/schema.ts` defines:
+`packages/db/prisma/schema.prisma` defines:
 
-- Better Auth tables: `user`, `session`, `account`, `verification`.
-- `forms`: title, share ID, template/published document keys and paths, status, version.
-- `prefill_profiles`: reusable per-user values and editability policy.
-- `prefill_snapshots`: immutable response-start values and policy.
-- `responses`: one response per user/form, draft state, published version, document key/path.
-- `submissions`: immutable JSON, DOCX path, PDF path, response/user/form ownership.
-- `operations`: asynchronous save, publish, draft, and submit state.
+- Better Auth `User`, `Session`, `Account`, and `Verification` models.
+- Forms, Template Drafts, immutable Published Templates, Field Manifests, and Prefill Configuration.
+- One Response per User/Form, immutable Submissions, Prefill snapshots, and append-only Corrections.
+- Handoffs, pending claims, Operations, callback claims, and Editor Leases.
+- immutable Audit Events, login-failure windows, and Deletion Tombstones.
 
 Database constraints enforce:
 
-- Unique form public IDs.
-- One response per user/form.
-- One submission per response.
-- Valid form/response/operation statuses.
-- Paired artifact keys and paths.
-- One active operation per form or response scope.
+- Normalized unique account email and opaque Form public IDs.
+- One Response per User/Form and one Submission per Response.
+- Immutable published contracts and monotonic Correction revisions.
+- One active Operation and one Editor Lease per target.
+- Accepted lifecycle, ownership, document-reference, and expiry invariants.
 
 ### Artifact layout
 
@@ -270,8 +228,6 @@ forms/<formId>/template-draft.docx
 forms/<formId>/published-<version>.docx
 responses/<responseId>/draft-<operationId>.docx
 submissions/<submissionId>/filled.docx
-submissions/<submissionId>/filled.pdf
-submissions/<submissionId>/data.json
 ```
 
 The API never statically exposes the storage root. Submission data and downloads require authentication and ownership, except Admin accounts may access all submissions.
@@ -289,7 +245,6 @@ The API never statically exposes the storage root. Submission data and downloads
 - ONLYOFFICE callback userdata uses a server-signed HMAC envelope containing the operation ID.
 - Callback document downloads are restricted to configured ONLYOFFICE origins, disallow redirects, and enforce a response-size limit.
 - Response JSON is restricted to published content-control tags, scalar values, and a bounded payload size.
-- Artifact paths are resolved beneath `STORAGE_ROOT`; traversal and absolute database paths are rejected.
 - Operations expire and roll back submitting responses when they remain active too long.
 
 These protections make the local prototype behaviorally safe for the demo, but the deployment defaults below are not suitable for the public internet.
@@ -377,7 +332,6 @@ apps/
   server/
     src/index.ts           Elysia routes and asynchronous operation orchestration
     src/onlyoffice.ts      ONLYOFFICE URLs, HMAC tokens, force-save, PDF conversion
-    src/seed.ts            Demo accounts, profiles, and demo form/artifact repair
     src/storage.ts         Private artifact path validation and atomic writes
     Dockerfile             Production API image
   web/
@@ -386,7 +340,7 @@ apps/
     src/lib/               API client and auth provider
 packages/
   auth/                    Better Auth configuration and bearer plugin
-  db/                      Drizzle schema, migrations, seed/migration CLIs
+  db/                      Prisma schema, generated client, and checked-in migration
   env/                     Server environment validation
   config/                  Shared TypeScript/project configuration
 onlyoffice-templates/
@@ -407,7 +361,6 @@ Database:
 
 ```bash
 bun run --cwd apps/server db:migrate
-bun run --cwd apps/server db:seed
 bun run --cwd packages/db db:generate
 ```
 
@@ -474,13 +427,6 @@ Confirm that:
 4. The storage directory is writable.
 5. You are not mixing host API and Compose API modes with different storage roots.
 
-For a seeded demo form, rerun:
-
-```bash
-bun run --cwd apps/server db:seed
-```
-
-The demo seed repairs missing demo template artifacts.
 
 ### Form actions are missing
 

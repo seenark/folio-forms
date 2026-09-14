@@ -4,5 +4,5 @@
     "noEmit": true,
     "strictNullChecks": true
   },
-  "include": ["src/**/*.ts", "drizzle.config.ts"]
+  "include": ["src/**/*.ts"]
 }

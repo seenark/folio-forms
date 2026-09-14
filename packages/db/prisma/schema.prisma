@@ -1,0 +1,538 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  admin
+  user
+}
+
+enum FormStatus {
+  draft
+  published
+  archived
+}
+
+enum FieldType {
+  text
+  checkbox
+  date
+  dropdown
+  combo
+  picture
+}
+
+enum PrefillPolicy {
+  editable
+  lock_when_available
+}
+
+enum ResponseStatus {
+  draft
+  submitting
+  submitted
+}
+
+enum OperationType {
+  save_template_draft
+  publish_form
+  save_draft
+  submit_response
+  save_correction
+}
+
+enum OperationStatus {
+  pending
+  processing
+  completed
+  failed
+}
+
+enum OperationTargetType {
+  template_draft
+  response
+  correction
+}
+
+enum HandoffStatus {
+  pending
+  reserved
+  consumed
+  expired
+  deleted
+}
+
+enum AuditOutcome {
+  success
+  failure
+}
+
+model User {
+  id                 String   @id
+  name               String
+  email              String   @unique
+  emailVerified      Boolean  @default(false) @map("email_verified")
+  image              String?
+  role               UserRole @default(user)
+  enabled            Boolean  @default(true)
+  mustChangePassword Boolean  @default(false) @map("must_change_password")
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  sessions          Session[]
+  accounts          Account[]
+  formsCreated      Form[]            @relation("FormCreator")
+  responses         Response[]        @relation("ResponseOwner")
+  submissions       Submission[]      @relation("SubmissionOwner")
+  prefillSnapshots  PrefillSnapshot[] @relation("PrefillOwner")
+  operationsAsActor Operation[]       @relation("OperationActor")
+  operationsAsOwner Operation[]       @relation("OperationOwner")
+  editorLeases      EditorLease[]     @relation("LeaseHolder")
+
+  @@index([role, enabled])
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(3)
+  token     String   @unique
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  ipAddress String?  @map("ip_address")
+  userAgent String?  @map("user_agent")
+  userId    String   @map("user_id")
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  editorLeases EditorLease[]
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String    @map("account_id")
+  providerId            String    @map("provider_id")
+  userId                String    @map("user_id")
+  accessToken           String?   @map("access_token")
+  refreshToken          String?   @map("refresh_token")
+  idToken               String?   @map("id_token")
+  accessTokenExpiresAt  DateTime? @map("access_token_expires_at") @db.Timestamptz(3)
+  refreshTokenExpiresAt DateTime? @map("refresh_token_expires_at") @db.Timestamptz(3)
+  scope                 String?
+  password              String?
+  issuer                String    @default("local:credential")
+  createdAt             DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, accountId])
+  @@index([userId])
+  @@index([issuer])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime @map("expires_at") @db.Timestamptz(3)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([identifier])
+  @@index([expiresAt])
+  @@map("verification")
+}
+
+model Form {
+  id          String     @id @default(uuid()) @db.Uuid
+  title       String
+  description String?
+  publicId    String     @unique @map("public_id")
+  status      FormStatus @default(draft)
+  version     Int        @default(0)
+  createdBy   String?    @map("created_by")
+  createdAt   DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  creator              User?                 @relation("FormCreator", fields: [createdBy], references: [id], onDelete: SetNull)
+  templateDraft        TemplateDraft?
+  publishedTemplate    PublishedTemplate?
+  prefillConfiguration PrefillConfiguration?
+  responses            Response[]
+  submissions          Submission[]
+  handoffs             Handoff[]
+  operations           Operation[]
+  prefillSnapshots     PrefillSnapshot[]
+
+  @@index([createdBy])
+  @@index([status, updatedAt])
+  @@map("forms")
+}
+
+model TemplateDraft {
+  id          String   @id @default(uuid()) @db.Uuid
+  formId      String   @unique @map("form_id") @db.Uuid
+  objectKey   String   @map("object_key")
+  documentKey String   @unique @map("document_key")
+  contentHash String?  @map("content_hash")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  form       Form             @relation(fields: [formId], references: [id], onDelete: Cascade)
+  fieldRules DraftFieldRule[]
+
+  @@map("template_drafts")
+}
+
+model DraftFieldRule {
+  id              String        @id @default(uuid()) @db.Uuid
+  templateDraftId String        @map("template_draft_id") @db.Uuid
+  tag             String
+  required        Boolean       @default(false)
+  prefillPointer  String?       @map("prefill_pointer")
+  prefillPolicy   PrefillPolicy @default(editable) @map("prefill_policy")
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  templateDraft TemplateDraft @relation(fields: [templateDraftId], references: [id], onDelete: Cascade)
+
+  @@unique([templateDraftId, tag])
+  @@unique([templateDraftId, prefillPointer])
+  @@map("draft_field_rules")
+}
+
+model PublishedTemplate {
+  id          String   @id @default(uuid()) @db.Uuid
+  formId      String   @unique @map("form_id") @db.Uuid
+  version     Int
+  objectKey   String   @map("object_key")
+  documentKey String   @unique @map("document_key")
+  contentHash String   @map("content_hash")
+  publishedAt DateTime @default(now()) @map("published_at") @db.Timestamptz(3)
+
+  form                 Form                  @relation(fields: [formId], references: [id], onDelete: Restrict)
+  manifest             FieldManifest?
+  prefillConfiguration PrefillConfiguration?
+  responses            Response[]
+
+  @@unique([formId, version])
+  @@map("published_templates")
+}
+
+model FieldManifest {
+  id                  String   @id @default(uuid()) @db.Uuid
+  publishedTemplateId String   @unique @map("published_template_id") @db.Uuid
+  configurationHash   String   @map("configuration_hash")
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  publishedTemplate PublishedTemplate @relation(fields: [publishedTemplateId], references: [id], onDelete: Restrict)
+  fields            ManifestField[]
+
+  @@map("field_manifests")
+}
+
+model ManifestField {
+  id               String        @id @default(uuid()) @db.Uuid
+  manifestId       String        @map("manifest_id") @db.Uuid
+  tag              String
+  type             FieldType
+  required         Boolean       @default(false)
+  prefillPolicy    PrefillPolicy @default(editable) @map("prefill_policy")
+  options          Json?
+  pictureMaxBytes  Int?          @map("picture_max_bytes")
+  pictureMaxWidth  Int?          @map("picture_max_width")
+  pictureMaxHeight Int?          @map("picture_max_height")
+
+  manifest FieldManifest @relation(fields: [manifestId], references: [id], onDelete: Restrict)
+
+  @@unique([manifestId, tag])
+  @@index([manifestId])
+  @@map("manifest_fields")
+}
+
+model PrefillConfiguration {
+  id                  String   @id @default(uuid()) @db.Uuid
+  formId              String   @unique @map("form_id") @db.Uuid
+  publishedTemplateId String?  @unique @map("published_template_id") @db.Uuid
+  configurationHash   String   @map("configuration_hash")
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  form              Form               @relation(fields: [formId], references: [id], onDelete: Cascade)
+  publishedTemplate PublishedTemplate? @relation(fields: [publishedTemplateId], references: [id], onDelete: Restrict)
+  fields            PrefillField[]
+
+  @@map("prefill_configurations")
+}
+
+model PrefillField {
+  id              String        @id @default(uuid()) @db.Uuid
+  configurationId String        @map("configuration_id") @db.Uuid
+  tag             String
+  pointer         String
+  policy          PrefillPolicy @default(editable)
+
+  configuration PrefillConfiguration @relation(fields: [configurationId], references: [id], onDelete: Cascade)
+
+  @@unique([configurationId, tag])
+  @@unique([configurationId, pointer])
+  @@index([configurationId])
+  @@map("prefill_fields")
+}
+
+model Response {
+  id                      String         @id @default(uuid()) @db.Uuid
+  formId                  String         @map("form_id") @db.Uuid
+  userId                  String         @map("user_id")
+  publishedTemplateId     String         @map("published_template_id") @db.Uuid
+  publishedVersion        Int            @map("published_version")
+  status                  ResponseStatus @default(draft)
+  draftData               Json?          @map("draft_data")
+  draftObjectKey          String?        @map("draft_object_key")
+  draftDocumentKey        String?        @unique @map("draft_document_key")
+  externalReferenceDigest String?        @unique @map("external_reference_digest")
+  createdAt               DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  form              Form              @relation(fields: [formId], references: [id], onDelete: Restrict)
+  owner             User              @relation("ResponseOwner", fields: [userId], references: [id], onDelete: Restrict)
+  publishedTemplate PublishedTemplate @relation(fields: [publishedTemplateId], references: [id], onDelete: Restrict)
+  prefillSnapshot   PrefillSnapshot?
+  submission        Submission?
+  corrections       Correction[]
+  handoffs          Handoff[]
+  operations        Operation[]
+
+  @@unique([formId, userId])
+  @@index([formId, status, updatedAt])
+  @@index([userId, updatedAt])
+  @@map("responses")
+}
+
+model PrefillSnapshot {
+  id           String   @id @default(uuid()) @db.Uuid
+  responseId   String   @unique @map("response_id") @db.Uuid
+  formId       String   @map("form_id") @db.Uuid
+  userId       String   @map("user_id")
+  values       Json
+  lockedFields Json     @map("locked_fields")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  response Response @relation(fields: [responseId], references: [id], onDelete: Cascade)
+  form     Form     @relation(fields: [formId], references: [id], onDelete: Restrict)
+  owner    User     @relation("PrefillOwner", fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([formId, userId])
+  @@map("prefill_snapshots")
+}
+
+model Submission {
+  id          String   @id @default(uuid()) @db.Uuid
+  responseId  String   @unique @map("response_id") @db.Uuid
+  formId      String   @map("form_id") @db.Uuid
+  userId      String   @map("user_id")
+  data        Json
+  objectKey   String   @map("object_key")
+  documentKey String   @unique @map("document_key")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  response    Response     @relation(fields: [responseId], references: [id], onDelete: Restrict)
+  form        Form         @relation(fields: [formId], references: [id], onDelete: Restrict)
+  owner       User         @relation("SubmissionOwner", fields: [userId], references: [id], onDelete: Restrict)
+  corrections Correction[]
+  operations  Operation[]
+
+  @@index([formId, createdAt])
+  @@index([userId, createdAt])
+  @@map("submissions")
+}
+
+model Correction {
+  id           String   @id @default(uuid()) @db.Uuid
+  responseId   String   @map("response_id") @db.Uuid
+  submissionId String   @map("submission_id") @db.Uuid
+  revision     Int
+  actorId      String   @map("actor_id")
+  reason       String
+  changedData  Json     @map("changed_data")
+  data         Json
+  objectKey    String   @map("object_key")
+  documentKey  String   @unique @map("document_key")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  response   Response    @relation(fields: [responseId], references: [id], onDelete: Restrict)
+  submission Submission  @relation(fields: [submissionId], references: [id], onDelete: Restrict)
+  operations Operation[]
+
+  @@unique([responseId, revision])
+  @@index([submissionId, revision])
+  @@index([actorId, createdAt])
+  @@map("corrections")
+}
+
+model Handoff {
+  id                      String        @id @default(uuid()) @db.Uuid
+  formId                  String        @map("form_id") @db.Uuid
+  responseId              String?       @map("response_id") @db.Uuid
+  normalizedEmail         String?       @map("normalized_email")
+  externalReferenceDigest String        @map("external_reference_digest")
+  codeDigest              String?       @unique @map("code_digest")
+  filteredValues          Json?         @map("filtered_values")
+  configurationHash       String        @map("configuration_hash")
+  status                  HandoffStatus @default(pending)
+  expiresAt               DateTime      @map("expires_at") @db.Timestamptz(3)
+  reservedAt              DateTime?     @map("reserved_at") @db.Timestamptz(3)
+  consumedAt              DateTime?     @map("consumed_at") @db.Timestamptz(3)
+  createdAt               DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  form         Form          @relation(fields: [formId], references: [id], onDelete: Restrict)
+  response     Response?     @relation(fields: [responseId], references: [id], onDelete: SetNull)
+  pendingClaim PendingClaim?
+
+  @@index([formId, status, expiresAt])
+  @@index([responseId])
+  @@index([externalReferenceDigest, createdAt])
+  @@index([status, expiresAt])
+  @@map("handoffs")
+}
+
+model PendingClaim {
+  id          String    @id @default(uuid()) @db.Uuid
+  handoffId   String    @unique @map("handoff_id") @db.Uuid
+  claimDigest String    @unique @map("claim_digest")
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(3)
+  consumedAt  DateTime? @map("consumed_at") @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  handoff Handoff @relation(fields: [handoffId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("pending_claims")
+}
+
+model Operation {
+  id               String              @id @default(uuid()) @db.Uuid
+  type             OperationType
+  status           OperationStatus     @default(pending)
+  targetType       OperationTargetType @map("target_type")
+  targetId         String              @map("target_id") @db.Uuid
+  formId           String              @map("form_id") @db.Uuid
+  responseId       String?             @map("response_id") @db.Uuid
+  submissionId     String?             @map("submission_id") @db.Uuid
+  correctionId     String?             @map("correction_id") @db.Uuid
+  actorId          String?             @map("actor_id")
+  ownerUserId      String?             @map("owner_user_id")
+  documentKey      String?             @map("document_key")
+  stagingObjectKey String?             @map("staging_object_key")
+  metadata         Json
+  result           Json?
+  errorCode        String?             @map("error_code")
+  createdAt        DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime            @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  form          Form           @relation(fields: [formId], references: [id], onDelete: Restrict)
+  response      Response?      @relation(fields: [responseId], references: [id], onDelete: SetNull)
+  submission    Submission?    @relation(fields: [submissionId], references: [id], onDelete: SetNull)
+  correction    Correction?    @relation(fields: [correctionId], references: [id], onDelete: SetNull)
+  actor         User?          @relation("OperationActor", fields: [actorId], references: [id], onDelete: SetNull)
+  owner         User?          @relation("OperationOwner", fields: [ownerUserId], references: [id], onDelete: SetNull)
+  callbackClaim CallbackClaim?
+
+  @@index([targetType, targetId, status])
+  @@index([formId, createdAt])
+  @@index([responseId, createdAt])
+  @@index([submissionId])
+  @@index([correctionId])
+  @@index([documentKey])
+  @@map("operations")
+}
+
+model CallbackClaim {
+  id          String    @id @default(uuid()) @db.Uuid
+  operationId String    @unique @map("operation_id") @db.Uuid
+  tokenDigest String    @unique @map("token_digest")
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(3)
+  consumedAt  DateTime? @map("consumed_at") @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  operation Operation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("callback_claims")
+}
+
+model EditorLease {
+  id               String              @id @default(uuid()) @db.Uuid
+  targetType       OperationTargetType @map("target_type")
+  targetId         String              @map("target_id") @db.Uuid
+  holderSessionId  String              @map("holder_session_id")
+  holderUserId     String              @map("holder_user_id")
+  capabilityDigest String              @map("capability_digest")
+  expiresAt        DateTime            @map("expires_at") @db.Timestamptz(3)
+  createdAt        DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  renewedAt        DateTime            @default(now()) @map("renewed_at") @db.Timestamptz(3)
+
+  holderSession Session @relation(fields: [holderSessionId], references: [id], onDelete: Cascade)
+  holder        User    @relation("LeaseHolder", fields: [holderUserId], references: [id], onDelete: Cascade)
+
+  @@unique([targetType, targetId])
+  @@index([expiresAt])
+  @@index([holderSessionId])
+  @@index([holderUserId])
+  @@map("editor_leases")
+}
+
+model AuditEvent {
+  id           String       @id @default(uuid()) @db.Uuid
+  actorId      String?      @map("actor_id")
+  action       String
+  targetType   String       @map("target_type")
+  targetId     String?      @map("target_id")
+  outcome      AuditOutcome
+  safeMetadata Json?        @map("safe_metadata")
+  createdAt    DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([createdAt, id])
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+  @@index([targetType, targetId, createdAt])
+  @@index([outcome, createdAt])
+  @@map("audit_events")
+}
+
+model LoginFailure {
+  id              String   @id @default(uuid()) @db.Uuid
+  emailDigest     String   @map("email_digest")
+  ipDigest        String   @map("ip_digest")
+  attempts        Int      @default(0)
+  windowStartedAt DateTime @map("window_started_at") @db.Timestamptz(3)
+  expiresAt       DateTime @map("expires_at") @db.Timestamptz(3)
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([emailDigest, ipDigest])
+  @@index([expiresAt])
+  @@map("login_failures")
+}
+
+model DeletionTombstone {
+  id                      String       @id @default(uuid()) @db.Uuid
+  responseLookupDigest    String       @unique @map("response_lookup_digest")
+  externalReferenceDigest String?      @unique @map("external_reference_digest")
+  actorId                 String?      @map("actor_id")
+  outcome                 AuditOutcome
+  createdAt               DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([actorId, createdAt])
+  @@map("deletion_tombstones")
+}

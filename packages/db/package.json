@@ -8,38 +8,25 @@
       "types": "./src/index.ts",
       "default": "./src/index.ts"
     },
-    "./schema": {
-      "types": "./src/schema.ts",
-      "default": "./src/schema.ts"
-    },
     "./client": {
       "types": "./src/client.ts",
       "default": "./src/client.ts"
-    },
-    "./migrate": {
-      "types": "./src/migrate.ts",
-      "default": "./src/migrate.ts"
-    },
-    "./seed": {
-      "types": "./src/seed.ts",
-      "default": "./src/seed.ts"
     }
   },
   "scripts": {
-    "check-types": "tsc -b",
-    "db:generate": "drizzle-kit generate --config drizzle.config.ts",
-    "db:migrate": "bun run src/migrate-cli.ts",
-    "db:seed": "bun run src/seed-cli.ts"
+    "check-types": "tsc --noEmit",
+    "db:generate": "prisma generate --schema prisma/schema.prisma",
+    "db:migrate": "prisma migrate deploy --schema prisma/schema.prisma",
+    "db:migrate:dev": "prisma migrate dev --schema prisma/schema.prisma"
   },
   "dependencies": {
-    "dotenv": "catalog:",
-    "drizzle-orm": "^0.45.2",
-    "postgres": "^3.4.7"
+    "@prisma/client": "6.19.0",
+    "dotenv": "catalog:"
   },
   "devDependencies": {
     "@onlyoffice/config": "workspace:*",
     "@types/bun": "catalog:",
-    "drizzle-kit": "^0.31.4",
+    "prisma": "6.19.0",
     "typescript": "catalog:"
   }
 }

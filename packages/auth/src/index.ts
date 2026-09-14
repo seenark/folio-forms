@@ -1,8 +1,8 @@
 // oxlint-disable func-style -- Preserve the auth factory's exported function contract.
-import { drizzleAdapter } from "@better-auth/drizzle-adapter";
-import { db, schema } from "@onlyoffice/db";
+import { prisma } from "@onlyoffice/db";
 import { env } from "@onlyoffice/env/server";
 import { betterAuth } from "better-auth";
+import { prismaAdapter } from "better-auth/adapters/prisma";
 import { bearer } from "better-auth/plugins";
 
 const sessionDurationSeconds = 8 * 60 * 60;
@@ -19,9 +19,9 @@ export function createAuth() {
       },
     },
     baseURL: env.BETTER_AUTH_URL,
-    database: drizzleAdapter(db, {
-      provider: "pg",
-      schema,
+    database: prismaAdapter(prisma, {
+      provider: "postgresql",
+      transaction: true,
     }),
     emailAndPassword: {
       enabled: true,
