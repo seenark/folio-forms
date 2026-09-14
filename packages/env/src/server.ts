@@ -42,6 +42,8 @@ export const env = createEnv({
 
     DATABASE_URL: z.url().default(localDatabaseUrl),
 
+    EDITOR_CAPABILITY_SECRET: z.string().min(32),
+
     NODE_ENV: z
       .enum(["development", "production", "test"])
       .default("development"),
@@ -53,6 +55,8 @@ export const env = createEnv({
       .default("http://host.docker.internal:3000"),
 
     ONLYOFFICE_INTERNAL_URL: z.url().default(localOnlyOfficeUrl),
+
+    ONLYOFFICE_JWT_SECRET: z.string().min(32),
 
     ONLYOFFICE_URL: z.url().default(localOnlyOfficeUrl),
 

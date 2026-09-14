@@ -21,29 +21,33 @@ const API_ROUTES = Object.freeze({
   OPERATIONS: "/api/operations",
 });
 
-const TOKEN_STORAGE_KEYS = [
-  "onlyoffice.sessionToken",
-  "onlyoffice.session-token",
-  "onlyoffice-auth-token",
-  "authToken",
-  "auth-token",
-  "accessToken",
-  "access-token",
-  "bearerToken",
-  "bearer-token",
-  "sessionToken",
-  "session-token",
-  "session_token",
-  "better-auth.session_token",
-  "better-auth.sessionToken",
-];
+const CAPABILITY_ACTIONS = Object.freeze([
+  ACTIONS.SAVE_TEMPLATE,
+  ACTIONS.PUBLISH,
+  ACTIONS.SAVE_DRAFT,
+  ACTIONS.SUBMIT,
+]);
 
+const BRIDGE_MESSAGE_SOURCE = "form-bridge";
+const PARENT_MESSAGE_SOURCE = "folio-parent";
+const BRIDGE_READY_TYPE = "bridge-ready";
+const BRIDGE_ACK_TYPE = "bridge-ack";
+const CAPABILITY_REQUEST_TYPE = "capability-request";
+const CAPABILITY_RESPONSE_TYPE = "capability-response";
+const OPERATION_MESSAGE_TYPE = "operation";
+
+const CAPABILITY_REQUEST_TIMEOUT_MS = 5000;
 const OPERATION_POLL_INTERVAL_MS = 1000;
 const MAX_OPERATION_POLLS = 300;
 const PREFILL_MAX_ATTEMPTS = 120;
 
 let runtimeOptions = {};
 let actionInFlight = false;
+let bridgeAcknowledged = false;
+let bridgeMessageListenerAttached = false;
+let bridgeReadySent = false;
+let capabilityRequestSequence = 0;
+const pendingCapabilityRequests = new Map();
 let initializationPending = false;
 let initializationStarted = false;
 let prefillApplied = false;
@@ -708,91 +712,160 @@ function errorMessage(error) {
 
   return String(error || "Unknown error");
 }
-function notifyParent(action, status, operationId, payload, error) {
-  try {
-    const target = window.top || window.parent;
-    target?.postMessage(
-      {
-        action,
-        error: error || undefined,
-        operation: isRecord(payload?.operation) ? payload.operation : undefined,
-        operationId: operationId || undefined,
-        source: "form-bridge",
-        status,
-        type: "operation",
-      },
-      "*"
+function parentWindow() {
+  const target = window.top;
+  if (!target || typeof target.postMessage !== "function") {
+    throw new Error("The editor parent window is unavailable");
+  }
+  return target;
+}
+
+function postBridgeMessage(message) {
+  const bridgeId = requireOption(runtimeOptions.bridgeId, "bridgeId");
+  const parentOrigin = requireOption(
+    runtimeOptions.parentOrigin,
+    "parentOrigin"
+  );
+  parentWindow().postMessage(
+    {
+      ...message,
+      bridgeId,
+    },
+    parentOrigin
+  );
+}
+function settleCapabilityRequest(requestId, settle, value) {
+  const pending = pendingCapabilityRequests.get(requestId);
+  if (!pending) {
+    return;
+  }
+
+  pendingCapabilityRequests.delete(requestId);
+  window.clearTimeout(pending.timeoutId);
+  settle(value);
+}
+
+function handleCapabilityResponse(message) {
+  if (
+    typeof message.requestId !== "string" ||
+    !message.requestId ||
+    !CAPABILITY_ACTIONS.includes(message.action)
+  ) {
+    return;
+  }
+
+  const pending = pendingCapabilityRequests.get(message.requestId);
+  if (!pending || pending.action !== message.action) {
+    return;
+  }
+
+  const hasCapability = Object.hasOwn(message, "capability");
+  const hasError = Object.hasOwn(message, "error");
+  if (hasCapability === hasError) {
+    return;
+  }
+
+  if (hasCapability) {
+    if (typeof message.capability !== "string" || !message.capability.trim()) {
+      return;
+    }
+
+    settleCapabilityRequest(
+      message.requestId,
+      pending.resolve,
+      message.capability
     );
+    return;
+  }
+
+  if (typeof message.error !== "string" || !message.error.trim()) {
+    return;
+  }
+
+  settleCapabilityRequest(
+    message.requestId,
+    pending.reject,
+    new Error(message.error)
+  );
+}
+
+function handleParentMessage(event) {
+  const message = event?.data;
+  let topWindow;
+
+  try {
+    topWindow = window.top;
+  } catch {
+    return;
+  }
+
+  if (
+    !topWindow ||
+    event?.source !== topWindow ||
+    event.origin !== runtimeOptions.parentOrigin ||
+    !isRecord(message) ||
+    message.source !== PARENT_MESSAGE_SOURCE ||
+    message.bridgeId !== runtimeOptions.bridgeId ||
+    (message.type !== BRIDGE_ACK_TYPE &&
+      message.type !== CAPABILITY_RESPONSE_TYPE)
+  ) {
+    return;
+  }
+
+  if (message.type === BRIDGE_ACK_TYPE) {
+    bridgeAcknowledged = true;
+    return;
+  }
+
+  if (!bridgeAcknowledged) {
+    return;
+  }
+
+  handleCapabilityResponse(message);
+}
+
+function startBridge() {
+  if (!bridgeMessageListenerAttached) {
+    window.addEventListener("message", handleParentMessage);
+    bridgeMessageListenerAttached = true;
+  }
+
+  if (bridgeReadySent) {
+    return;
+  }
+
+  try {
+    postBridgeMessage({
+      source: BRIDGE_MESSAGE_SOURCE,
+      type: BRIDGE_READY_TYPE,
+    });
+    bridgeReadySent = true;
+  } catch (error) {
+    setStatus(
+      `Could not connect to editor host: ${errorMessage(error)}`,
+      "error"
+    );
+  }
+}
+
+function notifyParent(action, status, operationId, payload, error) {
+  if (!bridgeAcknowledged) {
+    return;
+  }
+
+  try {
+    postBridgeMessage({
+      action,
+      error: error || undefined,
+      operation: isRecord(payload?.operation) ? payload.operation : undefined,
+      operationId: operationId || undefined,
+      source: BRIDGE_MESSAGE_SOURCE,
+      status,
+      type: OPERATION_MESSAGE_TYPE,
+    });
   } catch {
     // The editor can run without a host frame.
   }
-}
-
-function parseStoredToken(rawValue) {
-  if (typeof rawValue !== "string") {
-    return;
-  }
-
-  const value = rawValue.trim();
-
-  if (!value) {
-    return;
-  }
-
-  try {
-    const parsed = JSON.parse(value);
-
-    if (typeof parsed === "string" && parsed.trim()) {
-      return parsed.trim();
-    }
-
-    if (isRecord(parsed)) {
-      return firstString(
-        parsed.token,
-        parsed.sessionToken,
-        parsed.accessToken,
-        parsed.value
-      );
-    }
-  } catch {
-    return value;
-  }
-
-  return value;
-}
-
-function readBearerToken() {
-  const runtimeToken = parseStoredToken(runtimeOptions.authToken);
-  if (runtimeToken) {
-    return runtimeToken;
-  }
-
-  let storage;
-
-  try {
-    storage = window.localStorage;
-  } catch {
-    throw new Error("The browser localStorage is unavailable");
-  }
-
-  if (!storage) {
-    throw new Error("The browser localStorage is unavailable");
-  }
-
-  const configuredKey = runtimeOptions.tokenStorageKey;
-  const keys = configuredKey
-    ? [configuredKey, ...TOKEN_STORAGE_KEYS]
-    : TOKEN_STORAGE_KEYS;
-
-  for (const key of [...new Set(keys)]) {
-    const token = parseStoredToken(storage.getItem(key));
-
-    if (token) {
-      return token;
-    }
-  }
-
-  throw new Error("Sign in is required before using this form");
 }
 
 function apiUrl(path) {
@@ -805,9 +878,12 @@ function apiUrl(path) {
   return `${base}${path}`;
 }
 
-async function requestJson(path, init) {
-  const headers = new Headers(init?.headers || {});
-  headers.set("Authorization", `Bearer ${readBearerToken()}`);
+async function requestJson(path, init, capability) {
+  const headers = new Headers();
+  headers.set(
+    "X-Editor-Capability",
+    requireOption(capability, "editor capability")
+  );
 
   if (init?.body !== undefined) {
     headers.set("Content-Type", "application/json");
@@ -815,6 +891,7 @@ async function requestJson(path, init) {
 
   const response = await fetch(apiUrl(path), {
     ...init,
+    credentials: "omit",
     headers,
   });
   const text = await response.text();
@@ -857,26 +934,21 @@ function normalizeRuntimeOptions() {
       options = {};
     }
   }
+  if (!isRecord(options)) {
+    options = {};
+  }
   return {
     action: firstString(options.action)?.toLowerCase(),
-    apiBase: firstString(
-      options.apiBase,
-      options.apiBaseUrl,
-      options.serverOrigin,
-      options.serverUrl
-    )?.replace(/\/+$/, ""),
-    authToken: firstString(
-      options.authToken,
-      options.bearerToken,
-      options.token
-    ),
+    apiBase: firstString(options.apiBase)?.replace(/\/+$/, ""),
+    bridgeId: firstString(options.bridgeId),
     documentKey: firstString(options.documentKey),
     formId: firstString(options.formId, options.publicId),
+    operationCapability: firstString(options.operationCapability),
     operationId: firstString(options.operationId),
+    parentOrigin: firstString(options.parentOrigin),
     prefill: normalizePrefill(options),
     publicId: firstString(options.publicId, options.formId),
     responseId: firstString(options.responseId),
-    tokenStorageKey: firstString(options.tokenStorageKey),
   };
 }
 
@@ -1042,12 +1114,69 @@ function actionRequest(action, data) {
   throw new Error(`Unsupported form action: ${action || "none"}`);
 }
 
-async function postAction(action, data) {
-  const request = actionRequest(action, data);
-  const result = await requestJson(request.path, {
-    body: JSON.stringify(request.body),
-    method: "POST",
+function requestActionCapability(action) {
+  if (!CAPABILITY_ACTIONS.includes(action)) {
+    return Promise.reject(
+      new Error(`Unsupported form action: ${action || "none"}`)
+    );
+  }
+
+  if (!bridgeAcknowledged) {
+    return Promise.reject(
+      new Error("The editor host bridge is not acknowledged")
+    );
+  }
+
+  capabilityRequestSequence += 1;
+  const requestId = `capability-${capabilityRequestSequence}`;
+
+  return new Promise((resolve, reject) => {
+    const pending = {
+      action,
+      reject,
+      resolve,
+      timeoutId: undefined,
+    };
+    pendingCapabilityRequests.set(requestId, pending);
+
+    const timeout = () => {
+      if (pendingCapabilityRequests.get(requestId) !== pending) {
+        return;
+      }
+
+      pendingCapabilityRequests.delete(requestId);
+      reject(new Error(`Timed out waiting for ${action} capability`));
+    };
+
+    try {
+      pending.timeoutId = window.setTimeout(
+        timeout,
+        CAPABILITY_REQUEST_TIMEOUT_MS
+      );
+      postBridgeMessage({
+        action,
+        requestId,
+        source: BRIDGE_MESSAGE_SOURCE,
+        type: CAPABILITY_REQUEST_TYPE,
+      });
+    } catch (error) {
+      pendingCapabilityRequests.delete(requestId);
+      window.clearTimeout(pending.timeoutId);
+      reject(error);
+    }
   });
+}
+
+async function postAction(action, data, capability) {
+  const request = actionRequest(action, data);
+  const result = await requestJson(
+    request.path,
+    {
+      body: JSON.stringify(request.body),
+      method: "POST",
+    },
+    capability
+  );
 
   return result;
 }
@@ -1066,6 +1195,13 @@ function operationIdFromResponse(payload) {
     operation.id,
     data.operationId
   );
+}
+function operationCapabilityFromResponse(payload) {
+  if (!isRecord(payload)) {
+    return;
+  }
+
+  return firstString(payload.operationCapability);
 }
 
 function operationStatus(payload) {
@@ -1095,14 +1231,17 @@ function wait(milliseconds) {
   });
 }
 
-async function pollOperation(operationId, label = "operation") {
+async function pollOperation(operationId, label, operationCapability) {
+  const operationLabel = label === undefined ? "operation" : label;
   const id = requireOption(operationId, "operationId");
+  const capability = requireOption(operationCapability, "operationCapability");
   let previousStatus = "";
 
   for (let attempt = 0; attempt < MAX_OPERATION_POLLS; attempt += 1) {
     const payload = await requestJson(
       `${API_ROUTES.OPERATIONS}/${encodeURIComponent(id)}`,
-      { method: "GET" }
+      { method: "GET" },
+      capability
     );
     const status = operationStatus(payload);
 
@@ -1115,7 +1254,7 @@ async function pollOperation(operationId, label = "operation") {
       (status === "pending" || status === "queued" || status === "processing")
     ) {
       previousStatus = status;
-      setStatus(`${label} is processing…`, "pending");
+      setStatus(`${operationLabel} is processing…`, "pending");
     }
 
     if (
@@ -1178,12 +1317,17 @@ async function runAction(action) {
     }
 
     setStatus(`${actionLabel(action)} is pending…`, "pending");
-    const response = await postAction(action, data);
+    const capability = await requestActionCapability(action);
+    const response = await postAction(action, data, capability);
     operationId = operationIdFromResponse(response);
     notifyParent(action, "pending", operationId, response);
 
     if (operationId) {
-      completedPayload = await pollOperation(operationId, actionLabel(action));
+      completedPayload = await pollOperation(
+        operationId,
+        actionLabel(action),
+        operationCapabilityFromResponse(response)
+      );
     }
 
     setStatus(`${actionLabel(action)} completed`, "success");
@@ -1270,7 +1414,11 @@ function startInitializationTasks() {
 
   if (runtimeOptions.operationId) {
     tasks.push(
-      pollOperation(runtimeOptions.operationId, "Existing operation")
+      pollOperation(
+        runtimeOptions.operationId,
+        "Existing operation",
+        runtimeOptions.operationCapability
+      )
         .then((result) => {
           setStatus("Existing operation completed", "success");
           return result;
@@ -1313,6 +1461,7 @@ function initializePlugin() {
 
   pluginInitialized = true;
   runtimeOptions = normalizeRuntimeOptions();
+  startBridge();
 
   const actions = toolbarActionsForMode(runtimeOptions.action);
   if (actions.length) {

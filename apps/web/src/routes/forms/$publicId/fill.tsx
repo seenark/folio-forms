@@ -10,6 +10,7 @@ import { ArrowLeft, CheckCircle2, Monitor } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { OnlyOfficeEditor } from "@/components/onlyoffice-editor";
+import type { EditorBridgeMessage } from "@/components/onlyoffice-editor";
 import { Button, Notice, Spinner } from "@/components/ui";
 import { ApiError, apiGet, apiPost, safeReturnPath } from "@/lib/api";
 import type { Operation } from "@/lib/api";
@@ -25,20 +26,6 @@ const formRequestError = (error: unknown, fallback: string) => {
 interface PublicForm {
   title: string;
   description?: string;
-}
-
-interface BridgeMessage {
-  action?: string;
-  error?: string;
-  operation?: {
-    result?: {
-      submissionId?: string;
-    };
-  };
-  operationId?: string;
-  source?: string;
-  status?: string;
-  type?: string;
 }
 
 const FillRoute = () => {
@@ -127,59 +114,48 @@ const FillRoute = () => {
     };
   }, [activeResponseId, authLoading, editorConfigUrl, form, publicId, user]);
 
-  useEffect(() => {
-    const handleBridgeMessage = async (event: MessageEvent<BridgeMessage>) => {
-      const message = event.data;
-      if (message?.source !== "form-bridge" || message.type !== "operation") {
-        return;
-      }
-
-      const status = message.status === "failed" ? "failed" : message.status;
-      if (
-        message.operationId &&
-        (status === "pending" || status === "completed" || status === "failed")
-      ) {
-        setOperation({
-          error: message.error,
-          id: message.operationId,
-          status,
-        });
-      }
-      if (status === "failed") {
-        setOperationError(
-          message.error ?? "The document operation failed. Try again."
-        );
-        setSuccess(null);
-        return;
-      }
-
-      if (status !== "completed") {
-        return;
-      }
-
-      if (message.action === "submit") {
-        const submissionId = message.operation?.result?.submissionId;
-        if (submissionId) {
-          await navigate({
-            params: { submissionId },
-            to: "/receipt/$submissionId",
-          });
-          return;
-        }
-      }
-
-      setError(null);
-      setOperationError(null);
-      setSuccess(
-        message.action === "save-draft"
-          ? "Draft saved."
-          : "Template action completed."
+  const handleBridgeMessage = async (message: EditorBridgeMessage) => {
+    const { status } = message;
+    setOperation(
+      message.operationId
+        ? {
+            error: message.error,
+            id: message.operationId,
+            status,
+          }
+        : null
+    );
+    if (status === "failed") {
+      setOperationError(
+        message.error ?? "The document operation failed. Try again."
       );
-    };
+      setSuccess(null);
+      return;
+    }
 
-    window.addEventListener("message", handleBridgeMessage);
-    return () => window.removeEventListener("message", handleBridgeMessage);
-  }, [navigate]);
+    if (status !== "completed") {
+      return;
+    }
+
+    if (message.action === "submit") {
+      const submissionId = message.operation?.result?.submissionId;
+      if (submissionId) {
+        await navigate({
+          params: { submissionId },
+          to: "/receipt/$submissionId",
+        });
+        return;
+      }
+    }
+
+    setError(null);
+    setOperationError(null);
+    setSuccess(
+      message.action === "save-draft"
+        ? "Draft saved."
+        : "Template action completed."
+    );
+  };
 
   const fillPath = safeReturnPath(`/forms/${publicId}/fill`);
 
@@ -289,6 +265,7 @@ const FillRoute = () => {
         <div className="overflow-hidden rounded-[var(--radius)] border border-[var(--line-strong)] bg-[var(--muted)] shadow-inner">
           <OnlyOfficeEditor
             configUrl={editorConfigUrl ?? undefined}
+            onBridgeMessage={handleBridgeMessage}
             title={`Fill ${form.title}`}
           />
         </div>

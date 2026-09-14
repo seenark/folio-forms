@@ -20,14 +20,23 @@ import { Elysia } from "elysia";
 import { unzipSync } from "fflate";
 
 import {
-  callbackOperationId,
+  callbackClaim,
   createCallbackUserdata,
+  createEditorCapability,
+  createOnlyOfficeAuthorization,
   createOnlyOfficeClient,
   editorConfig,
   pluginGuid,
   verifyDocumentAccessToken,
+  verifyEditorCapability,
+  verifyOnlyOfficeAuthorization,
 } from "./onlyoffice";
-import type { OnlyOfficeClient } from "./onlyoffice";
+import type {
+  EditorCapabilityAction,
+  EditorCapabilityClaims,
+  EditorCapabilityTarget,
+  OnlyOfficeClient,
+} from "./onlyoffice";
 import {
   DOCX_CONTENT_TYPE,
   deleteObject,
@@ -63,8 +72,9 @@ const fallbackTemplatePath = path.resolve(
   "../../../onlyoffice-templates/template.docx"
 );
 const idPattern = /^[0-9a-f-]{36}$/iu;
-const operationTimeoutMs = 5 * 60_000;
+const operationTimeoutMs = 4 * 60_000;
 const maxCallbackDocumentBytes = 25 * 1024 * 1024;
+const maxCallbackBodyBytes = 64 * 1024;
 const loginFailureLimit = 5;
 const loginFailureWindowMs = 15 * 60_000;
 const passwordMinimumLength = 12;
@@ -77,6 +87,11 @@ const callbackOrigins = new Set(
     (origin): origin is string => Boolean(origin)
   )
 );
+const pluginOrigins = new Set(
+  [env.API_BASE, env.ONLYOFFICE_URL, env.CORS_ORIGIN]
+    .map(originOf)
+    .filter((origin): origin is string => Boolean(origin))
+);
 
 type UserRole = "admin" | "user";
 interface Identity {
@@ -87,6 +102,22 @@ interface Identity {
   name: string;
   role: UserRole;
   sessionId: string;
+}
+type Actor = Pick<
+  Identity,
+  "email" | "id" | "mustChangePassword" | "name" | "role"
+>;
+interface EditorAuthorization {
+  actor: Actor;
+  capability: EditorCapabilityClaims | null;
+}
+interface EditorCapabilityScope {
+  action: EditorCapabilityAction;
+  documentKey: string;
+  formId: string;
+  operationId?: string;
+  targetId: string;
+  targetType: EditorCapabilityTarget;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -136,6 +167,7 @@ interface CallbackPayload {
 export interface AppOptions {
   onlyOffice?: OnlyOfficeClient;
   onlyOfficeCallbackOrigins?: readonly string[];
+  onlyOfficeCallbackMaxBytes?: number;
   requestIp?: (request: Request) => string | null | undefined;
 }
 
@@ -163,6 +195,44 @@ function asRecord(
     fail(400, "invalid_request", message);
   }
   return value as JsonRecord;
+}
+async function readJsonRecord(
+  request: Request,
+  maximumBytes: number
+): Promise<JsonRecord> {
+  const contentLength = Number(request.headers.get("content-length") ?? "");
+  if (Number.isFinite(contentLength) && contentLength > maximumBytes) {
+    fail(413, "payload_too_large", "Request body is too large");
+  }
+  const reader = request.body?.getReader();
+  if (!reader) {
+    fail(400, "invalid_request", "Request body must be a JSON object");
+  }
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    byteLength += value.byteLength;
+    if (byteLength > maximumBytes) {
+      await reader.cancel();
+      fail(413, "payload_too_large", "Request body is too large");
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return asRecord(JSON.parse(new TextDecoder().decode(bytes)));
+  } catch {
+    fail(400, "invalid_request", "Request body must be valid JSON");
+  }
 }
 
 function requiredString(record: JsonRecord, key: string): string {
@@ -512,8 +582,95 @@ async function requireIdentity(request: Request): Promise<Identity> {
   }
   return identity;
 }
+async function editorAuthorization(
+  request: Request
+): Promise<EditorAuthorization> {
+  const token = request.headers.get("x-editor-capability")?.trim();
+  if (!token) {
+    return { actor: await requireIdentity(request), capability: null };
+  }
+  const capability = verifyEditorCapability(token);
+  if (!capability) {
+    fail(
+      401,
+      "invalid_editor_capability",
+      "Editor capability is invalid or expired"
+    );
+  }
+  const user = await prisma.user.findUnique({
+    select: {
+      email: true,
+      enabled: true,
+      id: true,
+      mustChangePassword: true,
+      name: true,
+      role: true,
+    },
+    where: { id: capability.actorId },
+  });
+  if (
+    !user?.enabled ||
+    user.mustChangePassword ||
+    user.role !== capability.role
+  ) {
+    fail(
+      401,
+      "invalid_editor_capability",
+      "Editor capability is invalid or expired"
+    );
+  }
+  return {
+    actor: {
+      email: user.email,
+      id: user.id,
+      mustChangePassword: false,
+      name: user.name,
+      role: user.role,
+    },
+    capability,
+  };
+}
 
-function requireAdmin(identity: Identity): void {
+function requireEditorScope(
+  authorization: EditorAuthorization,
+  scope: EditorCapabilityScope
+): void {
+  const { capability } = authorization;
+  if (!capability) {
+    return;
+  }
+  if (
+    capability.action !== scope.action ||
+    capability.documentKey !== scope.documentKey ||
+    capability.formId !== scope.formId ||
+    capability.operationId !== scope.operationId ||
+    capability.targetId !== scope.targetId ||
+    capability.targetType !== scope.targetType
+  ) {
+    fail(
+      403,
+      "editor_capability_scope_mismatch",
+      "Editor capability does not permit this action"
+    );
+  }
+}
+
+function scopedEditorCapability(
+  actor: Actor,
+  scope: Omit<EditorCapabilityScope, "action" | "operationId">,
+  action: EditorCapabilityAction,
+  operationId?: string
+): string {
+  return createEditorCapability({
+    ...scope,
+    action,
+    actorId: actor.id,
+    operationId,
+    role: actor.role,
+  });
+}
+
+function requireAdmin(identity: Pick<Actor, "role">): void {
   if (identity.role !== "admin") {
     fail(403, "forbidden", "Administrator access is required");
   }
@@ -604,9 +761,11 @@ function decodeXmlAttribute(value: string): string {
     .replaceAll("&quot;", '"')
     .replaceAll("&apos;", "'");
 }
-function callbackDocumentUrl(
+export function resolveCallbackDocumentUrl(
   value: unknown,
-  allowedOrigins: ReadonlySet<string> = callbackOrigins
+  allowedOrigins: ReadonlySet<string> = callbackOrigins,
+  publicOrigin: string | null = callbackPublicOrigin,
+  internalOrigin: string | null = callbackInternalOrigin
 ): string | null {
   if (typeof value !== "string") {
     return null;
@@ -615,20 +774,23 @@ function callbackDocumentUrl(
     let url = new URL(value);
     if (
       !["http:", "https:"].includes(url.protocol) ||
+      url.username ||
+      url.password ||
+      url.hash ||
       !allowedOrigins.has(url.origin)
     ) {
       return null;
     }
     if (
-      callbackPublicOrigin &&
-      callbackInternalOrigin &&
-      callbackPublicOrigin !== callbackInternalOrigin &&
-      url.origin === callbackPublicOrigin
+      publicOrigin &&
+      internalOrigin &&
+      publicOrigin !== internalOrigin &&
+      url.origin === publicOrigin
     ) {
-      url = new URL(
-        `${url.pathname}${url.search}${url.hash}`,
-        callbackInternalOrigin
-      );
+      const internalUrl = new URL(internalOrigin);
+      internalUrl.pathname = url.pathname;
+      internalUrl.search = url.search;
+      url = internalUrl;
     }
     return url.toString();
   } catch {
@@ -636,23 +798,46 @@ function callbackDocumentUrl(
   }
 }
 
-async function readCallbackDocument(url: string): Promise<Uint8Array> {
-  const response = await fetch(url, { redirect: "error" });
+async function readCallbackDocument(
+  url: string,
+  maximumBytes = maxCallbackDocumentBytes
+): Promise<Uint8Array> {
+  const response = await fetch(url, {
+    headers: { Authorization: createOnlyOfficeAuthorization({ url }) },
+    redirect: "error",
+  });
   if (!response.ok) {
     throw new Error(
       `Failed to download ONLYOFFICE document: HTTP ${response.status}`
     );
   }
   const contentLength = Number(response.headers.get("content-length") ?? "");
-  if (
-    Number.isFinite(contentLength) &&
-    contentLength > maxCallbackDocumentBytes
-  ) {
+  if (Number.isFinite(contentLength) && contentLength > maximumBytes) {
     throw new Error("ONLYOFFICE document callback payload is too large");
   }
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > maxCallbackDocumentBytes) {
-    throw new Error("ONLYOFFICE document callback payload is too large");
+  const reader = response.body?.getReader();
+  if (!reader) {
+    return new Uint8Array();
+  }
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    byteLength += value.byteLength;
+    if (byteLength > maximumBytes) {
+      await reader.cancel();
+      throw new Error("ONLYOFFICE document callback payload is too large");
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
   }
   return bytes;
 }
@@ -890,7 +1075,11 @@ function launchForceSave(
       }
       const hasChanges = await onlyOffice.forceSave(
         operation.documentKey,
-        createCallbackUserdata(operation.id)
+        createCallbackUserdata({
+          documentKey: operation.documentKey,
+          operationId: operation.id,
+          operationType: operation.type,
+        })
       );
       if (!hasChanges) {
         const currentObjectKey = await operationDocumentKey(
@@ -1298,7 +1487,8 @@ async function finalizeCallback(
   operationId: string,
   payload: CallbackPayload,
   snapshot: Uint8Array | undefined,
-  allowedCallbackOrigins: ReadonlySet<string>
+  allowedCallbackOrigins: ReadonlySet<string>,
+  maximumBytes = maxCallbackDocumentBytes
 ): Promise<void> {
   const operation = await prisma.operation.findUnique({
     where: { id: operationId },
@@ -1314,7 +1504,10 @@ async function finalizeCallback(
     return;
   }
   const metadata = operationMetadata(operation.metadata);
-  const callbackUrl = callbackDocumentUrl(payload.url, allowedCallbackOrigins);
+  const callbackUrl = resolveCallbackDocumentUrl(
+    payload.url,
+    allowedCallbackOrigins
+  );
   if (
     typeof payload.key !== "string" ||
     payload.key !== operation.documentKey
@@ -1344,7 +1537,7 @@ async function finalizeCallback(
     if (!callbackUrl) {
       throw new Error("ONLYOFFICE callback document URL is unavailable");
     }
-    bytes = await readCallbackDocument(callbackUrl);
+    bytes = await readCallbackDocument(callbackUrl, maximumBytes);
   }
   const claimed = await prisma.operation.updateMany({
     data: { status: OperationStatus.processing, updatedAt: new Date() },
@@ -1437,8 +1630,7 @@ async function userEditorConfig(
   form: FormWithDocuments,
   identity: Identity,
   responseId: string | undefined,
-  requestedAction?: string,
-  authToken?: string
+  requestedAction?: string
 ): Promise<Record<string, unknown>> {
   const publishedTemplate = form.publishedTemplate;
   if (!publishedTemplate?.objectKey || !publishedTemplate.documentKey) {
@@ -1474,6 +1666,12 @@ async function userEditorConfig(
     );
   }
   const snapshot = response.prefillSnapshot;
+  const capabilityScope = {
+    documentKey: response.draftDocumentKey,
+    formId: form.id,
+    targetId: response.id,
+    targetType: "response",
+  } as const;
   return editorConfig(
     {
       action:
@@ -1482,7 +1680,14 @@ async function userEditorConfig(
           : requestedAction === "fill"
             ? "fill"
             : "draft",
-      authToken,
+      capabilities: {
+        "save-draft": scopedEditorCapability(
+          identity,
+          capabilityScope,
+          "save-draft"
+        ),
+        submit: scopedEditorCapability(identity, capabilityScope, "submit"),
+      },
       documentKey: response.draftDocumentKey,
       formId: form.id,
       prefill:
@@ -1504,6 +1709,8 @@ export function createApp(options: AppOptions = {}) {
   const allowedCallbackOrigins = options.onlyOfficeCallbackOrigins
     ? new Set(options.onlyOfficeCallbackOrigins)
     : callbackOrigins;
+  const callbackMaximumBytes =
+    options.onlyOfficeCallbackMaxBytes ?? maxCallbackDocumentBytes;
   const callbackClaims = new Set<string>();
   return new Elysia()
     .onError(({ error, set }) => {
@@ -1530,7 +1737,11 @@ export function createApp(options: AppOptions = {}) {
     })
     .use(
       cors({
-        allowedHeaders: ["Content-Type", "Authorization"],
+        allowedHeaders: [
+          "Content-Type",
+          "Authorization",
+          "X-Editor-Capability",
+        ],
         credentials: true,
         methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         origin: env.CORS_ORIGIN,
@@ -1864,10 +2075,27 @@ export function createApp(options: AppOptions = {}) {
           "The template DOCX artifact is unavailable"
         );
       }
+      const capabilityScope = {
+        documentKey: templateDraft.documentKey,
+        formId: form.id,
+        targetId: templateDraft.id,
+        targetType: "template-draft",
+      } as const;
       return editorConfig(
         {
           action: "template-edit",
-          authToken: bearerTokenFor(request),
+          capabilities: {
+            publish: scopedEditorCapability(
+              identity,
+              capabilityScope,
+              "publish"
+            ),
+            "save-template": scopedEditorCapability(
+              identity,
+              capabilityScope,
+              "save-template"
+            ),
+          },
           documentKey: templateDraft.documentKey,
           formId: form.id,
         },
@@ -1877,13 +2105,24 @@ export function createApp(options: AppOptions = {}) {
     .post(
       "/api/admin/forms/:id/save",
       async ({ request, params, body, set }) => {
-        const identity = await requireIdentity(request);
+        const authorization = await editorAuthorization(request);
+        const { actor: identity } = authorization;
         requireAdmin(identity);
         const form = await findFormById(params.id);
         const templateDraft = form.templateDraft;
         if (!templateDraft) {
           fail(409, "document_unavailable", "No template DOCX is configured");
         }
+        const capabilityScope = {
+          documentKey: templateDraft.documentKey,
+          formId: form.id,
+          targetId: templateDraft.id,
+          targetType: "template-draft",
+        } as const;
+        requireEditorScope(authorization, {
+          ...capabilityScope,
+          action: "save-template",
+        });
         const input = asRecord(body);
         const documentKey = requiredString(input, "documentKey");
         if (templateDraft.documentKey !== documentKey) {
@@ -1941,19 +2180,39 @@ export function createApp(options: AppOptions = {}) {
         });
         set.status = 202;
         launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
-        return { operationId: operation.id, status: operation.status };
+        return {
+          operationCapability: scopedEditorCapability(
+            identity,
+            capabilityScope,
+            "poll-operation",
+            operation.id
+          ),
+          operationId: operation.id,
+          status: operation.status,
+        };
       }
     )
     .post(
       "/api/admin/forms/:id/publish",
       async ({ request, params, body, set }) => {
-        const identity = await requireIdentity(request);
+        const authorization = await editorAuthorization(request);
+        const { actor: identity } = authorization;
         requireAdmin(identity);
         const form = await findFormById(params.id);
         const templateDraft = form.templateDraft;
         if (!templateDraft) {
           fail(409, "document_unavailable", "No template DOCX is configured");
         }
+        const capabilityScope = {
+          documentKey: templateDraft.documentKey,
+          formId: form.id,
+          targetId: templateDraft.id,
+          targetType: "template-draft",
+        } as const;
+        requireEditorScope(authorization, {
+          ...capabilityScope,
+          action: "publish",
+        });
         const input = asRecord(body);
         const documentKey = requiredString(input, "documentKey");
         if (templateDraft.documentKey !== documentKey) {
@@ -2010,7 +2269,16 @@ export function createApp(options: AppOptions = {}) {
         });
         set.status = 202;
         launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
-        return { operationId: operation.id, status: operation.status };
+        return {
+          operationCapability: scopedEditorCapability(
+            identity,
+            capabilityScope,
+            "poll-operation",
+            operation.id
+          ),
+          operationId: operation.id,
+          status: operation.status,
+        };
       }
     )
     .get("/api/admin/forms/:id/submissions", async ({ request, params }) => {
@@ -2057,13 +2325,7 @@ export function createApp(options: AppOptions = {}) {
           typeof query.responseId === "string" ? query.responseId : undefined;
         const requestedAction =
           typeof query.action === "string" ? query.action : undefined;
-        return userEditorConfig(
-          form,
-          identity,
-          responseId,
-          requestedAction,
-          bearerTokenFor(request)
-        );
+        return userEditorConfig(form, identity, responseId, requestedAction);
       }
     )
     .post("/api/forms/:publicId/start", async ({ request, params }) => {
@@ -2252,7 +2514,8 @@ export function createApp(options: AppOptions = {}) {
     .post(
       "/api/forms/:publicId/draft",
       async ({ request, params, body, set }) => {
-        const identity = await requireIdentity(request);
+        const authorization = await editorAuthorization(request);
+        const { actor: identity } = authorization;
         const form = await findFormByPublicId(params.publicId);
         const input = asRecord(body);
         const responseId = requiredString(input, "responseId");
@@ -2269,6 +2532,16 @@ export function createApp(options: AppOptions = {}) {
         ) {
           fail(409, "stale_response", "The response is no longer editable");
         }
+        const capabilityScope = {
+          documentKey,
+          formId: form.id,
+          targetId: response.id,
+          targetType: "response",
+        } as const;
+        requireEditorScope(authorization, {
+          ...capabilityScope,
+          action: "save-draft",
+        });
         const data = await normalizeResponseData(form, response, input.data);
         if (await activeOperationForResponse(response.id)) {
           fail(
@@ -2315,6 +2588,12 @@ export function createApp(options: AppOptions = {}) {
         set.status = 202;
         launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
         return {
+          operationCapability: scopedEditorCapability(
+            identity,
+            capabilityScope,
+            "poll-operation",
+            operation.id
+          ),
           operationId: operation.id,
           responseId: response.id,
           status: operation.status,
@@ -2324,7 +2603,8 @@ export function createApp(options: AppOptions = {}) {
     .post(
       "/api/forms/:publicId/submit",
       async ({ request, params, body, set }) => {
-        const identity = await requireIdentity(request);
+        const authorization = await editorAuthorization(request);
+        const { actor: identity } = authorization;
         const form = await findFormByPublicId(params.publicId);
         const input = asRecord(body);
         const responseId = requiredString(input, "responseId");
@@ -2341,6 +2621,16 @@ export function createApp(options: AppOptions = {}) {
         ) {
           fail(409, "stale_response", "The response is no longer editable");
         }
+        const capabilityScope = {
+          documentKey,
+          formId: form.id,
+          targetId: response.id,
+          targetType: "response",
+        } as const;
+        requireEditorScope(authorization, {
+          ...capabilityScope,
+          action: "submit",
+        });
         const data = await normalizeResponseData(form, response, input.data);
         if (await activeOperationForResponse(response.id)) {
           fail(
@@ -2415,6 +2705,12 @@ export function createApp(options: AppOptions = {}) {
         set.status = 202;
         launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
         return {
+          operationCapability: scopedEditorCapability(
+            identity,
+            capabilityScope,
+            "poll-operation",
+            operation.id
+          ),
           operationId: operation.id,
           responseId: response.id,
           status: operation.status,
@@ -2423,7 +2719,8 @@ export function createApp(options: AppOptions = {}) {
       }
     )
     .get("/api/operations/:id", async ({ request, params }) => {
-      const identity = await requireIdentity(request);
+      const authorization = await editorAuthorization(request);
+      const { actor: identity } = authorization;
       validateId(params.id, "Operation");
       let operation = await prisma.operation.findUnique({
         where: { id: params.id },
@@ -2431,8 +2728,33 @@ export function createApp(options: AppOptions = {}) {
       if (!operation) {
         fail(404, "not_found", "Operation was not found");
       }
-      operation = await expireOperationIfNeeded(operation);
-      if (identity.role !== "admin") {
+      if (authorization.capability) {
+        const targetType =
+          operation.targetType === OperationTargetType.template_draft
+            ? "template-draft"
+            : operation.targetType === OperationTargetType.response
+              ? "response"
+              : null;
+        if (
+          !targetType ||
+          !operation.documentKey ||
+          operation.actorId !== identity.id
+        ) {
+          fail(
+            403,
+            "editor_capability_scope_mismatch",
+            "Editor capability does not permit this operation"
+          );
+        }
+        requireEditorScope(authorization, {
+          action: "poll-operation",
+          documentKey: operation.documentKey,
+          formId: operation.formId,
+          operationId: operation.id,
+          targetId: operation.targetId,
+          targetType,
+        });
+      } else if (identity.role !== "admin") {
         if (!operation.responseId) {
           fail(403, "forbidden", "You may not access this operation");
         }
@@ -2444,6 +2766,7 @@ export function createApp(options: AppOptions = {}) {
           fail(403, "forbidden", "You may not access this operation");
         }
       }
+      operation = await expireOperationIfNeeded(operation);
       await cleanupTerminalOperationObjects(operation);
       return {
         operation: {
@@ -2518,10 +2841,15 @@ export function createApp(options: AppOptions = {}) {
         `attachment; filename="submission-${submission.id}.pdf"`;
       return pdf;
     })
-    .get("/onlyoffice/document/:key", async ({ params, query }) => {
+    .get("/onlyoffice/document/:key", async ({ request, params, query }) => {
       const { key } = params;
       const token = typeof query.token === "string" ? query.token : "";
-      if (!verifyDocumentAccessToken(token, key)) {
+      if (
+        !verifyDocumentAccessToken(token, key) ||
+        !verifyOnlyOfficeAuthorization(request.headers.get("authorization"), {
+          url: request.url,
+        })
+      ) {
         fail(
           401,
           "unauthorized",
@@ -2538,14 +2866,13 @@ export function createApp(options: AppOptions = {}) {
     })
     .get("/onlyoffice-plugin/config.json", ({ request, set }) => {
       const origin = request.headers.get("origin");
-      const allowedOrigin =
-        origin === env.API_BASE ||
-        origin === env.ONLYOFFICE_URL ||
-        origin === env.CORS_ORIGIN
-          ? origin
-          : env.ONLYOFFICE_URL;
-      set.headers["Access-Control-Allow-Origin"] = allowedOrigin;
-      set.headers.Vary = "Origin";
+      if (origin && !pluginOrigins.has(origin)) {
+        fail(403, "forbidden_origin", "Origin is not allowed");
+      }
+      if (origin) {
+        set.headers["Access-Control-Allow-Origin"] = origin;
+        set.headers.Vary = "Origin";
+      }
       return {
         guid: pluginGuid,
         name: "Form Bridge",
@@ -2573,72 +2900,85 @@ export function createApp(options: AppOptions = {}) {
     .get("/onlyoffice-plugin/plugin.js", () =>
       Bun.file(path.resolve(pluginDir, "plugin.js"))
     )
-    .post("/onlyoffice/callback", async ({ body }) => {
-      const payload = asRecord(body) as CallbackPayload;
-      const operationId = callbackOperationId(payload.userdata);
-      if (!operationId) {
-        return { error: 0 };
-      }
-      const status =
-        typeof payload.status === "number"
-          ? payload.status
-          : Number(payload.status);
-      const operation = await prisma.operation.findUnique({
-        where: { id: operationId },
-      });
-      if (!operation) {
-        return { error: 0 };
-      }
-      if (
-        operation.status === OperationStatus.completed ||
-        operation.status === OperationStatus.failed
-      ) {
-        await cleanupTerminalOperationObjects(operation);
-        return { error: 0 };
-      }
-      if (
-        typeof payload.key !== "string" ||
-        payload.key !== operation.documentKey
-      ) {
-        return { error: 1 };
-      }
-      if (status === 7) {
-        const metadata = operationMetadata(operation.metadata);
-        await updateOperationFailed(
-          operation.id,
-          "ONLYOFFICE reported a document error"
-        );
-        if (metadata.action === "submit" && metadata.responseId) {
-          await rollbackSubmit(metadata.responseId);
+    .post(
+      "/onlyoffice/callback",
+      async ({ request }) => {
+        const payload = await readJsonRecord(request, maxCallbackBodyBytes);
+        if (
+          !verifyOnlyOfficeAuthorization(
+            request.headers.get("authorization"),
+            payload
+          )
+        ) {
+          fail(401, "invalid_onlyoffice_token", "OnlyOffice token is invalid");
         }
-        return { error: 0 };
-      }
-      if (status !== 6) {
-        return { error: 0 };
-      }
-      if (callbackClaims.has(operationId)) {
-        return { error: 0 };
-      }
-      callbackClaims.add(operationId);
-      try {
-        await finalizeCallback(
-          operationId,
-          payload,
-          undefined,
-          allowedCallbackOrigins
-        );
-        return { error: 0 };
-      } catch (error) {
-        const metadata = operationMetadata(operation.metadata);
-        await updateOperationFailed(operation.id, errorMessage(error));
-        if (metadata.action === "submit" && metadata.responseId) {
-          await rollbackSubmit(metadata.responseId);
+        const status =
+          typeof payload.status === "number"
+            ? payload.status
+            : Number(payload.status);
+        if (status !== 6 && status !== 7) {
+          return { error: 0 };
         }
-        return { error: 1 };
-      } finally {
-        callbackClaims.delete(operationId);
-      }
-    });
+        const claim = callbackClaim(payload.userdata);
+        if (!claim) {
+          return { error: 1 };
+        }
+        const operation = await prisma.operation.findUnique({
+          where: { id: claim.operationId },
+        });
+        if (
+          !operation ||
+          claim.documentKey !== operation.documentKey ||
+          claim.operationType !== operation.type ||
+          typeof payload.key !== "string" ||
+          payload.key !== operation.documentKey
+        ) {
+          return { error: 1 };
+        }
+        if (
+          operation.status === OperationStatus.completed ||
+          operation.status === OperationStatus.failed
+        ) {
+          await cleanupTerminalOperationObjects(operation);
+          return { error: 0 };
+        }
+        if (status === 7) {
+          const metadata = operationMetadata(operation.metadata);
+          await updateOperationFailed(
+            operation.id,
+            "ONLYOFFICE reported a document error"
+          );
+          if (metadata.action === "submit" && metadata.responseId) {
+            await rollbackSubmit(metadata.responseId);
+          }
+          return { error: 0 };
+        }
+        if (callbackClaims.has(operation.id)) {
+          return { error: 0 };
+        }
+        callbackClaims.add(operation.id);
+        try {
+          await finalizeCallback(
+            operation.id,
+            payload as unknown as CallbackPayload,
+            undefined,
+            allowedCallbackOrigins,
+            callbackMaximumBytes
+          );
+          return { error: 0 };
+        } catch (error) {
+          const metadata = operationMetadata(operation.metadata);
+          await updateOperationFailed(operation.id, errorMessage(error));
+          if (metadata.action === "submit" && metadata.responseId) {
+            await rollbackSubmit(metadata.responseId);
+          }
+          return { error: 1 };
+        } finally {
+          callbackClaims.delete(operation.id);
+        }
+      },
+      { parse: "none" }
+    );
 }
 
 async function readTemplateSourceBytes(

@@ -59,7 +59,7 @@ bun install
 cp apps/server/.env.example apps/server/.env
 ```
 
-Replace `BETTER_AUTH_SECRET` with a random value of at least 32 characters. Compose RustFS credentials are for isolated local setup only.
+Replace `BETTER_AUTH_SECRET`, `EDITOR_CAPABILITY_SECRET`, and `ONLYOFFICE_JWT_SECRET` with three different random values of at least 32 characters. The first signs browser Sessions, the second signs five-minute editor action capabilities, and the third is shared only with ONLYOFFICE Document Server. Compose RustFS credentials are for isolated local setup only.
 
 For the first startup when no Admin exists, set all three `BOOTSTRAP_ADMIN_NAME`, `BOOTSTRAP_ADMIN_EMAIL`, and `BOOTSTRAP_ADMIN_PASSWORD` values in `apps/server/.env`. Together they create the first `Admin` only; the password must be 12–128 characters. The bootstrapped credential forces a password replacement on first successful entry. Remove all three variables after that entry. Do not commit `.env` or put a usable password in `.env.example`.
 
@@ -70,7 +70,7 @@ Canonical Template and Response DOCX objects live in the private RustFS bucket. 
 ### 3. Start PostgreSQL, RustFS, and ONLYOFFICE
 
 ```bash
-docker compose -f compose.yaml up -d postgres rustfs rustfs-init onlyoffice
+docker compose --env-file apps/server/.env -f compose.yaml up -d postgres rustfs rustfs-init onlyoffice
 ```
 
 ### 4. Apply the checked-in Prisma migration
@@ -121,7 +121,7 @@ Choose exactly one API mode.
 PostgreSQL, RustFS, and ONLYOFFICE run in Docker. The API and web app run under Bun:
 
 ```bash
-docker compose -f compose.yaml up -d postgres rustfs rustfs-init onlyoffice
+docker compose --env-file apps/server/.env -f compose.yaml up -d postgres rustfs rustfs-init onlyoffice
 bun run --cwd apps/server db:migrate
 bun run dev
 ```
@@ -144,8 +144,8 @@ The Compose server:
 Check service state with:
 
 ```bash
-docker compose -f compose.yaml ps
-docker compose -f compose.yaml logs --tail=100 server
+docker compose --env-file apps/server/.env -f compose.yaml ps
+docker compose --env-file apps/server/.env -f compose.yaml logs --tail=100 server
 ```
 
 The Compose file intentionally uses local development credentials and networking. See [Production hardening](#production-hardening).
@@ -240,6 +240,8 @@ operations/<operationId>/<kind>/<uuid>/docx
 - Sessions use opaque Better Auth tokens, not JWTs.
 - The frontend sends `Authorization: Bearer <session-token>`.
 - The local web app stores the token at `localStorage["onlyoffice.sessionToken"]`.
+- The browser Session token and editor capabilities are never included in the signed ONLYOFFICE or plugin configuration. Before each action, the browser parent obtains a fresh five-minute capability bound to the actor, role, Form, document target, and one action, then sends only that capability over the source/origin-pinned bridge.
+- ONLYOFFICE Document Server uses `ONLYOFFICE_JWT_SECRET` for signed editor configuration, command/conversion requests, private document downloads, and callbacks. It never accepts a Better Auth Session or editor capability at that boundary.
 - Each session expires one hour after issuance; sessions do not refresh or slide. The client clears the token at expiry and warns during the final five minutes.
 - Logout and password replacement revoke sessions immediately. Password replacement revokes every session, so the Admin must sign in again.
 - The server derives identity and role from Better Auth, never from client-supplied role fields.
@@ -255,10 +257,16 @@ These protections cover the current local stack, but the deployment defaults bel
 
 ## HTTP API
 
-All protected endpoints use the bearer session header:
+Protected browser endpoints use the opaque bearer Session header:
 
 ```http
 Authorization: Bearer <opaque-better-auth-session-token>
+```
+
+Editor action and Operation-poll requests instead use the scoped capability returned through the validated editor bridge:
+
+```http
+X-Editor-Capability: <signed-action-or-operation-capability>
 ```
 
 ### Authentication and health
@@ -392,12 +400,12 @@ bun run build
 Docker:
 
 ```bash
-docker compose -f compose.yaml config --quiet
-docker compose -f compose.yaml build server
-docker compose -f compose.yaml up -d --build postgres rustfs rustfs-init onlyoffice server
-docker compose -f compose.yaml ps
-docker compose -f compose.yaml logs --tail=100 server
-docker compose -f compose.yaml down
+docker compose --env-file apps/server/.env -f compose.yaml config --quiet
+docker compose --env-file apps/server/.env -f compose.yaml build server
+docker compose --env-file apps/server/.env -f compose.yaml up -d --build postgres rustfs rustfs-init onlyoffice server
+docker compose --env-file apps/server/.env -f compose.yaml ps
+docker compose --env-file apps/server/.env -f compose.yaml logs --tail=100 server
+docker compose --env-file apps/server/.env -f compose.yaml down
 ```
 
 Run `bun run --cwd apps/server test:http` and `bun run --cwd apps/server test:storage` against an isolated PostgreSQL database and disposable private RustFS bucket.
@@ -409,7 +417,7 @@ Run `bun run --cwd apps/server test:http` and `bun run --cwd apps/server test:st
 Check the services and API health:
 
 ```bash
-docker compose -f compose.yaml ps
+docker compose --env-file apps/server/.env -f compose.yaml ps
 curl http://localhost:3000/health
 ```
 
@@ -420,7 +428,7 @@ If port `3000` is already occupied, stop the other API mode before starting the 
 Inspect the database logs:
 
 ```bash
-docker compose -f compose.yaml logs --tail=100 postgres
+docker compose --env-file apps/server/.env -f compose.yaml logs --tail=100 postgres
 ```
 
 PostgreSQL 18 uses the `/var/lib/postgresql` volume mount in `compose.yaml`. Do not reuse an incompatible older PostgreSQL data volume without migrating it.
@@ -444,14 +452,14 @@ curl http://localhost:3000/onlyoffice-plugin/config.json
 curl http://localhost:3000/onlyoffice-plugin/plugin.js
 ```
 
-The plugin requires a valid authenticated editor configuration and bearer token.
+The plugin receives only action-scoped editor capabilities. It never receives or reads the browser Session bearer token.
 
 ## Production hardening
 
 Before exposing this system outside an isolated local workstation:
 
-1. Enable ONLYOFFICE JWT request/inbox/outbox authentication and configure the server with the same secret.
-2. Remove hardcoded database credentials and authentication secrets from `compose.yaml`.
+1. Keep ONLYOFFICE JWT inbox/outbox authentication enabled and provision the same dedicated `ONLYOFFICE_JWT_SECRET` to the API and Document Server.
+2. Remove hardcoded local database and RustFS credentials from `compose.yaml`.
 3. Use HTTPS behind a reverse proxy with strict host and origin allowlists.
 4. Replace localStorage bearer tokens with an httpOnly, secure session strategy where appropriate.
 5. Restrict PostgreSQL and ONLYOFFICE network exposure; do not publish them directly.

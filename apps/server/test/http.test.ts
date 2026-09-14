@@ -4,7 +4,18 @@ import { expect, test } from "bun:test";
 import { auth, ensureBootstrapAdmin } from "@onlyoffice/auth";
 import { prisma } from "@onlyoffice/db";
 
-import { createApp } from "../src/app";
+import { createApp, resolveCallbackDocumentUrl } from "../src/app";
+import type { EditorCapabilityAction } from "../src/onlyoffice";
+import {
+  createCallbackUserdata,
+  createDocumentAccessToken,
+  createEditorCapability,
+  createOnlyOfficeBodyToken,
+  createOnlyOfficeAuthorization,
+  pluginGuid,
+  verifyEditorCapability,
+  verifyOnlyOfficeAuthorization,
+} from "../src/onlyoffice";
 import {
   DOCX_CONTENT_TYPE,
   objectExists,
@@ -36,6 +47,37 @@ interface CredentialFixtureOptions {
   password: string;
   role?: "admin" | "user";
   mustChangePassword?: boolean;
+}
+interface CallbackOperationFixture {
+  documentKey: string;
+  finalObjectKey: string;
+  id: string;
+  userdata: string;
+}
+
+interface EditorConfigBody {
+  apiUrl: string;
+  bridge: {
+    capabilities: Partial<Record<EditorCapabilityAction, string>>;
+    id: string;
+    pluginOrigin: string;
+  };
+  config: {
+    document: { key: string; url: string };
+    editorConfig: {
+      plugins: {
+        options: Record<
+          string,
+          {
+            authToken?: unknown;
+            bridgeId: string;
+            parentOrigin: string;
+          }
+        >;
+      };
+    };
+    token: string;
+  };
 }
 
 const createCredentialFixture = async ({
@@ -106,13 +148,13 @@ const bearerFor = async (
 };
 
 const waitForOperation = async (
-  token: string,
-  operationId: string
+  operationId: string,
+  headers: Record<string, string>
 ): Promise<Record<string, unknown>> => {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const response = await app.handle(
       new Request(`http://test.local/api/operations/${operationId}`, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers,
       })
     );
     expect(response.status).toBe(200);
@@ -126,6 +168,24 @@ const waitForOperation = async (
     await Bun.sleep(5);
   }
   throw new Error(`Operation ${operationId} did not finish`);
+};
+const callbackPayload = (
+  operation: CallbackOperationFixture,
+  url: string
+): Record<string, unknown> => ({
+  key: operation.documentKey,
+  status: 6,
+  url,
+  userdata: operation.userdata,
+});
+
+const tamperAuthorization = (authorization: string): string => {
+  const [scheme, token] = authorization.split(" ");
+  const [header, payload, signature] = token?.split(".") ?? [];
+  if (!scheme || !header || !payload || !signature) {
+    throw new Error("The ONLYOFFICE authorization was malformed");
+  }
+  return `${scheme} ${header}.${payload}.${signature[0] === "a" ? "b" : "a"}${signature.slice(1)}`;
 };
 
 test("serves authenticated Admin and User workflows through HTTP", async () => {
@@ -145,6 +205,22 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       "The HTTP application test requires all BOOTSTRAP_ADMIN_* variables"
     );
   }
+  expect(
+    resolveCallbackDocumentUrl(
+      "https://docs.example//169.254.169.254/latest/meta-data?key=value",
+      new Set(["https://docs.example"]),
+      "https://docs.example",
+      "http://onlyoffice"
+    )
+  ).toBe("http://onlyoffice//169.254.169.254/latest/meta-data?key=value");
+  expect(
+    resolveCallbackDocumentUrl(
+      "https://user:password@docs.example/document.docx",
+      new Set(["https://docs.example"]),
+      "https://docs.example",
+      "http://onlyoffice"
+    )
+  ).toBeNull();
   const bootstrapUserSelect = {
     createdAt: true,
     email: true,
@@ -307,31 +383,289 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   ).toBe(true);
 
-  const publishResponse = await app.handle(
+  const adminEditorResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/editor-config`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(adminEditorResponse.status).toBe(200);
+  const adminEditor = (await adminEditorResponse.json()) as EditorConfigBody;
+  const adminPluginOptions =
+    adminEditor.config.editorConfig.plugins.options[pluginGuid];
+  const publishCapability = adminEditor.bridge.capabilities.publish;
+  const saveTemplateCapability =
+    adminEditor.bridge.capabilities["save-template"];
+  if (!adminPluginOptions || !publishCapability || !saveTemplateCapability) {
+    throw new Error("The Admin editor capabilities were not returned");
+  }
+  const adminEditorSerialized = JSON.stringify(adminEditor);
+  expect(adminEditorSerialized).not.toContain(adminBearer);
+  expect(adminEditorSerialized).not.toContain('"authToken"');
+  expect(JSON.stringify(adminEditor.config)).not.toContain(publishCapability);
+  expect(adminEditor.bridge.id).toBe(adminPluginOptions.bridgeId);
+  expect(adminEditor.bridge.pluginOrigin).toBe(
+    new URL(process.env.API_BASE ?? "http://localhost:3000").origin
+  );
+  expect(adminPluginOptions.parentOrigin).toBe(
+    new URL(process.env.CORS_ORIGIN ?? "http://localhost:5173").origin
+  );
+  expect(adminEditor.config.token.length).toBeGreaterThan(20);
+  const publishClaims = verifyEditorCapability(publishCapability);
+  expect(publishClaims).toMatchObject({
+    action: "publish",
+    actorId: adminId,
+    documentKey: templateDocumentKey,
+    formId,
+    role: "admin",
+    targetType: "template-draft",
+  });
+  expect((publishClaims?.expiresAt ?? 0) - (publishClaims?.issuedAt ?? 0)).toBe(
+    5 * 60
+  );
+
+  const capabilityHeaders = (capability: string): Record<string, string> => ({
+    ...jsonHeaders,
+    "X-Editor-Capability": capability,
+  });
+  const crossActionResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+      body: JSON.stringify({ documentKey: templateDocumentKey }),
+      headers: capabilityHeaders(publishCapability),
+      method: "POST",
+    })
+  );
+  expect(crossActionResponse.status).toBe(403);
+
+  const [capabilityHeader, capabilityPayload, capabilitySignature] =
+    publishCapability.split(".");
+  if (!capabilityHeader || !capabilityPayload || !capabilitySignature) {
+    throw new Error("The Admin editor capability was malformed");
+  }
+  const tamperedPublishCapability = [
+    capabilityHeader,
+    capabilityPayload,
+    `${capabilitySignature[0] === "a" ? "b" : "a"}${capabilitySignature.slice(1)}`,
+  ].join(".");
+  const tamperedCapabilityResponse = await app.handle(
     new Request(`http://test.local/api/admin/forms/${formId}/publish`, {
       body: JSON.stringify({ documentKey: templateDocumentKey }),
+      headers: capabilityHeaders(tamperedPublishCapability),
+      method: "POST",
+    })
+  );
+  expect(tamperedCapabilityResponse.status).toBe(401);
+
+  if (!publishClaims) {
+    throw new Error("The Admin publish capability did not verify");
+  }
+  const expiredPublishCapability = createEditorCapability({
+    action: publishClaims.action,
+    actorId: publishClaims.actorId,
+    documentKey: publishClaims.documentKey,
+    expiresAt: Math.floor(Date.now() / 1000) - 1,
+    formId: publishClaims.formId,
+    role: publishClaims.role,
+    targetId: publishClaims.targetId,
+    targetType: publishClaims.targetType,
+  });
+  const expiredCapabilityResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/publish`, {
+      body: JSON.stringify({ documentKey: templateDocumentKey }),
+      headers: capabilityHeaders(expiredPublishCapability),
+      method: "POST",
+    })
+  );
+  expect(expiredCapabilityResponse.status).toBe(401);
+
+  const secondCreateResponse = await app.handle(
+    new Request("http://test.local/api/admin/forms", {
+      body: JSON.stringify({ title: "Capability scope target" }),
       headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "POST",
+    })
+  );
+  expect(secondCreateResponse.status).toBe(200);
+  const secondCreatedForm = (await secondCreateResponse.json()) as {
+    form?: { id?: string; templateDocumentKey?: string };
+  };
+  if (
+    !secondCreatedForm.form?.id ||
+    !secondCreatedForm.form.templateDocumentKey
+  ) {
+    throw new Error("The cross-target Form was not created");
+  }
+  const crossTargetResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${secondCreatedForm.form.id}/publish`,
+      {
+        body: JSON.stringify({
+          documentKey: secondCreatedForm.form.templateDocumentKey,
+        }),
+        headers: capabilityHeaders(publishCapability),
+        method: "POST",
+      }
+    )
+  );
+  expect(crossTargetResponse.status).toBe(403);
+
+  const documentUrl = adminEditor.config.document.url;
+  const unsignedDocumentResponse = await app.handle(new Request(documentUrl));
+  expect(unsignedDocumentResponse.status).toBe(401);
+  const alteredDocumentUrl = new URL(documentUrl);
+  alteredDocumentUrl.searchParams.set(
+    "token",
+    `${alteredDocumentUrl.searchParams.get("token") ?? ""}x`
+  );
+  const alteredDocumentResponse = await app.handle(
+    new Request(alteredDocumentUrl.toString(), {
+      headers: {
+        Authorization: createOnlyOfficeAuthorization({
+          url: alteredDocumentUrl.toString(),
+        }),
+      },
+    })
+  );
+  expect(alteredDocumentResponse.status).toBe(401);
+  const expiredDocumentUrl = new URL(documentUrl);
+  expiredDocumentUrl.searchParams.set(
+    "token",
+    createDocumentAccessToken(
+      templateDocumentKey,
+      Math.floor(Date.now() / 1000) - 1
+    )
+  );
+  const expiredDocumentResponse = await app.handle(
+    new Request(expiredDocumentUrl.toString(), {
+      headers: {
+        Authorization: createOnlyOfficeAuthorization({
+          url: expiredDocumentUrl.toString(),
+        }),
+      },
+    })
+  );
+  expect(expiredDocumentResponse.status).toBe(401);
+  const signedDocumentResponse = await app.handle(
+    new Request(documentUrl, {
+      headers: {
+        Authorization: createOnlyOfficeAuthorization({ url: documentUrl }),
+      },
+    })
+  );
+  expect(signedDocumentResponse.status).toBe(200);
+  expect(signedDocumentResponse.headers.get("content-type")).toBe(
+    DOCX_CONTENT_TYPE
+  );
+
+  const forbiddenPluginOriginResponse = await app.handle(
+    new Request("http://test.local/onlyoffice-plugin/config.json", {
+      headers: { Origin: "https://attacker.example" },
+    })
+  );
+  expect(forbiddenPluginOriginResponse.status).toBe(403);
+  const sameOriginPluginConfigResponse = await app.handle(
+    new Request("http://test.local/onlyoffice-plugin/config.json")
+  );
+  expect(sameOriginPluginConfigResponse.status).toBe(200);
+  expect(
+    sameOriginPluginConfigResponse.headers.get("access-control-allow-origin")
+  ).toBeNull();
+  const allowedPluginOrigin = new URL(
+    process.env.ONLYOFFICE_URL ?? "http://localhost:8080"
+  ).origin;
+  const pluginConfigResponse = await app.handle(
+    new Request("http://test.local/onlyoffice-plugin/config.json", {
+      headers: { Origin: allowedPluginOrigin },
+    })
+  );
+  expect(pluginConfigResponse.status).toBe(200);
+  expect(pluginConfigResponse.headers.get("access-control-allow-origin")).toBe(
+    allowedPluginOrigin
+  );
+  const saveTemplateResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+      body: JSON.stringify({ documentKey: templateDocumentKey }),
+      headers: capabilityHeaders(saveTemplateCapability),
+      method: "POST",
+    })
+  );
+  expect(saveTemplateResponse.status).toBe(202);
+  const saveTemplateBody = (await saveTemplateResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!saveTemplateBody.operationCapability || !saveTemplateBody.operationId) {
+    throw new Error("The template save operation was not created");
+  }
+  const saveTemplatePollClaims = verifyEditorCapability(
+    saveTemplateBody.operationCapability
+  );
+  expect(saveTemplatePollClaims).toMatchObject({
+    action: "poll-operation",
+    operationId: saveTemplateBody.operationId,
+  });
+  expect(
+    (saveTemplatePollClaims?.expiresAt ?? 0) -
+      (saveTemplatePollClaims?.issuedAt ?? 0)
+  ).toBe(6 * 60);
+  const saveTemplateOperation = await waitForOperation(
+    saveTemplateBody.operationId,
+    {
+      "X-Editor-Capability": saveTemplateBody.operationCapability,
+    }
+  );
+  expect(saveTemplateOperation.status).toBe("completed");
+
+  const refreshedAdminEditorResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/editor-config`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(refreshedAdminEditorResponse.status).toBe(200);
+  const refreshedAdminEditor =
+    (await refreshedAdminEditorResponse.json()) as EditorConfigBody;
+  const activeTemplateDocumentKey = refreshedAdminEditor.config.document.key;
+  const activePublishCapability =
+    refreshedAdminEditor.bridge.capabilities.publish;
+  if (!activeTemplateDocumentKey || !activePublishCapability) {
+    throw new Error("The refreshed Admin editor capability was not returned");
+  }
+  expect(activeTemplateDocumentKey).not.toBe(templateDocumentKey);
+  const publishResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/publish`, {
+      body: JSON.stringify({ documentKey: activeTemplateDocumentKey }),
+      headers: capabilityHeaders(activePublishCapability),
       method: "POST",
     })
   );
   expect(publishResponse.status).toBe(202);
   const publishBody = (await publishResponse.json()) as {
+    operationCapability?: string;
     operationId?: string;
   };
-  if (!publishBody.operationId) {
+  if (!publishBody.operationCapability || !publishBody.operationId) {
     throw new Error("The publish operation was not created");
   }
-  const publishOperation = await waitForOperation(
-    adminBearer,
-    publishBody.operationId
+  const publishPollClaims = verifyEditorCapability(
+    publishBody.operationCapability
   );
+  expect(publishPollClaims).toMatchObject({
+    action: "poll-operation",
+    operationId: publishBody.operationId,
+  });
+  expect(
+    (publishPollClaims?.expiresAt ?? 0) - (publishPollClaims?.issuedAt ?? 0)
+  ).toBe(6 * 60);
+  const publishOperation = await waitForOperation(publishBody.operationId, {
+    "X-Editor-Capability": publishBody.operationCapability,
+  });
   expect(publishOperation.status).toBe("completed");
 
-  await createCredentialFixture({
+  const user = await createCredentialFixture({
     email: userEmail,
     name: "Ticket 04 Workflow User",
     password,
   });
+  const userId = user.id;
   const userBearer = await bearerFor(userEmail, password);
 
   const formRecord = await prisma.form.findUnique({
@@ -398,13 +732,88 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(editorResponse.status).toBe(200);
-  const editorConfig = (await editorResponse.json()) as {
-    document?: { key?: string };
-  };
-  const responseDocumentKey = editorConfig.document?.key;
-  if (!responseDocumentKey) {
-    throw new Error("The response editor document key was not returned");
+  const editorConfig = (await editorResponse.json()) as EditorConfigBody;
+  const responseDocumentKey = editorConfig.config.document.key;
+  const userPluginOptions =
+    editorConfig.config.editorConfig.plugins.options[pluginGuid];
+  const saveDraftCapability = editorConfig.bridge.capabilities["save-draft"];
+  const submitCapability = editorConfig.bridge.capabilities.submit;
+  if (
+    !userPluginOptions ||
+    !responseDocumentKey ||
+    !saveDraftCapability ||
+    !submitCapability
+  ) {
+    throw new Error("The User editor capabilities were not returned");
   }
+  const userEditorSerialized = JSON.stringify(editorConfig);
+  expect(userEditorSerialized).not.toContain(userBearer);
+  expect(userEditorSerialized).not.toContain('"authToken"');
+  expect(JSON.stringify(editorConfig.config)).not.toContain(
+    saveDraftCapability
+  );
+  expect(editorConfig.bridge.id).toBe(userPluginOptions.bridgeId);
+  const saveDraftClaims = verifyEditorCapability(saveDraftCapability);
+  expect(saveDraftClaims).toMatchObject({
+    action: "save-draft",
+    actorId: userId,
+    documentKey: responseDocumentKey,
+    formId,
+    role: "user",
+    targetId: responseId,
+    targetType: "response",
+  });
+  if (!saveDraftClaims) {
+    throw new Error("The save-draft capability was invalid");
+  }
+  await prisma.user.update({
+    data: { enabled: false },
+    where: { id: userId },
+  });
+  const disabledActorResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
+      body: JSON.stringify({
+        data: {},
+        documentKey: responseDocumentKey,
+        responseId,
+      }),
+      headers: capabilityHeaders(saveDraftCapability),
+      method: "POST",
+    })
+  );
+  expect(disabledActorResponse.status).toBe(401);
+  await prisma.user.update({
+    data: { enabled: true, role: "admin" },
+    where: { id: userId },
+  });
+  const changedRoleResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
+      body: JSON.stringify({
+        data: {},
+        documentKey: responseDocumentKey,
+        responseId,
+      }),
+      headers: capabilityHeaders(saveDraftCapability),
+      method: "POST",
+    })
+  );
+  expect(changedRoleResponse.status).toBe(401);
+  await prisma.user.update({
+    data: { role: "user" },
+    where: { id: userId },
+  });
+  const userCrossActionResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
+      body: JSON.stringify({
+        data: {},
+        documentKey: responseDocumentKey,
+        responseId,
+      }),
+      headers: capabilityHeaders(submitCapability),
+      method: "POST",
+    })
+  );
+  expect(userCrossActionResponse.status).toBe(403);
 
   const saveResponse = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
@@ -413,21 +822,21 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         documentKey: responseDocumentKey,
         responseId,
       }),
-      headers: { ...jsonHeaders, Authorization: `Bearer ${userBearer}` },
+      headers: capabilityHeaders(saveDraftCapability),
       method: "POST",
     })
   );
   expect(saveResponse.status).toBe(202);
   const saveBody = (await saveResponse.json()) as {
+    operationCapability?: string;
     operationId?: string;
   };
-  if (!saveBody.operationId) {
+  if (!saveBody.operationCapability || !saveBody.operationId) {
     throw new Error("The draft operation was not created");
   }
-  const saveOperation = await waitForOperation(
-    userBearer,
-    saveBody.operationId
-  );
+  const saveOperation = await waitForOperation(saveBody.operationId, {
+    "X-Editor-Capability": saveBody.operationCapability,
+  });
   expect(saveOperation.status).toBe("completed");
 
   const submitResponse = await app.handle(
@@ -437,24 +846,36 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         documentKey: responseDocumentKey,
         responseId,
       }),
-      headers: { ...jsonHeaders, Authorization: `Bearer ${userBearer}` },
+      headers: capabilityHeaders(submitCapability),
       method: "POST",
     })
   );
   expect(submitResponse.status).toBe(202);
   const submitBody = (await submitResponse.json()) as {
+    operationCapability?: string;
     operationId?: string;
     submissionId?: string;
   };
   const completedSubmissionId = submitBody.submissionId;
-  if (!submitBody.operationId || !completedSubmissionId) {
+  if (
+    !submitBody.operationCapability ||
+    !submitBody.operationId ||
+    !completedSubmissionId
+  ) {
     throw new Error("The submit operation was not created");
   }
-  const submitOperation = await waitForOperation(
-    userBearer,
-    submitBody.operationId
-  );
+  const submitOperation = await waitForOperation(submitBody.operationId, {
+    "X-Editor-Capability": submitBody.operationCapability,
+  });
   expect(submitOperation.status).toBe("completed");
+  const crossOperationPollResponse = await app.handle(
+    new Request(`http://test.local/api/operations/${submitBody.operationId}`, {
+      headers: {
+        "X-Editor-Capability": saveBody.operationCapability,
+      },
+    })
+  );
+  expect(crossOperationPollResponse.status).toBe(403);
   await createCredentialFixture({
     email: otherUserEmail,
     name: "Ticket 04 Other User",
@@ -551,9 +972,19 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       updatedAt: new Date(0),
     },
   });
+  const staleOperationCapability = createEditorCapability({
+    action: "poll-operation",
+    actorId: adminId,
+    documentKey: templateDraft.documentKey,
+    formId,
+    operationId: staleOperationId,
+    role: "admin",
+    targetId: templateDraft.id,
+    targetType: "template-draft",
+  });
   const expiredOperationResponse = await app.handle(
     new Request(`http://test.local/api/operations/${staleOperationId}`, {
-      headers: { Authorization: `Bearer ${adminBearer}` },
+      headers: { "X-Editor-Capability": staleOperationCapability },
     })
   );
   expect(expiredOperationResponse.status).toBe(200);
@@ -563,6 +994,249 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(await objectExists(staleStagingObjectKey)).toBe(false);
   expect(await objectExists(staleFinalObjectKey)).toBe(false);
   expect(await objectExists(templateDraft.objectKey)).toBe(true);
+  const callbackDocument = new TextEncoder().encode("callback-docx");
+  const callbackDownloadPaths = new Set<string>();
+  const callbackDocumentServer = Bun.serve({
+    fetch(request) {
+      const url = new URL(request.url);
+      if (
+        !verifyOnlyOfficeAuthorization(request.headers.get("authorization"), {
+          url: request.url,
+        })
+      ) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+      callbackDownloadPaths.add(url.pathname);
+      if (url.pathname === "/redirect.docx") {
+        return new Response(null, {
+          headers: { Location: `${url.origin}/ok.docx` },
+          status: 302,
+        });
+      }
+      if (url.pathname === "/large.docx") {
+        return new Response(new Uint8Array(17));
+      }
+      return new Response(callbackDocument, {
+        headers: { "Content-Type": DOCX_CONTENT_TYPE },
+      });
+    },
+    port: 0,
+  });
+  try {
+    const callbackOrigin = callbackDocumentServer.url.origin;
+    const callbackApp = createApp({
+      onlyOffice: {
+        convertDocxToPdf: () =>
+          Promise.resolve(new TextEncoder().encode("%PDF-test")),
+        forceSave: () => Promise.resolve(false),
+      },
+      onlyOfficeCallbackMaxBytes: 16,
+      onlyOfficeCallbackOrigins: [callbackOrigin],
+    });
+    const createCallbackOperation =
+      async (): Promise<CallbackOperationFixture> => {
+        const id = crypto.randomUUID();
+        const stagedObjectKey = objectKey(
+          "operations",
+          id,
+          "callback-staged.docx"
+        );
+        const finalObjectKey = objectKey(
+          "operations",
+          id,
+          "callback-final.docx"
+        );
+        await prisma.operation.create({
+          data: {
+            actorId: adminId,
+            documentKey: templateDraft.documentKey,
+            errorCode: null,
+            formId,
+            id,
+            metadata: {
+              action: "save-template",
+              finalObjectKey,
+              formId,
+              stagedObjectKey,
+            },
+            ownerUserId: adminId,
+            stagingObjectKey: stagedObjectKey,
+            status: "processing",
+            targetId: id,
+            targetType: "template_draft",
+            type: "save_template_draft",
+          },
+        });
+        return {
+          documentKey: templateDraft.documentKey,
+          finalObjectKey,
+          id,
+          userdata: createCallbackUserdata({
+            documentKey: templateDraft.documentKey,
+            operationId: id,
+            operationType: "save_template_draft",
+          }),
+        };
+      };
+    const postCallback = (
+      payload: Record<string, unknown>,
+      authorization = createOnlyOfficeAuthorization(payload),
+      bodyToken = createOnlyOfficeBodyToken(payload)
+    ): Promise<Response> =>
+      callbackApp.handle(
+        new Request("http://test.local/onlyoffice/callback", {
+          body: JSON.stringify({ ...payload, token: bodyToken }),
+          headers: {
+            Authorization: authorization,
+            ...jsonHeaders,
+          },
+          method: "POST",
+        })
+      );
+
+    const trustOperation = await createCallbackOperation();
+    const trustedPayload = callbackPayload(
+      trustOperation,
+      `${callbackOrigin}/ok.docx`
+    );
+    const invalidJwtResponse = await postCallback(
+      trustedPayload,
+      tamperAuthorization(createOnlyOfficeAuthorization(trustedPayload))
+    );
+    expect(invalidJwtResponse.status).toBe(401);
+    const invalidBodyTokenResponse = await postCallback(
+      trustedPayload,
+      createOnlyOfficeAuthorization(trustedPayload),
+      `${createOnlyOfficeBodyToken(trustedPayload)}x`
+    );
+    expect(invalidBodyTokenResponse.status).toBe(401);
+    const ordinaryCallbackResponse = await postCallback({
+      actions: [],
+      key: trustOperation.documentKey,
+      status: 1,
+    });
+    expect(await ordinaryCallbackResponse.json()).toEqual({ error: 0 });
+    const browserSessionBoundaryResponse = await postCallback(
+      trustedPayload,
+      `Bearer ${publishCapability}`
+    );
+    expect(browserSessionBoundaryResponse.status).toBe(401);
+
+    const wrongKeyPayload = {
+      ...trustedPayload,
+      key: `wrong-${trustOperation.documentKey}`,
+    };
+    const wrongKeyResponse = await postCallback(wrongKeyPayload);
+    expect(await wrongKeyResponse.json()).toEqual({ error: 1 });
+    const wrongOperationPayload = {
+      ...trustedPayload,
+      userdata: createCallbackUserdata({
+        documentKey: trustOperation.documentKey,
+        operationId: crypto.randomUUID(),
+        operationType: "save_template_draft",
+      }),
+    };
+    const wrongOperationResponse = await postCallback(wrongOperationPayload);
+    expect(await wrongOperationResponse.json()).toEqual({ error: 1 });
+    const wrongOperationTypePayload = {
+      ...trustedPayload,
+      userdata: createCallbackUserdata({
+        documentKey: trustOperation.documentKey,
+        operationId: trustOperation.id,
+        operationType: "submit_response",
+      }),
+    };
+    const wrongOperationTypeResponse = await postCallback(
+      wrongOperationTypePayload
+    );
+    expect(await wrongOperationTypeResponse.json()).toEqual({ error: 1 });
+    const expiredCallbackPayload = {
+      ...trustedPayload,
+      userdata: createCallbackUserdata({
+        documentKey: trustOperation.documentKey,
+        expiresAt: Math.floor(Date.now() / 1000) - 1,
+        operationId: trustOperation.id,
+        operationType: "save_template_draft",
+      }),
+    };
+    const expiredCallbackResponse = await postCallback(expiredCallbackPayload);
+    expect(await expiredCallbackResponse.json()).toEqual({ error: 1 });
+    expect(
+      await prisma.operation.findUnique({
+        select: { status: true },
+        where: { id: trustOperation.id },
+      })
+    ).toEqual({ status: "processing" });
+
+    const oversizedCallbackPayload = {
+      padding: "x".repeat(65 * 1024),
+      status: 6,
+    };
+    const oversizedCallbackResponse = await postCallback(
+      oversizedCallbackPayload
+    );
+    expect(oversizedCallbackResponse.status).toBe(413);
+
+    const forbiddenOriginOperation = await createCallbackOperation();
+    const forbiddenOriginResponse = await postCallback(
+      callbackPayload(
+        forbiddenOriginOperation,
+        "https://attacker.example/document.docx"
+      )
+    );
+    expect(await forbiddenOriginResponse.json()).toEqual({ error: 0 });
+    expect(
+      await prisma.operation.findUnique({
+        select: { status: true },
+        where: { id: forbiddenOriginOperation.id },
+      })
+    ).toEqual({ status: "failed" });
+
+    const redirectOperation = await createCallbackOperation();
+    const redirectResponse = await postCallback(
+      callbackPayload(redirectOperation, `${callbackOrigin}/redirect.docx`)
+    );
+    expect(await redirectResponse.json()).toEqual({ error: 1 });
+    expect(
+      await prisma.operation.findUnique({
+        select: { status: true },
+        where: { id: redirectOperation.id },
+      })
+    ).toEqual({ status: "failed" });
+
+    const oversizedDocumentOperation = await createCallbackOperation();
+    const oversizedDocumentResponse = await postCallback(
+      callbackPayload(
+        oversizedDocumentOperation,
+        `${callbackOrigin}/large.docx`
+      )
+    );
+    expect(await oversizedDocumentResponse.json()).toEqual({ error: 1 });
+    expect(
+      await prisma.operation.findUnique({
+        select: { status: true },
+        where: { id: oversizedDocumentOperation.id },
+      })
+    ).toEqual({ status: "failed" });
+
+    const validCallbackResponse = await postCallback(trustedPayload);
+    expect(await validCallbackResponse.json()).toEqual({ error: 0 });
+    expect(
+      await prisma.operation.findUnique({
+        select: { status: true },
+        where: { id: trustOperation.id },
+      })
+    ).toEqual({ status: "completed" });
+    expect(await readObject(trustOperation.finalObjectKey)).toEqual(
+      callbackDocument
+    );
+    expect(callbackDownloadPaths).toEqual(
+      new Set(["/large.docx", "/ok.docx", "/redirect.docx"])
+    );
+  } finally {
+    callbackDocumentServer.stop(true);
+  }
+
   const passwordEmail = `ticket-04-password-${crypto.randomUUID()}@example.com`;
   const currentPassword = "Ticket04-current-password";
   const passwordUser = await createCredentialFixture({

@@ -18,10 +18,28 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import type { EditorBridgeMessage } from "@/components/onlyoffice-editor";
 import { OnlyOfficeEditor } from "@/components/onlyoffice-editor";
 import { Button, Notice, Spinner, Badge } from "@/components/ui";
 import { apiGet, apiPost, waitForOperation } from "@/lib/api";
 import type { FormDetail } from "@/lib/api";
+
+type FormDetailResponse =
+  | { editorConfigUrl?: string; form: FormDetail }
+  | FormDetail;
+
+const loadFormDetail = async (formId: string): Promise<FormDetail> => {
+  const payload = await apiGet<FormDetailResponse>(
+    `/api/admin/forms/${formId}`
+  );
+  return "form" in payload
+    ? {
+        ...payload.form,
+        editorConfigUrl:
+          payload.editorConfigUrl ?? payload.form.editorConfigUrl,
+      }
+    : payload;
+};
 
 const FormEditorRoute = () => {
   const { formId } = useParams({ from: "/admin/forms/$formId" });
@@ -38,21 +56,11 @@ const FormEditorRoute = () => {
     let cancelled = false;
     const loadForm = async () => {
       try {
-        const payload = await apiGet<
-          { form: FormDetail; editorConfigUrl?: string } | FormDetail
-        >(`/api/admin/forms/${formId}`);
+        const payload = await loadFormDetail(formId);
         if (cancelled) {
           return;
         }
-        if ("form" in payload) {
-          setForm({
-            ...payload.form,
-            editorConfigUrl:
-              payload.editorConfigUrl ?? payload.form.editorConfigUrl,
-          });
-        } else {
-          setForm(payload);
-        }
+        setForm(payload);
       } catch (caughtError) {
         if (!cancelled) {
           setError(
@@ -101,22 +109,12 @@ const FormEditorRoute = () => {
       if (result.operationId) {
         await waitForOperation(result.operationId);
       }
+      setForm(await loadFormDetail(formId));
       const noticeMessage =
         action === "publish"
           ? "Published. New responses will use this document."
           : "Draft saved.";
       setNotice(noticeMessage);
-      setForm((current) => {
-        if (!current) {
-          return current;
-        }
-        const nextForm = { ...current };
-        if (action === "publish") {
-          nextForm.activeDraftCount = 0;
-          nextForm.status = "published";
-        }
-        return nextForm;
-      });
     } catch (caughtError) {
       setError(
         caughtError instanceof Error
@@ -133,6 +131,33 @@ const FormEditorRoute = () => {
       return;
     }
     void perform(action);
+  };
+  const handleEditorBridgeMessage = async (message: EditorBridgeMessage) => {
+    if (message.status === "failed") {
+      setError(message.error ?? "The document action failed.");
+      return;
+    }
+    if (
+      message.status !== "completed" ||
+      (message.action !== "save-template" && message.action !== "publish")
+    ) {
+      return;
+    }
+    try {
+      setForm(await loadFormDetail(formId));
+      setError(null);
+      setNotice(
+        message.action === "publish"
+          ? "Published. New responses will use this document."
+          : "Draft saved."
+      );
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Could not refresh this form."
+      );
+    }
   };
 
   const copyLink = async () => {
@@ -260,6 +285,8 @@ const FormEditorRoute = () => {
       </div>
       <div className="overflow-hidden rounded-[var(--radius)] border border-[var(--line-strong)] bg-[var(--muted)] shadow-inner">
         <OnlyOfficeEditor
+          key={editorDocumentKey}
+          onBridgeMessage={handleEditorBridgeMessage}
           configUrl={form.editorConfigUrl ?? form.editorUrl}
           title={`Editor for ${form.title}`}
         />

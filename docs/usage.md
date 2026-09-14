@@ -24,7 +24,7 @@ Folio Forms เป็นระบบสร้างและกรอกแบ�
 cp apps/server/.env.example apps/server/.env
 ```
 
-จากนั้นเปลี่ยนค่า `BETTER_AUTH_SECRET` เป็นค่าสุ่มที่ยาวอย่างน้อย 32 ตัวอักษร ห้ามแชร์ค่านี้
+จากนั้นเปลี่ยนค่า `BETTER_AUTH_SECRET`, `EDITOR_CAPABILITY_SECRET` และ `ONLYOFFICE_JWT_SECRET` เป็นค่าสุ่มคนละค่าที่มีความยาวอย่างน้อย 32 ตัวอักษร ห้ามแชร์ค่าเหล่านี้ โดยค่าแรกใช้กับ Browser Session, ค่าที่สองใช้กับ Editor capability อายุ 5 นาที และค่าที่สามใช้เฉพาะกับ ONLYOFFICE Document Server
 
 ค่า `RUSTFS_ENDPOINT`, `RUSTFS_ACCESS_KEY_ID`, `RUSTFS_SECRET_ACCESS_KEY`, `RUSTFS_BUCKET` และ `RUSTFS_REGION` ในไฟล์ตัวอย่างตรงกับ Compose local เท่านั้น Bucket ต้องเป็น private และไม่ควรใช้ credential ชุดนี้นอกเครื่องพัฒนา
 
@@ -40,10 +40,10 @@ apps/server/.env.example  ตัวอย่างค่าที่ต้อง
 ถ้า Container ทำงานอยู่แล้ว ให้ข้ามคำสั่งนี้ได้:
 
 ```bash
-docker compose -f compose.yaml up -d postgres rustfs rustfs-init onlyoffice
+docker compose --env-file apps/server/.env -f compose.yaml up -d postgres rustfs rustfs-init onlyoffice
 ```
 
-ใช้ `compose.yaml` โดยระบุ `-f` เสมอ เพราะ repository มี `docker-compose.yml` อีกไฟล์หนึ่งที่เป็นไฟล์เก่าและมีเฉพาะ Server
+ใช้ `compose.yaml` โดยระบุ `--env-file apps/server/.env -f compose.yaml` เสมอ เพื่อส่ง secret ที่บังคับใช้และหลีกเลี่ยง `docker-compose.yml` รุ่นเก่าที่มีเฉพาะ Server
 
 ### 1.3 Apply Prisma migration
 
@@ -106,7 +106,7 @@ bun run dev
 และ:
 
 ```bash
-docker compose -f compose.yaml up -d --build server
+docker compose --env-file apps/server/.env -f compose.yaml up -d --build server
 ```
 
 ทั้งสองแบบใช้ port `3000` เหมือนกัน ให้เลือกเพียงแบบใดแบบหนึ่ง
@@ -168,6 +168,8 @@ localStorage["onlyoffice.sessionToken"]
 ```
 
 ไม่ควรเปิดดูหรือแชร์ Token นี้
+
+Bearer session นี้ใช้เฉพาะระหว่าง Web กับ API และจะไม่ถูกส่งเข้า ONLYOFFICE หรือ Plugin ก่อนทำแต่ละ Editor action หน้า Web จะใช้ Session ขอ capability อายุ 5 นาทีใหม่ แล้วส่งเฉพาะ capability นั้นผ่าน bridge ที่ตรวจ origin และ window source โดย capability ผูกกับผู้ใช้, role, Form, document และ action เดียว เช่น Save Draft หรือ Submit ส่วน Document Server ใช้ `ONLYOFFICE_JWT_SECRET` แยกต่างหากสำหรับเปิดไฟล์ private, callback, command และ conversion
 
 ## 3. ทดลองใช้งานในฐานะ User
 
@@ -259,7 +261,7 @@ apps/
     src/app.ts         API routes และ workflow หลัก
     src/index.ts       Production listen entrypoint
     src/storage.ts     Private RustFS object primitives
-    src/onlyoffice.ts  Document URL, HMAC, force-save และ PDF conversion
+    src/onlyoffice.ts  Editor capability, ONLYOFFICE JWT, document access, force-save และ PDF conversion
     .env               Environment local จริง
 
   web/
@@ -337,7 +339,7 @@ rustfs-data         Private DOCX objects
 
 ```bash
 curl http://localhost:3000/health
-docker compose -f compose.yaml ps
+docker compose --env-file apps/server/.env -f compose.yaml ps
 ```
 
 ถ้า port `3000` ถูกใช้งานอยู่ ให้ตรวจว่าไม่ได้เปิด Compose `server` พร้อมกับ Host API
@@ -372,7 +374,7 @@ docker compose -f compose.yaml ps
 ถ้าต้องการให้ API รันใน Docker ทั้งหมด ให้หยุด Host API ก่อน แล้วใช้:
 
 ```bash
-docker compose -f compose.yaml up -d --build postgres rustfs rustfs-init onlyoffice server
+docker compose --env-file apps/server/.env -f compose.yaml up -d --build postgres rustfs rustfs-init onlyoffice server
 bun run --cwd apps/web dev
 ```
 

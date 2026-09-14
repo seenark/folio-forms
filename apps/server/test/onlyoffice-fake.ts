@@ -1,4 +1,9 @@
-import { callbackOperationId, createCallbackUserdata } from "../src/onlyoffice";
+import {
+  callbackClaim,
+  createOnlyOfficeBodyToken,
+  createOnlyOfficeAuthorization,
+  verifyOnlyOfficeAuthorization,
+} from "../src/onlyoffice";
 
 export type OnlyOfficeFakeScenario =
   | "signed-success"
@@ -84,17 +89,26 @@ export class OnlyOfficeHttpFake {
     if (request.method === "POST" && url.pathname === "/converter") {
       return this.handleConverter(request);
     }
-    if (request.method === "GET" && url.pathname.startsWith("/documents/")) {
-      return new Response(this.document, {
-        headers: {
-          "Content-Type":
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        },
-      });
-    }
-    if (request.method === "GET" && url.pathname.startsWith("/converted/")) {
-      return new Response(this.pdf, {
-        headers: { "Content-Type": "application/pdf" },
+    if (
+      request.method === "GET" &&
+      (url.pathname.startsWith("/documents/") ||
+        url.pathname.startsWith("/converted/"))
+    ) {
+      if (
+        !verifyOnlyOfficeAuthorization(request.headers.get("authorization"), {
+          url: request.url,
+        })
+      ) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+      const body = url.pathname.startsWith("/documents/")
+        ? this.document
+        : this.pdf;
+      const contentType = url.pathname.startsWith("/documents/")
+        ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        : "application/pdf";
+      return new Response(body, {
+        headers: { "Content-Type": contentType },
       });
     }
     return Response.json({ error: "not_found" }, { status: 404 });
@@ -108,6 +122,15 @@ export class OnlyOfficeHttpFake {
         : undefined;
     if (command) {
       this.commands.push(command);
+    }
+    if (
+      !command ||
+      !verifyOnlyOfficeAuthorization(
+        request.headers.get("authorization"),
+        command
+      )
+    ) {
+      return Response.json({ error: "unauthorized" }, { status: 401 });
     }
     if (this.commandScenario === "timeout") {
       await Bun.sleep(this.timeoutMs);
@@ -128,14 +151,12 @@ export class OnlyOfficeHttpFake {
       });
     }
 
-    if (command) {
-      const key = typeof command.key === "string" ? command.key : "";
-      const userdata =
-        typeof command.userdata === "string" ? command.userdata : "";
-      const operationId = callbackOperationId(userdata);
-      if (key && operationId) {
-        this.scheduleCallbacks(key, operationId);
-      }
+    const key = typeof command.key === "string" ? command.key : "";
+    const userdata =
+      typeof command.userdata === "string" ? command.userdata : "";
+    const claim = callbackClaim(userdata);
+    if (key && claim) {
+      this.scheduleCallbacks(key, userdata);
     }
     return Response.json({ error: 0 });
   }
@@ -148,6 +169,15 @@ export class OnlyOfficeHttpFake {
         : undefined;
     if (conversion) {
       this.converters.push(conversion);
+    }
+    if (
+      !conversion ||
+      !verifyOnlyOfficeAuthorization(
+        request.headers.get("authorization"),
+        conversion
+      )
+    ) {
+      return Response.json({ error: "unauthorized" }, { status: 401 });
     }
     if (this.converterScenario === "timeout") {
       await Bun.sleep(this.timeoutMs);
@@ -174,11 +204,11 @@ export class OnlyOfficeHttpFake {
     });
   }
 
-  private scheduleCallbacks(key: string, operationId: string): void {
-    this.pendingCallbacks.add(this.emitCallbacks(key, operationId));
+  private scheduleCallbacks(key: string, userdata: string): void {
+    this.pendingCallbacks.add(this.emitCallbacks(key, userdata));
   }
 
-  private async emitCallbacks(key: string, operationId: string): Promise<void> {
+  private async emitCallbacks(key: string, userdata: string): Promise<void> {
     const scenario = this.callbackScenario;
     if (scenario === "timeout") {
       await Bun.sleep(this.timeoutMs);
@@ -192,7 +222,7 @@ export class OnlyOfficeHttpFake {
       key,
       status: scenario === "explicit-failure" ? 7 : 6,
       url: `${this.url}/documents/${encodeURIComponent(key)}.docx`,
-      userdata: createCallbackUserdata(operationId),
+      userdata,
     };
     if (scenario === "duplicate") {
       await Promise.all([
@@ -211,10 +241,17 @@ export class OnlyOfficeHttpFake {
   }
 
   private async sendCallback(payload: JsonRecord): Promise<void> {
-    this.callbackBodies.push(payload);
+    const callbackPayload = {
+      ...payload,
+      token: createOnlyOfficeBodyToken(payload),
+    };
+    this.callbackBodies.push(callbackPayload);
     await fetch(this.callbackUrl, {
-      body: JSON.stringify(payload),
-      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(callbackPayload),
+      headers: {
+        Authorization: createOnlyOfficeAuthorization(callbackPayload),
+        "Content-Type": "application/json",
+      },
       method: "POST",
     });
   }
