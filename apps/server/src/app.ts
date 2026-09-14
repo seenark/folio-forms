@@ -1,11 +1,12 @@
 // oxlint-disable func-style prefer-destructuring no-await-in-loop no-use-before-define no-nested-ternary complexity no-shadow -- Route modules keep declaration order and sequential persistence invariants.
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import path from "node:path";
 
 import { cors } from "@elysiajs/cors";
 import { auth } from "@onlyoffice/auth";
 import type { OperationType } from "@onlyoffice/db";
 import {
+  AuditOutcome,
   FieldType,
   FormStatus,
   OperationStatus,
@@ -71,7 +72,8 @@ const fallbackTemplatePath = path.resolve(
   import.meta.dirname,
   "../../../onlyoffice-templates/template.docx"
 );
-const idPattern = /^[0-9a-f-]{36}$/iu;
+const idPattern = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
+const accountEmailPattern = /^[^\s@]+@[^\s@]+$/u;
 const operationTimeoutMs = 4 * 60_000;
 const editorLeaseDurationMs = 90_000;
 const callbackClaimLifetimeSeconds = 5 * 60;
@@ -82,6 +84,12 @@ const loginFailureWindowMs = 15 * 60_000;
 const passwordMinimumLength = 12;
 const passwordMaximumLength = 128;
 const maxResponseDataBytes = 256 * 1024;
+const accountUserPageSize = 20;
+const accountBodyMaximumBytes = 64 * 1024;
+const accountEmailMaximumLength = 254;
+const accountNameMaximumLength = 120;
+// ponytail: one global account lock caps mutation throughput; shard locks only if needed.
+const accountMutationLockId = 1_604_619_418;
 const callbackInternalOrigin = originOf(env.ONLYOFFICE_INTERNAL_URL);
 const callbackPublicOrigin = originOf(env.ONLYOFFICE_URL);
 const callbackOrigins = new Set(
@@ -109,6 +117,26 @@ type Actor = Pick<
   Identity,
   "email" | "id" | "mustChangePassword" | "name" | "role"
 >;
+type AccountAuditAction =
+  | "create_user"
+  | "enable_user"
+  | "disable_user"
+  | "change_user_email"
+  | "promote_user"
+  | "demote_user"
+  | "reset_user_password"
+  | "update_user";
+const adminUserSelect = {
+  createdAt: true,
+  email: true,
+  enabled: true,
+  id: true,
+  mustChangePassword: true,
+  name: true,
+  role: true,
+  updatedAt: true,
+} as const;
+type AdminUser = Prisma.UserGetPayload<{ select: typeof adminUserSelect }>;
 interface EditorAuthorization {
   actor: Actor;
   capability: EditorCapabilityClaims | null;
@@ -1019,6 +1047,206 @@ function validateId(value: string, label: string): string {
     fail(404, "not_found", `${label} was not found`);
   }
   return value;
+}
+function queryString(record: JsonRecord, key: string): string | undefined {
+  const value = record[key];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    fail(400, "invalid_request", `${key} must be a string`);
+  }
+  return value;
+}
+function normalizedAccountEmail(value: string): string {
+  const email = normalizeEmail(value);
+  if (
+    email.length > accountEmailMaximumLength ||
+    !accountEmailPattern.test(email)
+  ) {
+    fail(400, "invalid_request", "email must be a valid email address");
+  }
+  return email;
+}
+function accountAuditTargetId(value: string): string | null {
+  return idPattern.test(value) ? value : null;
+}
+
+function accountUserSummary(user: AdminUser): AdminUser {
+  return {
+    createdAt: user.createdAt,
+    email: user.email,
+    enabled: user.enabled,
+    id: user.id,
+    mustChangePassword: user.mustChangePassword,
+    name: user.name,
+    role: user.role,
+    updatedAt: user.updatedAt,
+  };
+}
+
+function generateTemporaryPassword(): string {
+  return randomBytes(24).toString("base64url");
+}
+
+async function lockAccountMutationActor(
+  tx: Prisma.TransactionClient,
+  identity: Identity
+): Promise<void> {
+  const [actor] = await tx.$queryRaw<{ id: string }[]>(
+    Prisma.sql`
+      SELECT "account_actor"."id"
+      FROM "user" AS "account_actor"
+      INNER JOIN "session" AS "account_session"
+        ON "account_session"."user_id" = "account_actor"."id"
+      WHERE
+        "account_actor"."id" = ${identity.id}
+        AND "account_actor"."role" = CAST('admin' AS "UserRole")
+        AND "account_actor"."enabled" = TRUE
+        AND "account_actor"."must_change_password" = FALSE
+        AND "account_session"."id" = ${identity.sessionId}
+        AND "account_session"."expires_at" > NOW()
+      FOR UPDATE OF "account_actor", "account_session"
+    `
+  );
+  if (!actor) {
+    fail(403, "forbidden", "Administrator authorization changed");
+  }
+}
+
+function accountTransaction<T>(
+  identity: Identity,
+  operation: (tx: Prisma.TransactionClient) => Promise<T>
+): Promise<T> {
+  return prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${accountMutationLockId})`;
+    await lockAccountMutationActor(tx, identity);
+    return operation(tx);
+  });
+}
+
+async function lockAccountUser(
+  tx: Prisma.TransactionClient,
+  userId: string
+): Promise<AdminUser> {
+  const [locked] = await tx.$queryRaw<{ id: string }[]>(
+    Prisma.sql`SELECT "id" FROM "user" WHERE "id" = ${userId} FOR UPDATE`
+  );
+  if (!locked) {
+    fail(404, "not_found", "User was not found");
+  }
+  const user = await tx.user.findUnique({
+    select: adminUserSelect,
+    where: { id: userId },
+  });
+  if (!user) {
+    fail(404, "not_found", "User was not found");
+  }
+  return user;
+}
+
+interface AccountAuditMetadata {
+  change?: string;
+  errorCode?: string;
+}
+
+async function createAccountAudit(
+  tx: Prisma.TransactionClient,
+  {
+    action,
+    actorId,
+    outcome,
+    safeMetadata,
+    targetId,
+  }: {
+    action: AccountAuditAction;
+    actorId: string | null;
+    outcome: AuditOutcome;
+    safeMetadata: AccountAuditMetadata;
+    targetId: string | null;
+  }
+): Promise<void> {
+  await tx.auditEvent.create({
+    data: {
+      action,
+      actorId,
+      outcome,
+      safeMetadata: jsonValue(safeMetadata),
+      targetId,
+      targetType: "user",
+    },
+  });
+}
+
+function accountErrorCode(error: unknown): string {
+  if (databaseErrorCode(error) === "P2002") {
+    return "email_in_use";
+  }
+  return error instanceof HttpError ? error.code : "internal_error";
+}
+
+async function createAccountFailureAudit({
+  action,
+  actorId,
+  error,
+  targetId,
+}: {
+  action: AccountAuditAction;
+  actorId: string | null;
+  error: unknown;
+  targetId: string | null;
+}): Promise<void> {
+  await prisma.auditEvent.create({
+    data: {
+      action,
+      actorId,
+      outcome: AuditOutcome.failure,
+      safeMetadata: jsonValue({ errorCode: accountErrorCode(error) }),
+      targetId,
+      targetType: "user",
+    },
+  });
+}
+
+async function withAdminMutation<T>(
+  request: Request,
+  action: AccountAuditAction,
+  targetId: string | null,
+  operation: (
+    identity: Identity,
+    setAction: (action: AccountAuditAction) => void
+  ) => Promise<T>
+): Promise<T> {
+  const identity = await identityFor(request);
+  if (!identity) {
+    fail(401, "unauthorized", "Authentication is required");
+  }
+  requireAdmin(identity);
+  let auditAction = action;
+  try {
+    if (identity.mustChangePassword) {
+      fail(403, "password_change_required", "Password replacement is required");
+    }
+    return await operation(identity, (nextAction) => {
+      auditAction = nextAction;
+    });
+  } catch (error) {
+    const normalizedError =
+      databaseErrorCode(error) === "P2002"
+        ? new HttpError(409, "email_in_use", "Email is already in use")
+        : error;
+    try {
+      await createAccountFailureAudit({
+        action: auditAction,
+        actorId: identity.id,
+        error: normalizedError,
+        targetId,
+      });
+    } catch {
+      // Preserve the route error if the failure audit cannot be persisted.
+    }
+    throw normalizedError;
+  }
 }
 
 function formSummary(form: FormWithDocuments): JsonRecord {
@@ -2308,6 +2536,289 @@ export function createApp(options: AppOptions = {}) {
       });
       return { ok: true };
     })
+    .get("/api/admin/users", async ({ request, query }) => {
+      const identity = await requireIdentity(request);
+      requireAdmin(identity);
+      const queryRecord = query as unknown as JsonRecord;
+      const cursor = queryString(queryRecord, "cursor");
+      const emailQuery = queryString(queryRecord, "email");
+      const roleQuery = queryString(queryRecord, "role");
+      const enabledQuery = queryString(queryRecord, "enabled");
+      if (cursor !== undefined && !idPattern.test(cursor)) {
+        fail(400, "invalid_request", "cursor is invalid");
+      }
+      const email = emailQuery ? normalizeEmail(emailQuery) : undefined;
+      if (email && email.length > accountEmailMaximumLength) {
+        fail(400, "invalid_request", "email filter is too long");
+      }
+      let role: UserRole | undefined;
+      if (roleQuery !== undefined) {
+        if (roleQuery !== "admin" && roleQuery !== "user") {
+          fail(400, "invalid_request", "role must be admin or user");
+        }
+        role = roleQuery;
+      }
+      let enabled: boolean | undefined;
+      if (enabledQuery !== undefined) {
+        if (enabledQuery !== "true" && enabledQuery !== "false") {
+          fail(400, "invalid_request", "enabled must be true or false");
+        }
+        enabled = enabledQuery === "true";
+      }
+      const where: Prisma.UserWhereInput = {};
+      if (cursor) {
+        where.id = { gt: cursor };
+      }
+      if (email) {
+        where.email = { contains: email };
+      }
+      if (role) {
+        where.role = role;
+      }
+      if (enabled !== undefined) {
+        where.enabled = enabled;
+      }
+      const users = await prisma.user.findMany({
+        orderBy: { id: "asc" },
+        select: adminUserSelect,
+        take: accountUserPageSize + 1,
+        where,
+      });
+      const page = users.slice(0, accountUserPageSize);
+      return {
+        nextCursor:
+          users.length > accountUserPageSize ? (page.at(-1)?.id ?? null) : null,
+        users: page.map(accountUserSummary),
+      };
+    })
+    .post(
+      "/api/admin/users",
+      ({ request }) =>
+        withAdminMutation(request, "create_user", null, async (identity) => {
+          const input = await readJsonRecord(request, accountBodyMaximumBytes);
+          const keys = Object.keys(input);
+          if (
+            keys.length !== 3 ||
+            keys.some(
+              (key) => key !== "name" && key !== "email" && key !== "role"
+            )
+          ) {
+            fail(400, "invalid_request", "name, email, and role are required");
+          }
+          const name = requiredString(input, "name");
+          if (name.length > accountNameMaximumLength) {
+            fail(400, "invalid_request", "name is too long");
+          }
+          const email = normalizedAccountEmail(requiredString(input, "email"));
+          const roleValue = requiredString(input, "role");
+          if (roleValue !== "admin" && roleValue !== "user") {
+            fail(400, "invalid_request", "role must be admin or user");
+          }
+          const temporaryPassword = generateTemporaryPassword();
+          const user = await accountTransaction(identity, async (tx) => {
+            const existing = await tx.user.findUnique({
+              select: { id: true },
+              where: { email },
+            });
+            if (existing) {
+              fail(409, "email_in_use", "Email is already in use");
+            }
+            const authContext = await auth.$context;
+            const passwordHash =
+              await authContext.password.hash(temporaryPassword);
+            const userId = crypto.randomUUID();
+            const created = await tx.user.create({
+              data: {
+                accounts: {
+                  create: {
+                    accountId: userId,
+                    id: crypto.randomUUID(),
+                    issuer: "local:credential",
+                    password: passwordHash,
+                    providerId: "credential",
+                  },
+                },
+                email,
+                emailVerified: true,
+                enabled: true,
+                id: userId,
+                mustChangePassword: true,
+                name,
+                role: roleValue,
+              },
+              select: adminUserSelect,
+            });
+            await createAccountAudit(tx, {
+              action: "create_user",
+              actorId: identity.id,
+              outcome: AuditOutcome.success,
+              safeMetadata: { change: "created" },
+              targetId: created.id,
+            });
+            return created;
+          });
+          return {
+            temporaryPassword,
+            user: accountUserSummary(user),
+          };
+        }),
+      { parse: "none" }
+    )
+    .patch(
+      "/api/admin/users/:id",
+      ({ request, params }) =>
+        withAdminMutation(
+          request,
+          "update_user",
+          accountAuditTargetId(params.id),
+          async (identity, setAction) => {
+            const userId = validateId(params.id, "User");
+            const input = await readJsonRecord(
+              request,
+              accountBodyMaximumBytes
+            );
+            const keys = Object.keys(input);
+            const key = keys[0];
+            if (
+              keys.length !== 1 ||
+              (key !== "enabled" && key !== "email" && key !== "role")
+            ) {
+              fail(
+                400,
+                "invalid_request",
+                "Exactly one of enabled, email, or role is required"
+              );
+            }
+            let action: AccountAuditAction = "update_user";
+            let change = "updated";
+            let updateData: Prisma.UserUpdateInput;
+            let newEmail: string | undefined;
+            let revokeSessions = false;
+            if (key === "enabled") {
+              if (typeof input.enabled !== "boolean") {
+                fail(400, "invalid_request", "enabled must be a boolean");
+              }
+              action = input.enabled ? "enable_user" : "disable_user";
+              change = input.enabled ? "enabled" : "disabled";
+              revokeSessions = !input.enabled;
+              updateData = { enabled: input.enabled };
+            } else if (key === "email") {
+              if (typeof input.email !== "string") {
+                fail(400, "invalid_request", "email is required");
+              }
+              newEmail = normalizedAccountEmail(input.email);
+              action = "change_user_email";
+              change = "email_changed";
+              revokeSessions = true;
+              updateData = { email: newEmail };
+            } else {
+              if (input.role !== "admin" && input.role !== "user") {
+                fail(400, "invalid_request", "role must be admin or user");
+              }
+              action = input.role === "admin" ? "promote_user" : "demote_user";
+              change = input.role === "admin" ? "promoted" : "demoted";
+              revokeSessions = true;
+              updateData = { role: input.role };
+            }
+            setAction(action);
+            const user = await accountTransaction(identity, async (tx) => {
+              const target = await lockAccountUser(tx, userId);
+              const removesFinalAdmin =
+                target.role === "admin" &&
+                target.enabled &&
+                (updateData.enabled === false || updateData.role === "user");
+              if (removesFinalAdmin) {
+                const enabledAdminCount = await tx.user.count({
+                  where: { enabled: true, role: "admin" },
+                });
+                if (enabledAdminCount <= 1) {
+                  fail(
+                    409,
+                    "final_admin_required",
+                    "At least one enabled Admin is required"
+                  );
+                }
+              }
+              if (newEmail !== undefined) {
+                const existing = await tx.user.findUnique({
+                  select: { id: true },
+                  where: { email: newEmail },
+                });
+                if (existing && existing.id !== target.id) {
+                  fail(409, "email_in_use", "Email is already in use");
+                }
+              }
+              const updated = await tx.user.update({
+                data: updateData,
+                select: adminUserSelect,
+                where: { id: target.id },
+              });
+              if (revokeSessions) {
+                await tx.session.deleteMany({ where: { userId: target.id } });
+              }
+              await createAccountAudit(tx, {
+                action,
+                actorId: identity.id,
+                outcome: AuditOutcome.success,
+                safeMetadata: { change },
+                targetId: target.id,
+              });
+              return updated;
+            });
+            return { user: accountUserSummary(user) };
+          }
+        ),
+      { parse: "none" }
+    )
+    .post(
+      "/api/admin/users/:id/password-reset",
+      ({ request, params }) =>
+        withAdminMutation(
+          request,
+          "reset_user_password",
+          accountAuditTargetId(params.id),
+          async (identity) => {
+            const userId = validateId(params.id, "User");
+            const temporaryPassword = generateTemporaryPassword();
+            const user = await accountTransaction(identity, async (tx) => {
+              const target = await lockAccountUser(tx, userId);
+              const account = await tx.account.findFirst({
+                where: { providerId: "credential", userId: target.id },
+              });
+              if (!account?.password) {
+                fail(500, "credential_missing", "Credential is unavailable");
+              }
+              const authContext = await auth.$context;
+              const passwordHash =
+                await authContext.password.hash(temporaryPassword);
+              await tx.account.update({
+                data: { password: passwordHash },
+                where: { id: account.id },
+              });
+              const updated = await tx.user.update({
+                data: { mustChangePassword: true },
+                select: adminUserSelect,
+                where: { id: target.id },
+              });
+              await tx.session.deleteMany({ where: { userId: target.id } });
+              await createAccountAudit(tx, {
+                action: "reset_user_password",
+                actorId: identity.id,
+                outcome: AuditOutcome.success,
+                safeMetadata: { change: "password_reset" },
+                targetId: target.id,
+              });
+              return updated;
+            });
+            return {
+              temporaryPassword,
+              user: accountUserSummary(user),
+            };
+          }
+        ),
+      { parse: "none" }
+    )
+
     .post("/api/auth/sign-out", async ({ request }) => {
       const identity = await identityFor(request);
       if (identity) {

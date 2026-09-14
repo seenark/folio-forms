@@ -2150,4 +2150,532 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(await clearedSixthResponse.json()).toMatchObject({
     error: "login_throttled",
   });
+  const accountRequest = (
+    method: string,
+    pathname: string,
+    token: string,
+    body?: Record<string, unknown>
+  ): Promise<Response> => {
+    const headers =
+      body === undefined
+        ? { Authorization: `Bearer ${token}` }
+        : { ...jsonHeaders, Authorization: `Bearer ${token}` };
+    return app.handle(
+      new Request(`http://test.local${pathname}`, {
+        body: body === undefined ? undefined : JSON.stringify(body),
+        headers,
+        method,
+      })
+    );
+  };
+  const sessionStatus = async (token: string): Promise<number> => {
+    const response = await app.handle(
+      new Request("http://test.local/api/session", {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+    );
+    return response.status;
+  };
+
+  const managedEmail = `ticket-07-managed-${crypto.randomUUID()}@example.com`;
+  const managedCreateResponse = await accountRequest(
+    "POST",
+    "/api/admin/users",
+    adminBearer,
+    {
+      email: ` ${managedEmail.toUpperCase()} `,
+      name: "Ticket 07 Managed User",
+      role: "user",
+    }
+  );
+  expect(managedCreateResponse.status).toBe(200);
+  const managedCreateBody = (await managedCreateResponse.json()) as {
+    temporaryPassword?: unknown;
+    user?: Record<string, unknown>;
+  };
+  const managedTemporaryPassword = managedCreateBody.temporaryPassword;
+  const managedUser = managedCreateBody.user;
+  if (
+    typeof managedTemporaryPassword !== "string" ||
+    !managedUser ||
+    typeof managedUser.id !== "string"
+  ) {
+    throw new TypeError("The account creation response was malformed");
+  }
+  const managedId = managedUser.id;
+  expect(Object.keys(managedUser).toSorted()).toEqual([
+    "createdAt",
+    "email",
+    "enabled",
+    "id",
+    "mustChangePassword",
+    "name",
+    "role",
+    "updatedAt",
+  ]);
+  expect(managedUser).toMatchObject({
+    email: managedEmail,
+    enabled: true,
+    mustChangePassword: true,
+    role: "user",
+  });
+  expect(managedTemporaryPassword).toMatch(/^[A-Za-z0-9_-]+$/u);
+  expect(managedTemporaryPassword.length).toBe(32);
+  const managedAccount = await prisma.account.findFirst({
+    where: { providerId: "credential", userId: managedId },
+  });
+  expect(managedAccount?.password).not.toBe(managedTemporaryPassword);
+
+  const cursorSeed = Array.from({ length: 21 }, (_, index) => ({
+    email: `ticket-07-page-${crypto.randomUUID()}-${index}@example.com`,
+    emailVerified: true,
+    id: crypto.randomUUID(),
+    name: `Ticket 07 Page ${index}`,
+    role: "user" as const,
+  }));
+  await prisma.user.createMany({ data: cursorSeed });
+  const firstPageResponse = await accountRequest(
+    "GET",
+    "/api/admin/users",
+    adminBearer
+  );
+  expect(firstPageResponse.status).toBe(200);
+  const firstPageBody = (await firstPageResponse.json()) as {
+    nextCursor?: unknown;
+    users?: Record<string, unknown>[];
+  };
+  if (
+    !Array.isArray(firstPageBody.users) ||
+    typeof firstPageBody.nextCursor !== "string"
+  ) {
+    throw new TypeError("The first account page was malformed");
+  }
+  expect(firstPageBody.users).toHaveLength(20);
+  const firstPageIds = new Set(
+    firstPageBody.users.map((pageUser) => String(pageUser.id))
+  );
+  const secondPageResponse = await accountRequest(
+    "GET",
+    `/api/admin/users?cursor=${encodeURIComponent(firstPageBody.nextCursor)}`,
+    adminBearer
+  );
+  expect(secondPageResponse.status).toBe(200);
+  const secondPageBody = (await secondPageResponse.json()) as {
+    users?: Record<string, unknown>[];
+  };
+  if (!Array.isArray(secondPageBody.users)) {
+    throw new TypeError("The second account page was malformed");
+  }
+  expect(
+    secondPageBody.users.every(
+      (pageUser) => !firstPageIds.has(String(pageUser.id))
+    )
+  ).toBe(true);
+  const invalidCursorResponse = await accountRequest(
+    "GET",
+    "/api/admin/users?cursor=------------------------------------",
+    adminBearer
+  );
+  expect(invalidCursorResponse.status).toBe(400);
+  const normalizedListResponse = await accountRequest(
+    "GET",
+    `/api/admin/users?email=${encodeURIComponent(` ${managedEmail.toUpperCase()} `)}&role=user&enabled=true`,
+    adminBearer
+  );
+  expect(normalizedListResponse.status).toBe(200);
+  const normalizedListBody = (await normalizedListResponse.json()) as {
+    users?: Record<string, unknown>[];
+  };
+  expect(normalizedListBody.users).toHaveLength(1);
+  expect(normalizedListBody.users?.[0]).toMatchObject({
+    email: managedEmail,
+    id: managedId,
+    role: "user",
+  });
+  expect(JSON.stringify(normalizedListBody)).not.toContain(
+    managedTemporaryPassword
+  );
+
+  const managedTemporaryToken = await bearerFor(
+    managedEmail,
+    managedTemporaryPassword,
+    `ticket-07-managed-temporary-${crypto.randomUUID()}`
+  );
+  const managedTemporarySession = await app.handle(
+    new Request("http://test.local/api/session", {
+      headers: { Authorization: `Bearer ${managedTemporaryToken}` },
+    })
+  );
+  expect(managedTemporarySession.status).toBe(200);
+  expect(await managedTemporarySession.json()).toMatchObject({
+    user: { mustChangePassword: true },
+  });
+  const managedPassword = "Ticket07-managed-permanent-password";
+  const managedPasswordChange = await replacePassword(
+    managedTemporaryToken,
+    managedTemporaryPassword,
+    managedPassword
+  );
+  expect(managedPasswordChange.status).toBe(200);
+  expect(await sessionStatus(managedTemporaryToken)).toBe(401);
+  let managedToken = await bearerFor(
+    managedEmail,
+    managedPassword,
+    `ticket-07-managed-live-${crypto.randomUUID()}`
+  );
+
+  const managedDisableResponse = await accountRequest(
+    "PATCH",
+    `/api/admin/users/${managedId}`,
+    adminBearer,
+    { enabled: false }
+  );
+  expect(managedDisableResponse.status).toBe(200);
+  expect(await sessionStatus(managedToken)).toBe(401);
+  const managedEnableResponse = await accountRequest(
+    "PATCH",
+    `/api/admin/users/${managedId}`,
+    adminBearer,
+    { enabled: true }
+  );
+  expect(managedEnableResponse.status).toBe(200);
+  managedToken = await bearerFor(
+    managedEmail,
+    managedPassword,
+    `ticket-07-managed-enabled-${crypto.randomUUID()}`
+  );
+  const changedManagedEmail = `ticket-07-managed-renamed-${crypto.randomUUID()}@example.com`;
+  const managedEmailResponse = await accountRequest(
+    "PATCH",
+    `/api/admin/users/${managedId}`,
+    adminBearer,
+    { email: ` ${changedManagedEmail.toUpperCase()} ` }
+  );
+  expect(managedEmailResponse.status).toBe(200);
+  expect(await sessionStatus(managedToken)).toBe(401);
+  managedToken = await bearerFor(
+    changedManagedEmail,
+    managedPassword,
+    `ticket-07-managed-renamed-${crypto.randomUUID()}`
+  );
+  const managedPromoteResponse = await accountRequest(
+    "PATCH",
+    `/api/admin/users/${managedId}`,
+    adminBearer,
+    { role: "admin" }
+  );
+  expect(managedPromoteResponse.status).toBe(200);
+  expect(await sessionStatus(managedToken)).toBe(401);
+  const promotedManagedToken = await bearerFor(
+    changedManagedEmail,
+    managedPassword,
+    `ticket-07-managed-promoted-${crypto.randomUUID()}`
+  );
+  const promotedListResponse = await accountRequest(
+    "GET",
+    "/api/admin/users",
+    promotedManagedToken
+  );
+  expect(promotedListResponse.status).toBe(200);
+  const managedDemoteResponse = await accountRequest(
+    "PATCH",
+    `/api/admin/users/${managedId}`,
+    adminBearer,
+    { role: "user" }
+  );
+  expect(managedDemoteResponse.status).toBe(200);
+  expect(await sessionStatus(promotedManagedToken)).toBe(401);
+  managedToken = await bearerFor(
+    changedManagedEmail,
+    managedPassword,
+    `ticket-07-managed-demoted-${crypto.randomUUID()}`
+  );
+
+  const managedResetResponse = await accountRequest(
+    "POST",
+    `/api/admin/users/${managedId}/password-reset`,
+    adminBearer
+  );
+  expect(managedResetResponse.status).toBe(200);
+  const managedResetBody = (await managedResetResponse.json()) as {
+    temporaryPassword?: unknown;
+    user?: Record<string, unknown>;
+  };
+  if (
+    typeof managedResetBody.temporaryPassword !== "string" ||
+    !managedResetBody.user
+  ) {
+    throw new Error("The password reset response was malformed");
+  }
+  const resetTemporaryPassword = managedResetBody.temporaryPassword;
+  expect(resetTemporaryPassword).not.toBe(managedTemporaryPassword);
+  expect(managedResetBody.user).toMatchObject({
+    id: managedId,
+    mustChangePassword: true,
+    role: "user",
+  });
+  expect(await sessionStatus(managedToken)).toBe(401);
+  const resetTemporaryToken = await bearerFor(
+    changedManagedEmail,
+    resetTemporaryPassword,
+    `ticket-07-managed-reset-${crypto.randomUUID()}`
+  );
+  expect(await sessionStatus(resetTemporaryToken)).toBe(200);
+  const resetPassword = "Ticket07-managed-reset-permanent-password";
+  const resetPasswordChange = await replacePassword(
+    resetTemporaryToken,
+    resetTemporaryPassword,
+    resetPassword
+  );
+  expect(resetPasswordChange.status).toBe(200);
+  expect(await sessionStatus(resetTemporaryToken)).toBe(401);
+  managedToken = await bearerFor(
+    changedManagedEmail,
+    resetPassword,
+    `ticket-07-managed-reset-live-${crypto.randomUUID()}`
+  );
+
+  const duplicateCreateResponse = await accountRequest(
+    "POST",
+    "/api/admin/users",
+    adminBearer,
+    {
+      email: ` ${changedManagedEmail.toUpperCase()} `,
+      name: "Ticket 07 Duplicate",
+      role: "user",
+    }
+  );
+  expect(duplicateCreateResponse.status).toBe(409);
+  expect(await duplicateCreateResponse.json()).toMatchObject({
+    error: "email_in_use",
+  });
+  const malformedPatchResponse = await accountRequest(
+    "PATCH",
+    `/api/admin/users/${managedId}`,
+    adminBearer,
+    { email: "another@example.com", role: "user" }
+  );
+  expect(malformedPatchResponse.status).toBe(400);
+  expect(await malformedPatchResponse.json()).toMatchObject({
+    error: "invalid_request",
+  });
+  const unknownResetResponse = await accountRequest(
+    "POST",
+    `/api/admin/users/${crypto.randomUUID()}/password-reset`,
+    adminBearer
+  );
+  expect(unknownResetResponse.status).toBe(404);
+  const invalidTargetSecret = `ticket-07-target-secret-${crypto.randomUUID()}`;
+  const invalidTargetResponse = await accountRequest(
+    "POST",
+    `/api/admin/users/${encodeURIComponent(invalidTargetSecret)}/password-reset`,
+    adminBearer
+  );
+  expect(invalidTargetResponse.status).toBe(404);
+  const userForbiddenResponse = await accountRequest(
+    "POST",
+    "/api/admin/users",
+    managedToken,
+    {
+      email: `ticket-07-forbidden-${crypto.randomUUID()}@example.com`,
+      name: "Ticket 07 Forbidden",
+      role: "user",
+    }
+  );
+  expect(userForbiddenResponse.status).toBe(403);
+  expect(await userForbiddenResponse.json()).toMatchObject({
+    error: "forbidden",
+  });
+
+  const provisionAdmin = async (label: string) => {
+    const email = `ticket-07-${label}-${crypto.randomUUID()}@example.com`;
+    const provisionResponse = await accountRequest(
+      "POST",
+      "/api/admin/users",
+      adminBearer,
+      { email, name: `Ticket 07 ${label}`, role: "admin" }
+    );
+    expect(provisionResponse.status).toBe(200);
+    const body = (await provisionResponse.json()) as {
+      temporaryPassword?: unknown;
+      user?: Record<string, unknown>;
+    };
+    if (
+      typeof body.temporaryPassword !== "string" ||
+      !body.user ||
+      typeof body.user.id !== "string"
+    ) {
+      throw new Error("The Admin provisioning response was malformed");
+    }
+    const temporaryToken = await bearerFor(
+      email,
+      body.temporaryPassword,
+      `ticket-07-${label}-temporary-${crypto.randomUUID()}`
+    );
+    const newPassword = `Ticket07-${label}-permanent-password`;
+    const passwordChange = await replacePassword(
+      temporaryToken,
+      body.temporaryPassword,
+      newPassword
+    );
+    expect(passwordChange.status).toBe(200);
+    return {
+      email,
+      id: body.user.id,
+      password: newPassword,
+      temporaryPassword: body.temporaryPassword,
+      token: await bearerFor(
+        email,
+        newPassword,
+        `ticket-07-${label}-live-${crypto.randomUUID()}`
+      ),
+    };
+  };
+  const authorityAdminA = await provisionAdmin("authority-a");
+  const authorityAdminB = await provisionAdmin("authority-b");
+  const authorityListResponses = await Promise.all([
+    accountRequest("GET", "/api/admin/users", authorityAdminA.token),
+    accountRequest("GET", "/api/admin/users", authorityAdminB.token),
+  ]);
+  expect(authorityListResponses.map((response) => response.status)).toEqual([
+    200, 200,
+  ]);
+  const enabledAdminsBeforeRace = await prisma.user.findMany({
+    select: { id: true },
+    where: { enabled: true, role: "admin" },
+  });
+  for (const existingAdmin of enabledAdminsBeforeRace) {
+    if (
+      existingAdmin.id === authorityAdminA.id ||
+      existingAdmin.id === authorityAdminB.id
+    ) {
+      continue;
+    }
+    const demoteResponse = await accountRequest(
+      "PATCH",
+      `/api/admin/users/${existingAdmin.id}`,
+      authorityAdminA.token,
+      { role: "user" }
+    );
+    expect(demoteResponse.status).toBe(200);
+  }
+  expect(
+    await prisma.user.count({ where: { enabled: true, role: "admin" } })
+  ).toBe(2);
+  const [disableRaceResponse, demoteRaceResponse] = await Promise.all([
+    accountRequest(
+      "PATCH",
+      `/api/admin/users/${authorityAdminA.id}`,
+      authorityAdminA.token,
+      { enabled: false }
+    ),
+    accountRequest(
+      "PATCH",
+      `/api/admin/users/${authorityAdminB.id}`,
+      authorityAdminB.token,
+      { role: "user" }
+    ),
+  ]);
+  expect(
+    [disableRaceResponse.status, demoteRaceResponse.status].toSorted()
+  ).toEqual([200, 409]);
+  expect(
+    [disableRaceResponse, demoteRaceResponse].some(
+      (response) => response.status === 409
+    )
+  ).toBe(true);
+  const raceBodies = await Promise.all([
+    disableRaceResponse.json(),
+    demoteRaceResponse.json(),
+  ]);
+  expect(
+    raceBodies.some(
+      (body) =>
+        (body as Record<string, unknown>).error === "final_admin_required"
+    )
+  ).toBe(true);
+  expect(
+    await prisma.user.count({ where: { enabled: true, role: "admin" } })
+  ).toBe(1);
+  if (disableRaceResponse.status === 200) {
+    expect(await sessionStatus(authorityAdminA.token)).toBe(401);
+    expect(await sessionStatus(authorityAdminB.token)).toBe(200);
+  } else {
+    expect(await sessionStatus(authorityAdminA.token)).toBe(200);
+    expect(await sessionStatus(authorityAdminB.token)).toBe(401);
+  }
+
+  const accountAuditEvents = await prisma.auditEvent.findMany({
+    orderBy: { createdAt: "asc" },
+    where: { targetType: "user" },
+  });
+  const auditText = JSON.stringify(accountAuditEvents);
+  for (const secret of [
+    managedTemporaryPassword,
+    resetTemporaryPassword,
+    authorityAdminA.temporaryPassword,
+    authorityAdminB.temporaryPassword,
+    managedPassword,
+    resetPassword,
+    authorityAdminA.password,
+    authorityAdminB.password,
+    invalidTargetSecret,
+  ]) {
+    expect(auditText).not.toContain(secret);
+  }
+  for (const event of accountAuditEvents) {
+    const metadata =
+      event.safeMetadata &&
+      typeof event.safeMetadata === "object" &&
+      !Array.isArray(event.safeMetadata)
+        ? (event.safeMetadata as Record<string, unknown>)
+        : null;
+    expect(
+      Object.keys(metadata ?? {}).every(
+        (key) => key === "change" || key === "errorCode"
+      )
+    ).toBe(true);
+  }
+  const managedAuditActions = new Set(
+    accountAuditEvents
+      .filter((event) => event.targetId === managedId)
+      .map((event) => event.action)
+  );
+  for (const action of [
+    "create_user",
+    "enable_user",
+    "disable_user",
+    "change_user_email",
+    "promote_user",
+    "demote_user",
+    "reset_user_password",
+  ]) {
+    expect(managedAuditActions.has(action)).toBe(true);
+  }
+  expect(
+    accountAuditEvents.some(
+      (event) =>
+        event.action === "create_user" &&
+        event.outcome === "failure" &&
+        (event.safeMetadata as Record<string, unknown> | null)?.errorCode ===
+          "email_in_use"
+    )
+  ).toBe(true);
+  expect(
+    accountAuditEvents.some(
+      (event) =>
+        event.outcome === "failure" &&
+        (event.safeMetadata as Record<string, unknown> | null)?.errorCode ===
+          "final_admin_required"
+    )
+  ).toBe(true);
+  expect(
+    accountAuditEvents.some(
+      (event) =>
+        event.action === "update_user" &&
+        event.outcome === "failure" &&
+        (event.safeMetadata as Record<string, unknown> | null)?.errorCode ===
+          "invalid_request"
+    )
+  ).toBe(true);
 });

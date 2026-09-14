@@ -115,13 +115,18 @@ docker compose --env-file apps/server/.env -f compose.yaml up -d --build server
 
 ### 2.1 Application accounts
 
-การติดตั้งใหม่สร้าง Admin คนแรกจากค่า bootstrap เมื่อยังไม่มี Admin เท่านั้น หลังจากนั้น Admin สร้างและจัดการบัญชีทั้งหมด ระบบไม่มี public sign-up, บัญชี demo หรือรหัสผ่านคงที่
+การติดตั้งใหม่สร้าง Admin คนแรกจากค่า bootstrap เมื่อยังไม่มี Admin เท่านั้น หลังจากนั้น Admin สร้างและจัดการบัญชีทั้งหมด ระบบไม่มี public sign-up, บัญชี demo หรือรหัสผ่านคงที่ เปิด `/admin/users` เพื่อค้นหาด้วยอีเมลที่ normalize แล้ว กรองตาม Role/สถานะ และเปิดหน้าถัดไปแบบ cursor Admin ทุกคนมีสิทธิ์จัดการบัญชีเท่ากัน แต่ระบบจะปฏิเสธคำขอที่ทำให้ไม่เหลือ Admin ที่เปิดใช้งาน
+
+เมื่อสร้างบัญชีหรือ Reset password เซิร์ฟเวอร์จะสุ่มรหัสผ่านชั่วคราวอย่างน้อย 20 ตัวอักษรและแสดงในผลลัพธ์ครั้งเดียวเท่านั้น ผู้รับต้องเปลี่ยนรหัสผ่านก่อนใช้ส่วนอื่นของระบบ การ Disable, เปลี่ยนอีเมล, เปลี่ยน Role หรือ Reset password จะ revoke Session ทั้งหมดของบัญชีนั้นทันที
+
+ทุกความพยายามจัดการบัญชีจะเพิ่ม Audit Event แบบ immutable พร้อมผู้กระทำ เป้าหมาย เวลา Action และ Outcome โดยไม่เก็บรหัสผ่าน, password hash, token หรือ credential material
 
 ### 2.2 สิทธิ์ของแต่ละ Role
 
 #### Admin
 
 - เข้า `/admin`
+- จัดการบัญชีที่ `/admin/users`
 - สร้าง Form ใหม่
 - ลบ Form ที่ยังเป็น Draft และยังไม่มี Response
 - แก้ไข DOCX Template
@@ -157,6 +162,7 @@ user          email, name และ role
 account       Better Auth credential และ password hash
 session       session token และวันหมดอายุ
 verification  ข้อมูล verification
+audit_events  ผู้กระทำ เป้าหมาย Action, Outcome และ metadata ที่ไม่มี secret
 ```
 
 Password จริงในฐานข้อมูลถูกจัดการโดย Better Auth ไม่ได้เก็บเป็น Plain Text
@@ -188,6 +194,9 @@ Share Link เป็น opaque public ID ที่ระบบสร้างใ
 1. เปิด `http://localhost:5173/login`
 2. Login ด้วยบัญชีที่ถูก provision เป็น role `Admin`
 3. ระบบจะพาไปที่ `/admin`
+
+หากต้องจัดการบัญชี ให้เปิดเมนู **ผู้ใช้** หรือ `/admin/users` หน้าเดียวกันรองรับการสร้างบัญชี แก้ไขอีเมล เปิด/ปิดบัญชี Promote/Demote และ Reset password คัดลอกรหัสผ่านชั่วคราวจากผลลัพธ์ก่อนเปลี่ยนหน้า เพราะ API จะไม่ส่งค่านั้นซ้ำ
+
 4. กด **New form**
 5. กรอก Title และ Description
 6. กด **Create draft**
@@ -246,6 +255,7 @@ Admin จะสามารถดูข้อมูล, เปิด Receipt แ
 | `http://localhost:5173/login` | Login |
 | `http://localhost:5173/dashboard` | Dashboard ของ User |
 | `http://localhost:5173/admin` | Dashboard ของ Admin |
+| `http://localhost:5173/admin/users` | จัดการบัญชี User และ Admin |
 | `http://localhost:5173/admin/forms/new` | สร้าง Form |
 | `http://localhost:3000/health` | ตรวจ API |
 | `http://localhost:8080` | ONLYOFFICE Document Server |

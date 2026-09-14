@@ -43,6 +43,27 @@ export interface SignInResponse {
 export interface PasswordReplacementResponse {
   ok: true;
 }
+export interface AdminUser {
+  id: string;
+  name: string;
+  email: string;
+  role: Role;
+  enabled: boolean;
+  mustChangePassword: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface AdminUserListResponse {
+  users: AdminUser[];
+  nextCursor: string | null;
+}
+export interface AdminUserMutationResponse {
+  user: AdminUser;
+}
+export interface AdminUserCredentialResponse extends AdminUserMutationResponse {
+  temporaryPassword: string;
+}
+
 export interface FormSummary {
   id: string;
   publicId?: string;
@@ -232,6 +253,11 @@ export const apiPost = <T>(
       ? { "X-Editor-Capability": editorCapability }
       : undefined,
     method: "POST",
+  });
+export const apiPatch = <T>(path: string, body?: unknown) =>
+  request<T>(path, {
+    body: JSON.stringify(body ?? {}),
+    method: "PATCH",
   });
 export const apiDelete = <T>(path: string) =>
   request<T>(path, { method: "DELETE" });

@@ -63,7 +63,7 @@ Replace `BETTER_AUTH_SECRET`, `EDITOR_CAPABILITY_SECRET`, and `ONLYOFFICE_JWT_SE
 
 For the first startup when no Admin exists, set all three `BOOTSTRAP_ADMIN_NAME`, `BOOTSTRAP_ADMIN_EMAIL`, and `BOOTSTRAP_ADMIN_PASSWORD` values in `apps/server/.env`. Together they create the first `Admin` only; the password must be 12–128 characters. The bootstrapped credential forces a password replacement on first successful entry. Remove all three variables after that entry. Do not commit `.env` or put a usable password in `.env.example`.
 
-There is no public registration or direct signup. Later accounts are provisioned by authenticated Admins, and later startups never mutate an existing Admin.
+There is no public registration or direct signup. Later accounts are provisioned by authenticated Admins, and later startups never mutate an existing Admin. Admins manage accounts at `/admin/users`. Creation and reset disclose a server-generated temporary password once; the account must replace it at the next sign-in. Disabling an account, changing its email or role, and resetting its password revoke every active Session.
 
 Canonical Template and Response DOCX objects live in the private RustFS bucket. Database rows store opaque object keys; browsers and ONLYOFFICE read them only through short-lived API authorization.
 
@@ -107,6 +107,7 @@ Main screens:
 - `/login` — sign in.
 - `/dashboard` — user responses and draft resume links.
 - `/admin` — admin form list.
+- `/admin/users` — search, provision, and administer accounts.
 - `/admin/forms/new` — create a form.
 - `/admin/forms/:formId` — edit and publish a DOCX template.
 - `/admin/forms/:formId/submissions` — inspect submissions for a form.
@@ -151,6 +152,12 @@ docker compose --env-file apps/server/.env -f compose.yaml logs --tail=100 serve
 The Compose file intentionally uses local development credentials and networking. See [Production hardening](#production-hardening).
 
 ## Roles and workflow
+
+### Account administration
+
+Every Admin has the same account authority. Use `/admin/users` to search by normalized email, filter by role or enabled state, provision an account, correct its email, enable or disable access, change its role, or reset its password. Creation and reset show a generated temporary password only in that response; copy it before leaving the result. The final enabled Admin cannot be disabled or demoted.
+
+Each privileged account attempt appends an immutable Audit Event with its actor, target, action, outcome, and safe metadata. Passwords, hashes, tokens, and other credential material are excluded.
 
 ### Admin workflow
 
@@ -245,6 +252,8 @@ operations/<operationId>/<kind>/<uuid>/docx
 - ONLYOFFICE Document Server uses `ONLYOFFICE_JWT_SECRET` for signed editor configuration, command/conversion requests, private document downloads, and callbacks. It never accepts a Better Auth Session or editor capability at that boundary.
 - Each session expires one hour after issuance; sessions do not refresh or slide. The client clears the token at expiry and warns during the final five minutes.
 - Logout and password replacement revoke sessions immediately. Password replacement revokes every session, so the Admin must sign in again.
+- Admin account creation, disablement, email/role changes, and password resets are attributable Audit Events. Account disablement and credential or identity changes revoke all target Sessions immediately.
+- A serialized database invariant prevents concurrent requests from disabling or demoting the final enabled Admin.
 - The server derives identity and role from Better Auth, never from client-supplied role fields.
 - Admin routes require the `admin` role.
 - User response and submission routes enforce ownership.
@@ -293,6 +302,15 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 | `POST` | `/api/forms/:publicId/submit` | Submit a response through an asynchronous operation |
 | `GET` | `/api/responses/me` | List the current user's responses |
 | `GET` | `/api/operations/:id` | Poll an owned or Admin operation |
+
+### Admin account operations
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/admin/users` | Cursor-page and filter accounts by normalized email, role, and enabled state |
+| `POST` | `/api/admin/users` | Provision an account and disclose its temporary password once |
+| `PATCH` | `/api/admin/users/:id` | Enable/disable or change one email/role value and revoke affected Sessions |
+| `POST` | `/api/admin/users/:id/password-reset` | Rotate the credential, revoke Sessions, and disclose a temporary password once |
 
 ### Admin form operations
 

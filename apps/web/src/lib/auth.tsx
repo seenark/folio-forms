@@ -16,6 +16,7 @@ interface AuthContextValue {
   loading: boolean;
   error: string | null;
   expiresAt: string | null;
+  clearSession: () => void;
   signIn: (email: string, password: string) => Promise<SessionUser>;
   replacePassword: (
     currentPassword: string,
@@ -174,15 +175,21 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     }
   };
 
-  const signOut = async () => {
-    await requestSignOut();
+  const clearSession = () => {
+    clearToken();
     setUser(null);
     setExpiresAt(null);
+  };
+
+  const signOut = async () => {
+    await requestSignOut();
+    clearSession();
   };
 
   return (
     <AuthContext.Provider
       value={{
+        clearSession,
         error,
         expiresAt,
         loading,

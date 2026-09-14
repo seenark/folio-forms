@@ -1,4 +1,4 @@
-import { Link, useNavigate } from "@tanstack/react-router";
+import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 import {
   FilePlus2,
   FileText,
@@ -7,6 +7,7 @@ import {
   Menu,
   ShieldCheck,
   UserRound,
+  UsersRound,
   X,
 } from "lucide-react";
 import { useState } from "react";
@@ -20,7 +21,11 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
   const [loggingOut, setLoggingOut] = useState(false);
   const [open, setOpen] = useState(false);
   const navigate = useNavigate();
+  const location = useLocation();
   const role = roleFor(user);
+  const formsAreActive =
+    location.pathname === "/admin" ||
+    location.pathname.startsWith("/admin/forms/");
 
   const logout = async () => {
     if (loggingOut) {
@@ -77,13 +82,27 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
               <>
                 <Link
                   to="/admin"
+                  className={`rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] ${
+                    formsAreActive
+                      ? "bg-[var(--accent-soft)] text-[var(--ink)]"
+                      : ""
+                  }`}
+                  activeOptions={{ exact: true }}
+                  aria-current={formsAreActive ? "page" : undefined}
+                  onClick={() => setOpen(false)}
+                >
+                  Forms
+                </Link>
+                <Link
+                  to="/admin/users"
                   className="rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)]"
                   activeProps={{
                     className: "bg-[var(--accent-soft)] text-[var(--ink)]",
                   }}
                   onClick={() => setOpen(false)}
                 >
-                  Forms
+                  <UsersRound className="mr-1 inline" size={15} />
+                  จัดการผู้ใช้
                 </Link>
                 <Link
                   to="/admin/forms/new"
