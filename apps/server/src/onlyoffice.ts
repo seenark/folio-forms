@@ -198,73 +198,122 @@ export function editorConfig(
   };
 }
 
-export async function forceSave(
+export interface OnlyOfficeClient {
+  forceSave: (documentKey: string, userdata: string) => Promise<boolean>;
+  convertDocxToPdf: (documentKey: string) => Promise<Uint8Array>;
+}
+
+export interface OnlyOfficeClientOptions {
+  fetch?: typeof fetch;
+  internalUrl?: string;
+  documentBaseUrl?: string;
+}
+
+function documentUrlFor(documentKey: string, baseUrl: string): string {
+  const token = createDocumentAccessToken(documentKey);
+  return `${trimOrigin(baseUrl)}/onlyoffice/document/${encodeURIComponent(documentKey)}?token=${encodeURIComponent(token)}`;
+}
+
+function converterResponseError(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object" || !("error" in payload)) {
+    return null;
+  }
+  const { error } = payload;
+  if (error === undefined || error === 0) {
+    return null;
+  }
+  return `ONLYOFFICE conversion failed (${String(error)})`;
+}
+
+export function createOnlyOfficeClient(
+  options: OnlyOfficeClientOptions = {}
+): OnlyOfficeClient {
+  const request = options.fetch ?? fetch;
+  const internalUrl = options.internalUrl ?? env.ONLYOFFICE_INTERNAL_URL;
+  const documentBaseUrl =
+    options.documentBaseUrl ?? env.ONLYOFFICE_DOCUMENT_BASE_URL;
+
+  return {
+    async convertDocxToPdf(documentKey): Promise<Uint8Array> {
+      const endpoint = `${trimOrigin(internalUrl)}/converter`;
+      const response = await request(endpoint, {
+        body: JSON.stringify({
+          async: false,
+          filetype: "docx",
+          key: documentKey,
+          outputtype: "pdf",
+          title: `${documentKey}.docx`,
+          url: documentUrlFor(documentKey, documentBaseUrl),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      if (!response.ok) {
+        throw new Error(
+          `ONLYOFFICE converter returned HTTP ${response.status}`
+        );
+      }
+
+      const payload = (await response.json()) as ConverterResponse;
+      const conversionError = converterResponseError(payload);
+      if (conversionError) {
+        throw new Error(conversionError);
+      }
+      const outputUrl = payload.fileUrl ?? payload.url;
+      if (!outputUrl) {
+        throw new Error("ONLYOFFICE conversion did not return a PDF URL");
+      }
+
+      const pdfResponse = await request(outputUrl);
+      if (!pdfResponse.ok) {
+        throw new Error(
+          `Failed to download converted PDF: HTTP ${pdfResponse.status}`
+        );
+      }
+      return new Uint8Array(await pdfResponse.arrayBuffer());
+    },
+
+    async forceSave(documentKey, userdata): Promise<boolean> {
+      const endpoint = `${trimOrigin(internalUrl)}/command?shardkey=${encodeURIComponent(documentKey)}`;
+      const response = await request(endpoint, {
+        body: JSON.stringify({ c: "forcesave", key: documentKey, userdata }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      if (!response.ok) {
+        throw new Error(
+          `ONLYOFFICE command service returned HTTP ${response.status}`
+        );
+      }
+      const payload: unknown = await response.json();
+      if (!payload || typeof payload !== "object") {
+        throw new Error("ONLYOFFICE command service returned invalid JSON");
+      }
+      const error = "error" in payload ? payload.error : undefined;
+      if (error === 4) {
+        return false;
+      }
+      if (error !== undefined && error !== 0) {
+        const message =
+          "message" in payload && typeof payload.message === "string"
+            ? payload.message
+            : `ONLYOFFICE command failed (${String(error)})`;
+        throw new Error(message);
+      }
+      return true;
+    },
+  };
+}
+
+const defaultOnlyOfficeClient = createOnlyOfficeClient();
+
+export function forceSave(
   documentKey: string,
   userdata: string
 ): Promise<boolean> {
-  const endpoint = `${trimOrigin(env.ONLYOFFICE_INTERNAL_URL)}/command?shardkey=${encodeURIComponent(documentKey)}`;
-  const response = await fetch(endpoint, {
-    body: JSON.stringify({ c: "forcesave", key: documentKey, userdata }),
-    headers: { "Content-Type": "application/json" },
-    method: "POST",
-  });
-  if (!response.ok) {
-    throw new Error(
-      `ONLYOFFICE command service returned HTTP ${response.status}`
-    );
-  }
-  const payload: unknown = await response.json();
-  if (!payload || typeof payload !== "object") {
-    throw new Error("ONLYOFFICE command service returned invalid JSON");
-  }
-  const error = "error" in payload ? payload.error : undefined;
-  if (error === 4) {
-    return false;
-  }
-  if (error !== undefined && error !== 0) {
-    const message =
-      "message" in payload && typeof payload.message === "string"
-        ? payload.message
-        : `ONLYOFFICE command failed (${String(error)})`;
-    throw new Error(message);
-  }
-  return true;
+  return defaultOnlyOfficeClient.forceSave(documentKey, userdata);
 }
 
-export async function convertDocxToPdf(
-  documentKey: string
-): Promise<Uint8Array> {
-  const endpoint = `${trimOrigin(env.ONLYOFFICE_INTERNAL_URL)}/converter`;
-  const response = await fetch(endpoint, {
-    body: JSON.stringify({
-      async: false,
-      filetype: "docx",
-      key: documentKey,
-      outputtype: "pdf",
-      title: `${documentKey}.docx`,
-      url: documentUrl(documentKey),
-    }),
-    headers: { "Content-Type": "application/json" },
-    method: "POST",
-  });
-  if (!response.ok) {
-    throw new Error(`ONLYOFFICE converter returned HTTP ${response.status}`);
-  }
-
-  const payload = (await response.json()) as ConverterResponse;
-  if (payload.error !== undefined && payload.error !== 0) {
-    throw new Error(`ONLYOFFICE conversion failed (${payload.error})`);
-  }
-  const outputUrl = payload.fileUrl ?? payload.url;
-  if (!outputUrl) {
-    throw new Error("ONLYOFFICE conversion did not return a PDF URL");
-  }
-
-  const pdfResponse = await fetch(outputUrl);
-  if (!pdfResponse.ok) {
-    throw new Error(
-      `Failed to download converted PDF: HTTP ${pdfResponse.status}`
-    );
-  }
-  return new Uint8Array(await pdfResponse.arrayBuffer());
+export function convertDocxToPdf(documentKey: string): Promise<Uint8Array> {
+  return defaultOnlyOfficeClient.convertDocxToPdf(documentKey);
 }

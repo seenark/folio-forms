@@ -9,7 +9,8 @@
     "db:migrate": "bun run ../../packages/db/src/migrate-cli.ts",
     "db:seed": "bun run src/seed.ts",
     "dev": "bun run --hot src/index.ts",
-    "start": "bun run dist/index.mjs"
+    "start": "bun run dist/index.mjs",
+    "test:http": "test -n \"$DATABASE_URL\" || (echo 'DATABASE_URL must point to an isolated PostgreSQL database' >&2; exit 1); bun test test/http.test.ts"
   },
   "dependencies": {
     "@elysiajs/cors": "^1.4.2",

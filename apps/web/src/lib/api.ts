@@ -3,6 +3,24 @@ export const API_ORIGIN =
   import.meta.env.VITE_API_ORIGIN ?? "http://localhost:3000";
 export const SESSION_KEY = "onlyoffice.sessionToken";
 
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+interface ApiErrorBody {
+  error?: unknown;
+  message?: unknown;
+  code?: unknown;
+}
+
 export type Role = "admin" | "user";
 export interface SessionUser {
   id: string;
@@ -80,35 +98,38 @@ const request = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
   }
   const response = await fetch(`${API_ORIGIN}${path}`, { ...init, headers });
   const text = await response.text();
-  let body: { error?: string; message?: string } | T | null = null;
+  let body: ApiErrorBody | T | string | null = null;
   if (text) {
     try {
-      body = JSON.parse(text) as { error?: string; message?: string } | T;
+      body = JSON.parse(text) as ApiErrorBody | T;
     } catch {
-      body = text as unknown as T;
+      body = text;
     }
   }
   if (!response.ok) {
     const fallbackMessage = `Request failed (${response.status})`;
+    const errorBody =
+      body && typeof body === "object" ? (body as ApiErrorBody) : undefined;
+    const {
+      code: bodyCode,
+      error: bodyError,
+      message: bodyMessage,
+    } = errorBody ?? {};
     let errorMessage = fallbackMessage;
-    if (
-      body &&
-      typeof body === "object" &&
-      "message" in body &&
-      typeof body.message === "string"
-    ) {
-      errorMessage = body.message;
-    } else if (
-      body &&
-      typeof body === "object" &&
-      "error" in body &&
-      typeof body.error === "string"
-    ) {
-      errorMessage = body.error;
+    if (typeof bodyMessage === "string") {
+      errorMessage = bodyMessage;
+    } else if (typeof bodyError === "string") {
+      errorMessage = bodyError;
     } else if (typeof body === "string") {
       errorMessage = body;
     }
-    throw new Error(errorMessage);
+    let code = "request_failed";
+    if (typeof bodyError === "string") {
+      code = bodyError;
+    } else if (typeof bodyCode === "string") {
+      code = bodyCode;
+    }
+    throw new ApiError(response.status, code, errorMessage);
   }
   return body as T;
 };
@@ -125,7 +146,11 @@ export const downloadArtifact = async (path: string, filename: string) => {
     headers: token ? { Authorization: `Bearer ${token}` } : undefined,
   });
   if (!response.ok) {
-    throw new Error(`Download failed (${response.status})`);
+    throw new ApiError(
+      response.status,
+      "download_failed",
+      `Download failed (${response.status})`
+    );
   }
   const blob = await response.blob();
   const href = URL.createObjectURL(blob);
@@ -146,6 +171,8 @@ export const signIn = async (email: string, password: string) => {
   });
   let body: {
     error?: string;
+    code?: string;
+    message?: string;
     token?: string;
     session?: { token?: string };
     user?: SessionUser;
@@ -153,6 +180,8 @@ export const signIn = async (email: string, password: string) => {
   try {
     body = (await response.json()) as {
       error?: string;
+      code?: string;
+      message?: string;
       token?: string;
       session?: { token?: string };
       user?: SessionUser;
@@ -161,7 +190,10 @@ export const signIn = async (email: string, password: string) => {
     body = null;
   }
   if (!response.ok) {
-    throw new Error(body?.error ?? `Request failed (${response.status})`);
+    const errorMessage =
+      body?.error ?? body?.message ?? `Request failed (${response.status})`;
+    const code = body?.error ?? body?.code ?? "sign_in_failed";
+    throw new ApiError(response.status, code, errorMessage);
   }
   const headerToken = response.headers
     .get("set-auth-token")
