@@ -240,7 +240,8 @@ operations/<operationId>/<kind>/<uuid>/docx
 - Sessions use opaque Better Auth tokens, not JWTs.
 - The frontend sends `Authorization: Bearer <session-token>`.
 - The local web app stores the token at `localStorage["onlyoffice.sessionToken"]`.
-- The browser Session token and editor capabilities are never included in the signed ONLYOFFICE or plugin configuration. Before each action, the browser parent obtains a fresh five-minute capability bound to the actor, role, Form, document target, and one action, then sends only that capability over the source/origin-pinned bridge.
+- Opening an editor configuration atomically claims or renews a 90-second lease for that Template Draft or Response under the live browser Session. A competing Session receives no editable configuration until the holder releases the lease or it expires.
+- The browser Session token and editor capabilities are never included in the signed ONLYOFFICE or plugin configuration. Before each action, the browser parent obtains a fresh five-minute capability bound to the actor, role, Form, document target, action, and active lease, then sends only that capability over the source/origin-pinned bridge.
 - ONLYOFFICE Document Server uses `ONLYOFFICE_JWT_SECRET` for signed editor configuration, command/conversion requests, private document downloads, and callbacks. It never accepts a Better Auth Session or editor capability at that boundary.
 - Each session expires one hour after issuance; sessions do not refresh or slide. The client clears the token at expiry and warns during the final five minutes.
 - Logout and password replacement revoke sessions immediately. Password replacement revokes every session, so the Admin must sign in again.
@@ -248,10 +249,10 @@ operations/<operationId>/<kind>/<uuid>/docx
 - Admin routes require the `admin` role.
 - User response and submission routes enforce ownership.
 - ONLYOFFICE document URLs use a five-minute HMAC token bound to the document key.
-- ONLYOFFICE callback userdata uses a server-signed HMAC envelope containing the operation ID.
+- ONLYOFFICE callback userdata uses a server-signed HMAC envelope containing the Operation ID. Its exact token digest and single-use consumption are persisted, so replay protection survives process restarts.
 - Callback document downloads are restricted to configured ONLYOFFICE origins, disallow redirects, and enforce a response-size limit.
 - Response JSON is restricted to published content-control tags, scalar values, and a bounded payload size.
-- Operations expire and roll back submitting responses when they remain active too long.
+- Operations expire with stable error codes and atomically roll back submitting Responses when they remain active too long. Startup reconciliation expires stale Operations, callback claims, editor leases, and leases backed by expired Sessions without replacing committed object references.
 
 These protections cover the current local stack, but the deployment defaults below are not suitable for the public internet.
 
@@ -263,7 +264,7 @@ Protected browser endpoints use the opaque bearer Session header:
 Authorization: Bearer <opaque-better-auth-session-token>
 ```
 
-Editor action and Operation-poll requests instead use the scoped capability returned through the validated editor bridge:
+Mutating editor requests require the active lease-bound action capability returned through the validated editor bridge. Plugin Operation polling uses a separate Operation-bound capability:
 
 ```http
 X-Editor-Capability: <signed-action-or-operation-capability>
@@ -277,6 +278,8 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 | `POST` | `/api/auth/sign-out` | Revoke the current live Session |
 | `GET` | `/api/session` | Read the current live Session and absolute expiry |
 | `POST` | `/api/account/password` | Replace the authenticated account password and revoke its Sessions |
+| `POST` | `/api/editor-leases/:id/renew` | Renew the current Session's active editor lease |
+| `DELETE` | `/api/editor-leases/:id` | Release the current Session's editor lease |
 | `GET` | `/health` | API health check |
 
 ### Authenticated user form operations

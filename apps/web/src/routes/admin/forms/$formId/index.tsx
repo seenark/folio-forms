@@ -27,6 +27,11 @@ import type { FormDetail } from "@/lib/api";
 type FormDetailResponse =
   | { editorConfigUrl?: string; form: FormDetail }
   | FormDetail;
+interface AdminEditorConfig {
+  bridge?: {
+    capabilities?: Partial<Record<"publish" | "save-template", string>>;
+  };
+}
 
 const loadFormDetail = async (formId: string): Promise<FormDetail> => {
   const payload = await apiGet<FormDetailResponse>(
@@ -102,9 +107,20 @@ const FormEditorRoute = () => {
     setError(null);
     setNotice(null);
     try {
+      const configUrl = loadedForm.editorConfigUrl ?? loadedForm.editorUrl;
+      if (!configUrl) {
+        throw new Error("Editor configuration is unavailable.");
+      }
+      const editorConfig = await apiGet<AdminEditorConfig>(configUrl);
+      const capabilityAction = action === "save" ? "save-template" : "publish";
+      const capability = editorConfig.bridge?.capabilities?.[capabilityAction];
+      if (!capability) {
+        throw new Error("Editor capability is unavailable.");
+      }
       const result = await apiPost<{ operationId?: string }>(
         `/api/admin/forms/${formId}/${action}`,
-        { documentKey: editorDocumentKey }
+        { documentKey: editorDocumentKey },
+        capability
       );
       if (result.operationId) {
         await waitForOperation(result.operationId);

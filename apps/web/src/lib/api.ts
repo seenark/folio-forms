@@ -221,8 +221,18 @@ const request = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
 
 export const apiGet = <T>(path: string) => request<T>(path);
 
-export const apiPost = <T>(path: string, body?: unknown) =>
-  request<T>(path, { body: JSON.stringify(body ?? {}), method: "POST" });
+export const apiPost = <T>(
+  path: string,
+  body?: unknown,
+  editorCapability?: string
+) =>
+  request<T>(path, {
+    body: JSON.stringify(body ?? {}),
+    headers: editorCapability
+      ? { "X-Editor-Capability": editorCapability }
+      : undefined,
+    method: "POST",
+  });
 export const apiDelete = <T>(path: string) =>
   request<T>(path, { method: "DELETE" });
 export const downloadArtifact = async (path: string, filename: string) => {

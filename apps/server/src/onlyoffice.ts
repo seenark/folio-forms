@@ -61,6 +61,8 @@ export interface EditorCapabilityClaims {
   formId: string;
   issuedAt: number;
   kind: "editor-capability";
+  leaseId?: string;
+  leaseProof?: string;
   operationId?: string;
   role: UserRole;
   targetId: string;
@@ -73,6 +75,8 @@ export interface EditorCapabilityInput {
   documentKey: string;
   expiresAt?: number;
   formId: string;
+  leaseId?: string;
+  leaseProof?: string;
   operationId?: string;
   role: UserRole;
   targetId: string;
@@ -97,6 +101,12 @@ export interface CallbackClaimInput {
 export interface EditorOptions {
   action: PluginAction;
   capabilities: Partial<Record<EditorCapabilityAction, string>>;
+  lease: {
+    expiresAt: string;
+    id: string;
+    releaseUrl: string;
+    renewUrl: string;
+  };
   documentKey: string;
   formId: string;
   operationId?: string;
@@ -249,12 +259,20 @@ function validCapabilityTimes(claims: JsonRecord): boolean {
 }
 
 function validOperationScope(claims: JsonRecord): boolean {
-  if (claims.action !== "poll-operation") {
-    return claims.operationId === undefined;
+  if (claims.action === "poll-operation") {
+    return (
+      typeof claims.operationId === "string" &&
+      uuidPattern.test(claims.operationId) &&
+      claims.leaseId === undefined &&
+      claims.leaseProof === undefined
+    );
   }
   return (
-    typeof claims.operationId === "string" &&
-    uuidPattern.test(claims.operationId)
+    claims.operationId === undefined &&
+    typeof claims.leaseId === "string" &&
+    uuidPattern.test(claims.leaseId) &&
+    typeof claims.leaseProof === "string" &&
+    claims.leaseProof.length > 0
   );
 }
 
@@ -406,7 +424,7 @@ export function editorConfig(
   options: EditorOptions,
   user: { id: string; name: string }
 ): Record<string, unknown> {
-  const { capabilities, ...pluginOptions } = options;
+  const { capabilities, lease, ...pluginOptions } = options;
   const officeServerOrigin = trimOrigin(env.ONLYOFFICE_DOCUMENT_BASE_URL);
   const browserServerOrigin = trimOrigin(env.API_BASE);
   const bridgeId = crypto.randomUUID();
@@ -465,6 +483,7 @@ export function editorConfig(
     bridge: {
       capabilities,
       id: bridgeId,
+      lease,
       pluginOrigin: exactOrigin(env.API_BASE),
     },
     config: { ...config, token: signToken(config, env.ONLYOFFICE_JWT_SECRET) },

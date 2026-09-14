@@ -73,6 +73,8 @@ const fallbackTemplatePath = path.resolve(
 );
 const idPattern = /^[0-9a-f-]{36}$/iu;
 const operationTimeoutMs = 4 * 60_000;
+const editorLeaseDurationMs = 90_000;
+const callbackClaimLifetimeSeconds = 5 * 60;
 const maxCallbackDocumentBytes = 25 * 1024 * 1024;
 const maxCallbackBodyBytes = 64 * 1024;
 const loginFailureLimit = 5;
@@ -111,6 +113,9 @@ interface EditorAuthorization {
   actor: Actor;
   capability: EditorCapabilityClaims | null;
 }
+type ActionEditorAuthorization = EditorAuthorization & {
+  capability: EditorCapabilityClaims;
+};
 interface EditorCapabilityScope {
   action: EditorCapabilityAction;
   documentKey: string;
@@ -118,6 +123,22 @@ interface EditorCapabilityScope {
   operationId?: string;
   targetId: string;
   targetType: EditorCapabilityTarget;
+}
+interface ClaimedEditorLease {
+  expiresAt: Date;
+  id: string;
+}
+interface EditorLeaseGrant extends ClaimedEditorLease {
+  proof: string;
+}
+interface ActiveEditorLease {
+  capabilityDigest: string;
+  holderSessionId: string;
+  holderUserId: string;
+}
+interface LockedEditorLease extends ActiveEditorLease {
+  expiresAt: Date;
+  id: string;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -128,6 +149,14 @@ const operationTypeForAction: Record<OperationAction, OperationType> = {
   "save-template": "save_template_draft",
   submit: "submit_response",
 };
+type OperationErrorCode =
+  | "callback_claim_invalid"
+  | "callback_document_unavailable"
+  | "callback_key_mismatch"
+  | "callback_processing_failed"
+  | "force_save_failed"
+  | "onlyoffice_document_error"
+  | "operation_timeout";
 type OperationMetadata = JsonRecord & {
   action: OperationAction;
   cleanupObjectKeys?: string[];
@@ -282,12 +311,6 @@ function operationMetadata(value: unknown): OperationMetadata {
   return metadata as unknown as OperationMetadata;
 }
 
-function errorMessage(error: unknown): string {
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-  return "Operation failed";
-}
 function databaseErrorCode(error: unknown): string | null {
   if (!error || typeof error !== "object" || !("code" in error)) {
     return null;
@@ -298,6 +321,9 @@ function databaseErrorCode(error: unknown): string | null {
 
 function contentHash(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+function tokenDigest(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 async function deleteObjects(
@@ -630,6 +656,20 @@ async function editorAuthorization(
     capability,
   };
 }
+async function requireActionEditorAuthorization(
+  request: Request
+): Promise<ActionEditorAuthorization> {
+  const authorization = await editorAuthorization(request);
+  const { capability } = authorization;
+  if (!capability) {
+    fail(
+      401,
+      "editor_capability_required",
+      "An editor capability is required for this action"
+    );
+  }
+  return { actor: authorization.actor, capability };
+}
 
 function requireEditorScope(
   authorization: EditorAuthorization,
@@ -655,19 +695,317 @@ function requireEditorScope(
   }
 }
 
-function scopedEditorCapability(
+function actionEditorCapability(
   actor: Actor,
   scope: Omit<EditorCapabilityScope, "action" | "operationId">,
-  action: EditorCapabilityAction,
-  operationId?: string
+  action: OperationAction,
+  lease: EditorLeaseGrant
 ): string {
   return createEditorCapability({
     ...scope,
     action,
     actorId: actor.id,
+    leaseId: lease.id,
+    leaseProof: lease.proof,
+    role: actor.role,
+  });
+}
+
+function operationEditorCapability(
+  actor: Actor,
+  scope: Omit<EditorCapabilityScope, "action" | "operationId">,
+  operationId: string
+): string {
+  return createEditorCapability({
+    ...scope,
+    action: "poll-operation",
+    actorId: actor.id,
     operationId,
     role: actor.role,
   });
+}
+
+function editorLeaseTargetType(
+  targetType: EditorCapabilityTarget
+): OperationTargetType {
+  return targetType === "template-draft"
+    ? OperationTargetType.template_draft
+    : OperationTargetType.response;
+}
+
+function editorLeaseProof(
+  holder: Pick<Identity, "id" | "sessionId">,
+  targetType: EditorCapabilityTarget,
+  targetId: string
+): string {
+  return createHmac("sha256", env.EDITOR_CAPABILITY_SECRET)
+    .update(
+      [
+        "editor-lease-v1",
+        targetType,
+        targetId,
+        holder.sessionId,
+        holder.id,
+      ].join("\0")
+    )
+    .digest("base64url");
+}
+
+function nextEditorLeaseExpiry(identity: Identity, now: Date): Date {
+  const expiresAt = new Date(
+    Math.min(
+      now.getTime() + editorLeaseDurationMs,
+      identity.expiresAt.getTime()
+    )
+  );
+  if (expiresAt.getTime() <= now.getTime()) {
+    fail(401, "unauthorized", "Authentication is required");
+  }
+  return expiresAt;
+}
+
+function editorLeaseBridge(lease: ClaimedEditorLease) {
+  return {
+    expiresAt: lease.expiresAt.toISOString(),
+    id: lease.id,
+    releaseUrl: `/api/editor-leases/${lease.id}`,
+    renewUrl: `/api/editor-leases/${lease.id}/renew`,
+  };
+}
+
+async function claimEditorLease(
+  identity: Identity,
+  targetType: EditorCapabilityTarget,
+  targetId: string
+): Promise<EditorLeaseGrant> {
+  const now = new Date();
+  const expiresAt = nextEditorLeaseExpiry(identity, now);
+  const proof = editorLeaseProof(identity, targetType, targetId);
+  const capabilityDigest = tokenDigest(proof);
+  const leaseId = crypto.randomUUID();
+  const databaseTargetType = editorLeaseTargetType(targetType);
+  const activeOperation = await prisma.operation.findFirst({
+    where: {
+      status: { in: [OperationStatus.pending, OperationStatus.processing] },
+      targetId,
+      targetType: databaseTargetType,
+    },
+  });
+  if (activeOperation) {
+    await expireOperationIfNeeded(activeOperation);
+  }
+  const lease = await prisma.$transaction(async (tx) => {
+    const [current] = await tx.$queryRaw<LockedEditorLease[]>(
+      Prisma.sql`
+        SELECT
+          "id",
+          "capability_digest" AS "capabilityDigest",
+          "expires_at" AS "expiresAt",
+          "holder_session_id" AS "holderSessionId",
+          "holder_user_id" AS "holderUserId"
+        FROM "editor_leases"
+        WHERE
+          "target_type" = CAST(${databaseTargetType} AS "OperationTargetType")
+          AND "target_id" = ${targetId}::uuid
+        FOR UPDATE
+      `
+    );
+    const sameHolder =
+      current?.holderSessionId === identity.sessionId &&
+      current.holderUserId === identity.id;
+    if (!sameHolder) {
+      const activeOperation = await tx.operation.findFirst({
+        select: { id: true },
+        where: {
+          status: {
+            in: [OperationStatus.pending, OperationStatus.processing],
+          },
+          targetId,
+          targetType: databaseTargetType,
+        },
+      });
+      if (activeOperation) {
+        return null;
+      }
+    }
+    const [claimed] = await tx.$queryRaw<ClaimedEditorLease[]>(
+      Prisma.sql`
+        INSERT INTO "editor_leases" (
+          "id",
+          "target_type",
+          "target_id",
+          "holder_session_id",
+          "holder_user_id",
+          "capability_digest",
+          "expires_at",
+          "renewed_at"
+        )
+        VALUES (
+          ${leaseId}::uuid,
+          CAST(${databaseTargetType} AS "OperationTargetType"),
+          ${targetId}::uuid,
+          ${identity.sessionId},
+          ${identity.id},
+          ${capabilityDigest},
+          ${expiresAt},
+          ${now}
+        )
+        ON CONFLICT ("target_type", "target_id") DO UPDATE SET
+          "id" = CASE
+            WHEN "editor_leases"."expires_at" <= ${now} THEN EXCLUDED."id"
+            ELSE "editor_leases"."id"
+          END,
+          "holder_session_id" = EXCLUDED."holder_session_id",
+          "holder_user_id" = EXCLUDED."holder_user_id",
+          "capability_digest" = EXCLUDED."capability_digest",
+          "expires_at" = EXCLUDED."expires_at",
+          "created_at" = CASE
+            WHEN "editor_leases"."expires_at" <= ${now}
+              THEN EXCLUDED."created_at"
+            ELSE "editor_leases"."created_at"
+          END,
+          "renewed_at" = EXCLUDED."renewed_at"
+        WHERE
+          "editor_leases"."expires_at" <= ${now}
+          OR (
+            "editor_leases"."holder_session_id" = ${identity.sessionId}
+            AND "editor_leases"."holder_user_id" = ${identity.id}
+          )
+        RETURNING "id", "expires_at" AS "expiresAt"
+      `
+    );
+    return claimed ?? null;
+  });
+  if (!lease) {
+    fail(409, "editor_in_use", "This document is open in another session");
+  }
+  return { ...lease, proof };
+}
+
+async function renewEditorLease(
+  identity: Identity,
+  leaseId: string
+): Promise<ClaimedEditorLease> {
+  const now = new Date();
+  const expiresAt = nextEditorLeaseExpiry(identity, now);
+  const renewed = await prisma.editorLease.updateMany({
+    data: { expiresAt, renewedAt: now },
+    where: {
+      expiresAt: { gt: now },
+      holderSessionId: identity.sessionId,
+      holderUserId: identity.id,
+      id: leaseId,
+    },
+  });
+  if (renewed.count !== 1) {
+    fail(409, "editor_lease_inactive", "The editor lease is no longer active");
+  }
+  return { expiresAt, id: leaseId };
+}
+
+async function releaseEditorLease(
+  identity: Identity,
+  leaseId: string
+): Promise<void> {
+  const released = await prisma.editorLease.deleteMany({
+    where: {
+      holderSessionId: identity.sessionId,
+      holderUserId: identity.id,
+      id: leaseId,
+    },
+  });
+  if (released.count !== 1) {
+    fail(409, "editor_lease_inactive", "The editor lease is no longer active");
+  }
+}
+
+function editorLeaseClaims(authorization: ActionEditorAuthorization): {
+  id: string;
+  proof: string;
+} {
+  const { leaseId, leaseProof } = authorization.capability;
+  if (!leaseId || !leaseProof) {
+    fail(409, "editor_lease_inactive", "The editor lease is no longer active");
+  }
+  return { id: leaseId, proof: leaseProof };
+}
+
+function requireEditorLeaseProof(
+  scope: Omit<EditorCapabilityScope, "action" | "operationId">,
+  lease: ActiveEditorLease,
+  proof: string
+): void {
+  const expectedProof = editorLeaseProof(
+    { id: lease.holderUserId, sessionId: lease.holderSessionId },
+    scope.targetType,
+    scope.targetId
+  );
+  if (
+    proof !== expectedProof ||
+    tokenDigest(proof) !== lease.capabilityDigest
+  ) {
+    fail(409, "editor_lease_inactive", "The editor lease is no longer active");
+  }
+}
+
+async function requireActiveEditorLease(
+  authorization: ActionEditorAuthorization,
+  scope: Omit<EditorCapabilityScope, "action" | "operationId">
+): Promise<void> {
+  const claim = editorLeaseClaims(authorization);
+  const now = new Date();
+  const lease = await prisma.editorLease.findFirst({
+    select: {
+      capabilityDigest: true,
+      holderSessionId: true,
+      holderUserId: true,
+    },
+    where: {
+      expiresAt: { gt: now },
+      holderSession: { expiresAt: { gt: now } },
+      holderUserId: authorization.actor.id,
+      id: claim.id,
+      targetId: scope.targetId,
+      targetType: editorLeaseTargetType(scope.targetType),
+    },
+  });
+  if (!lease) {
+    fail(409, "editor_lease_inactive", "The editor lease is no longer active");
+  }
+  requireEditorLeaseProof(scope, lease, claim.proof);
+}
+
+async function lockActiveEditorLease(
+  tx: Prisma.TransactionClient,
+  authorization: ActionEditorAuthorization,
+  scope: Omit<EditorCapabilityScope, "action" | "operationId">
+): Promise<void> {
+  const claim = editorLeaseClaims(authorization);
+  const databaseTargetType = editorLeaseTargetType(scope.targetType);
+  const [lease] = await tx.$queryRaw<ActiveEditorLease[]>(
+    Prisma.sql`
+      SELECT
+        "editor_leases"."capability_digest" AS "capabilityDigest",
+        "editor_leases"."holder_session_id" AS "holderSessionId",
+        "editor_leases"."holder_user_id" AS "holderUserId"
+      FROM "editor_leases"
+      INNER JOIN "session"
+        ON "session"."id" = "editor_leases"."holder_session_id"
+      WHERE
+        "editor_leases"."id" = ${claim.id}::uuid
+        AND "editor_leases"."target_type" =
+          CAST(${databaseTargetType} AS "OperationTargetType")
+        AND "editor_leases"."target_id" = ${scope.targetId}::uuid
+        AND "editor_leases"."holder_user_id" = ${authorization.actor.id}
+        AND "editor_leases"."expires_at" > NOW()
+        AND "session"."expires_at" > NOW()
+      FOR UPDATE OF "editor_leases"
+    `
+  );
+  if (!lease) {
+    fail(409, "editor_lease_inactive", "The editor lease is no longer active");
+  }
+  requireEditorLeaseProof(scope, lease, claim.proof);
 }
 
 function requireAdmin(identity: Pick<Actor, "role">): void {
@@ -943,89 +1281,142 @@ async function normalizeResponseData(
   return data;
 }
 
-async function activeOperationForForm(
-  formId: string,
-  action: OperationType
+async function activeAfterRecovery(
+  operation: Operation | null
 ): Promise<boolean> {
-  const operation = await prisma.operation.findFirst({
-    select: { id: true },
-    where: {
-      formId,
-      status: { in: [OperationStatus.pending, OperationStatus.processing] },
-      type: action,
-    },
-  });
-  return Boolean(operation);
+  if (!operation) {
+    return false;
+  }
+  const current = await expireOperationIfNeeded(operation);
+  return (
+    current.status === OperationStatus.pending ||
+    current.status === OperationStatus.processing
+  );
+}
+
+async function activeOperationForForm(formId: string): Promise<boolean> {
+  return activeAfterRecovery(
+    await prisma.operation.findFirst({
+      where: {
+        formId,
+        status: { in: [OperationStatus.pending, OperationStatus.processing] },
+        targetType: OperationTargetType.template_draft,
+      },
+    })
+  );
 }
 
 async function activeOperationForResponse(
   responseId: string
 ): Promise<boolean> {
-  const operation = await prisma.operation.findFirst({
-    select: { id: true },
-    where: {
-      responseId,
-      status: { in: [OperationStatus.pending, OperationStatus.processing] },
-    },
-  });
-  return Boolean(operation);
+  return activeAfterRecovery(
+    await prisma.operation.findFirst({
+      where: {
+        responseId,
+        status: { in: [OperationStatus.pending, OperationStatus.processing] },
+      },
+    })
+  );
 }
 
-function createOperation(input: {
-  type: OperationType;
-  targetType: OperationTargetType;
-  targetId: string;
-  formId: string;
+async function createOperation(input: {
   actorId: string;
+  authorization: ActionEditorAuthorization;
+  capabilityScope: Omit<EditorCapabilityScope, "action" | "operationId">;
+  documentKey: string;
+  formId: string;
+  metadata: OperationMetadata;
   ownerUserId: string;
   responseId?: string;
-  submissionId?: string;
-  documentKey: string;
   stagingObjectKey: string;
-  metadata: OperationMetadata;
+  submissionId?: string;
+  targetId: string;
+  targetType: OperationTargetType;
+  type: OperationType;
 }): Promise<Operation> {
-  return prisma.operation.create({
-    data: {
-      actorId: input.actorId,
-      documentKey: input.documentKey,
-      errorCode: null,
-      formId: input.formId,
-      metadata: jsonValue(input.metadata),
-      ownerUserId: input.ownerUserId,
-      responseId: input.responseId,
-      stagingObjectKey: input.stagingObjectKey,
-      status: OperationStatus.pending,
-      submissionId: input.submissionId,
-      targetId: input.targetId,
-      targetType: input.targetType,
-      type: input.type,
-    },
-  });
+  try {
+    return await prisma.$transaction(async (tx) => {
+      await lockActiveEditorLease(
+        tx,
+        input.authorization,
+        input.capabilityScope
+      );
+      return tx.operation.create({
+        data: {
+          actorId: input.actorId,
+          documentKey: input.documentKey,
+          errorCode: null,
+          formId: input.formId,
+          metadata: jsonValue(input.metadata),
+          ownerUserId: input.ownerUserId,
+          responseId: input.responseId,
+          stagingObjectKey: input.stagingObjectKey,
+          status: OperationStatus.pending,
+          submissionId: input.submissionId,
+          targetId: input.targetId,
+          targetType: input.targetType,
+          type: input.type,
+        },
+      });
+    });
+  } catch (error) {
+    if (databaseErrorCode(error) === "P2002") {
+      fail(
+        409,
+        "operation_in_progress",
+        "Another document operation is already in progress"
+      );
+    }
+    throw error;
+  }
 }
 
 async function updateOperationFailed(
   operationId: string,
-  message: string
-): Promise<void> {
-  const operation = await prisma.operation.findUnique({
-    select: { metadata: true, stagingObjectKey: true },
-    where: { id: operationId },
+  errorCode: OperationErrorCode,
+  updatedBefore?: Date
+): Promise<boolean> {
+  const operation = await prisma.$transaction(async (tx) => {
+    const current = await tx.operation.findUnique({
+      select: { metadata: true, stagingObjectKey: true },
+      where: { id: operationId },
+    });
+    if (!current) {
+      return null;
+    }
+    const metadata = operationMetadata(current.metadata);
+    const failed = await tx.operation.updateMany({
+      data: {
+        errorCode,
+        status: OperationStatus.failed,
+        updatedAt: new Date(),
+      },
+      where: {
+        id: operationId,
+        ...(updatedBefore ? { updatedAt: { lte: updatedBefore } } : {}),
+        status: { in: [OperationStatus.pending, OperationStatus.processing] },
+      },
+    });
+    if (failed.count !== 1) {
+      return null;
+    }
+    if (metadata.action === "submit" && metadata.responseId) {
+      await tx.response.updateMany({
+        data: { status: ResponseStatus.draft, updatedAt: new Date() },
+        where: {
+          id: metadata.responseId,
+          status: ResponseStatus.submitting,
+        },
+      });
+    }
+    return { ...current, metadata };
   });
-  const failed = await prisma.operation.updateMany({
-    data: {
-      errorCode: message,
-      status: OperationStatus.failed,
-      updatedAt: new Date(),
-    },
-    where: {
-      id: operationId,
-      status: { in: [OperationStatus.pending, OperationStatus.processing] },
-    },
-  });
-  if (failed.count === 1 && operation) {
-    const metadata = operationMetadata(operation.metadata);
-    await deleteObjects([operation.stagingObjectKey, metadata.finalObjectKey]);
+  if (!operation) {
+    return false;
   }
+  await deleteObjects([operation.stagingObjectKey]);
+  await deleteObjectUnlessCanonical(operation.metadata.finalObjectKey);
+  return true;
 }
 
 async function expireOperationIfNeeded(
@@ -1034,25 +1425,67 @@ async function expireOperationIfNeeded(
   const active =
     operation.status === OperationStatus.pending ||
     operation.status === OperationStatus.processing;
-  const stale =
-    Date.now() - operation.updatedAt.getTime() >= operationTimeoutMs;
+  const staleBefore = new Date(Date.now() - operationTimeoutMs);
+  const stale = operation.updatedAt <= staleBefore;
   if (!active || !stale) {
     return operation;
   }
-
-  const message = "The document operation timed out. Try again.";
-  await updateOperationFailed(operation.id, message);
-  const metadata = operationMetadata(operation.metadata);
-  if (metadata.action === "submit" && metadata.responseId) {
-    await rollbackSubmit(metadata.responseId);
-  }
-  return { ...operation, errorCode: message, status: OperationStatus.failed };
+  await updateOperationFailed(operation.id, "operation_timeout", staleBefore);
+  return (
+    (await prisma.operation.findUnique({ where: { id: operation.id } })) ??
+    operation
+  );
 }
 
-async function rollbackSubmit(responseId: string): Promise<void> {
-  await prisma.response.updateMany({
-    data: { status: ResponseStatus.draft, updatedAt: new Date() },
-    where: { id: responseId, status: ResponseStatus.submitting },
+type CallbackClaimConsumption = "claimed" | "invalid" | "replayed";
+
+async function consumeCallbackClaim(
+  operationId: string,
+  userdata: string
+): Promise<CallbackClaimConsumption> {
+  const digest = tokenDigest(userdata);
+  const consumed = await prisma.callbackClaim.updateMany({
+    data: { consumedAt: new Date() },
+    where: {
+      consumedAt: null,
+      expiresAt: { gt: new Date() },
+      operationId,
+      tokenDigest: digest,
+    },
+  });
+  if (consumed.count === 1) {
+    return "claimed";
+  }
+  const existing = await prisma.callbackClaim.findFirst({
+    select: { consumedAt: true },
+    where: { operationId, tokenDigest: digest },
+  });
+  return existing?.consumedAt ? "replayed" : "invalid";
+}
+
+export async function reconcileRecoverableState(): Promise<void> {
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - operationTimeoutMs);
+  await prisma.editorLease.deleteMany({
+    where: {
+      OR: [
+        { expiresAt: { lte: now } },
+        { holderSession: { expiresAt: { lte: now } } },
+      ],
+    },
+  });
+  const staleOperations = await prisma.operation.findMany({
+    select: { id: true },
+    where: {
+      status: { in: [OperationStatus.pending, OperationStatus.processing] },
+      updatedAt: { lte: staleBefore },
+    },
+  });
+  for (const operation of staleOperations) {
+    await updateOperationFailed(operation.id, "operation_timeout", staleBefore);
+  }
+  await prisma.callbackClaim.deleteMany({
+    where: { expiresAt: { lte: now } },
   });
 }
 
@@ -1066,22 +1499,47 @@ function launchForceSave(
       if (!operation.documentKey) {
         fail(500, "invalid_operation", "Operation has no document key");
       }
-      const claimed = await prisma.operation.updateMany({
-        data: { status: OperationStatus.processing, updatedAt: new Date() },
-        where: { id: operation.id, status: OperationStatus.pending },
+      const expiresAtSeconds =
+        Math.floor(Date.now() / 1000) + callbackClaimLifetimeSeconds;
+      const userdata = createCallbackUserdata({
+        documentKey: operation.documentKey,
+        expiresAt: expiresAtSeconds,
+        operationId: operation.id,
+        operationType: operation.type,
       });
-      if (claimed.count !== 1) {
+      const claimed = await prisma.$transaction(async (tx) => {
+        const activated = await tx.operation.updateMany({
+          data: { status: OperationStatus.processing, updatedAt: new Date() },
+          where: { id: operation.id, status: OperationStatus.pending },
+        });
+        if (activated.count !== 1) {
+          return false;
+        }
+        await tx.callbackClaim.create({
+          data: {
+            expiresAt: new Date(expiresAtSeconds * 1000),
+            operationId: operation.id,
+            tokenDigest: tokenDigest(userdata),
+          },
+        });
+        return true;
+      });
+      if (!claimed) {
         return;
       }
       const hasChanges = await onlyOffice.forceSave(
         operation.documentKey,
-        createCallbackUserdata({
-          documentKey: operation.documentKey,
-          operationId: operation.id,
-          operationType: operation.type,
-        })
+        userdata
       );
       if (!hasChanges) {
+        const consumption = await consumeCallbackClaim(operation.id, userdata);
+        if (consumption === "replayed") {
+          return;
+        }
+        if (consumption === "invalid") {
+          await updateOperationFailed(operation.id, "callback_claim_invalid");
+          return;
+        }
         const currentObjectKey = await operationDocumentKey(
           operation.documentKey
         );
@@ -1099,12 +1557,8 @@ function launchForceSave(
           allowedCallbackOrigins
         );
       }
-    } catch (error) {
-      const metadata = operationMetadata(operation.metadata);
-      await updateOperationFailed(operation.id, errorMessage(error));
-      if (metadata.action === "submit" && metadata.responseId) {
-        await rollbackSubmit(metadata.responseId);
-      }
+    } catch {
+      await updateOperationFailed(operation.id, "force_save_failed");
     }
   })();
 }
@@ -1512,23 +1966,11 @@ async function finalizeCallback(
     typeof payload.key !== "string" ||
     payload.key !== operation.documentKey
   ) {
-    await updateOperationFailed(
-      operation.id,
-      "ONLYOFFICE callback key did not match the initiating operation"
-    );
-    if (metadata.action === "submit" && metadata.responseId) {
-      await rollbackSubmit(metadata.responseId);
-    }
+    await updateOperationFailed(operation.id, "callback_key_mismatch");
     return;
   }
   if (!snapshot && !callbackUrl) {
-    await updateOperationFailed(
-      operation.id,
-      "ONLYOFFICE callback did not include an allowed document URL"
-    );
-    if (metadata.action === "submit" && metadata.responseId) {
-      await rollbackSubmit(metadata.responseId);
-    }
+    await updateOperationFailed(operation.id, "callback_document_unavailable");
     return;
   }
 
@@ -1672,6 +2114,11 @@ async function userEditorConfig(
     targetId: response.id,
     targetType: "response",
   } as const;
+  const lease = await claimEditorLease(
+    identity,
+    capabilityScope.targetType,
+    capabilityScope.targetId
+  );
   return editorConfig(
     {
       action:
@@ -1681,15 +2128,22 @@ async function userEditorConfig(
             ? "fill"
             : "draft",
       capabilities: {
-        "save-draft": scopedEditorCapability(
+        "save-draft": actionEditorCapability(
           identity,
           capabilityScope,
-          "save-draft"
+          "save-draft",
+          lease
         ),
-        submit: scopedEditorCapability(identity, capabilityScope, "submit"),
+        submit: actionEditorCapability(
+          identity,
+          capabilityScope,
+          "submit",
+          lease
+        ),
       },
       documentKey: response.draftDocumentKey,
       formId: form.id,
+      lease: editorLeaseBridge(lease),
       prefill:
         requestedAction === "fill" && snapshot
           ? {
@@ -1711,7 +2165,6 @@ export function createApp(options: AppOptions = {}) {
     : callbackOrigins;
   const callbackMaximumBytes =
     options.onlyOfficeCallbackMaxBytes ?? maxCallbackDocumentBytes;
-  const callbackClaims = new Set<string>();
   return new Elysia()
     .onError(({ error, set }) => {
       if (error instanceof HttpError) {
@@ -1769,6 +2222,20 @@ export function createApp(options: AppOptions = {}) {
           role: identity.role,
         },
       };
+    })
+    .post("/api/editor-leases/:id/renew", async ({ request, params }) => {
+      const identity = await requireIdentity(request);
+      validateId(params.id, "Editor lease");
+      const lease = await renewEditorLease(identity, params.id);
+      return {
+        lease: { expiresAt: lease.expiresAt.toISOString(), id: lease.id },
+      };
+    })
+    .delete("/api/editor-leases/:id", async ({ request, params }) => {
+      const identity = await requireIdentity(request);
+      validateId(params.id, "Editor lease");
+      await releaseEditorLease(identity, params.id);
+      return { ok: true };
     })
     .post("/api/account/password", async ({ body, request }) => {
       const identity = await identityFor(request);
@@ -2081,23 +2548,31 @@ export function createApp(options: AppOptions = {}) {
         targetId: templateDraft.id,
         targetType: "template-draft",
       } as const;
+      const lease = await claimEditorLease(
+        identity,
+        capabilityScope.targetType,
+        capabilityScope.targetId
+      );
       return editorConfig(
         {
           action: "template-edit",
           capabilities: {
-            publish: scopedEditorCapability(
+            publish: actionEditorCapability(
               identity,
               capabilityScope,
-              "publish"
+              "publish",
+              lease
             ),
-            "save-template": scopedEditorCapability(
+            "save-template": actionEditorCapability(
               identity,
               capabilityScope,
-              "save-template"
+              "save-template",
+              lease
             ),
           },
           documentKey: templateDraft.documentKey,
           formId: form.id,
+          lease: editorLeaseBridge(lease),
         },
         identity
       );
@@ -2105,7 +2580,7 @@ export function createApp(options: AppOptions = {}) {
     .post(
       "/api/admin/forms/:id/save",
       async ({ request, params, body, set }) => {
-        const authorization = await editorAuthorization(request);
+        const authorization = await requireActionEditorAuthorization(request);
         const { actor: identity } = authorization;
         requireAdmin(identity);
         const form = await findFormById(params.id);
@@ -2123,6 +2598,7 @@ export function createApp(options: AppOptions = {}) {
           ...capabilityScope,
           action: "save-template",
         });
+        await requireActiveEditorLease(authorization, capabilityScope);
         const input = asRecord(body);
         const documentKey = requiredString(input, "documentKey");
         if (templateDraft.documentKey !== documentKey) {
@@ -2132,12 +2608,7 @@ export function createApp(options: AppOptions = {}) {
             "The editor document is no longer current"
           );
         }
-        if (
-          await activeOperationForForm(
-            form.id,
-            operationTypeForAction["save-template"]
-          )
-        ) {
+        if (await activeOperationForForm(form.id)) {
           fail(
             409,
             "operation_in_progress",
@@ -2169,6 +2640,8 @@ export function createApp(options: AppOptions = {}) {
         };
         const operation = await createOperation({
           actorId: identity.id,
+          authorization,
+          capabilityScope,
           documentKey,
           formId: form.id,
           metadata,
@@ -2181,10 +2654,9 @@ export function createApp(options: AppOptions = {}) {
         set.status = 202;
         launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
         return {
-          operationCapability: scopedEditorCapability(
+          operationCapability: operationEditorCapability(
             identity,
             capabilityScope,
-            "poll-operation",
             operation.id
           ),
           operationId: operation.id,
@@ -2195,7 +2667,7 @@ export function createApp(options: AppOptions = {}) {
     .post(
       "/api/admin/forms/:id/publish",
       async ({ request, params, body, set }) => {
-        const authorization = await editorAuthorization(request);
+        const authorization = await requireActionEditorAuthorization(request);
         const { actor: identity } = authorization;
         requireAdmin(identity);
         const form = await findFormById(params.id);
@@ -2213,6 +2685,7 @@ export function createApp(options: AppOptions = {}) {
           ...capabilityScope,
           action: "publish",
         });
+        await requireActiveEditorLease(authorization, capabilityScope);
         const input = asRecord(body);
         const documentKey = requiredString(input, "documentKey");
         if (templateDraft.documentKey !== documentKey) {
@@ -2222,9 +2695,7 @@ export function createApp(options: AppOptions = {}) {
             "The editor document is no longer current"
           );
         }
-        if (
-          await activeOperationForForm(form.id, operationTypeForAction.publish)
-        ) {
+        if (await activeOperationForForm(form.id)) {
           fail(
             409,
             "operation_in_progress",
@@ -2258,6 +2729,8 @@ export function createApp(options: AppOptions = {}) {
         };
         const operation = await createOperation({
           actorId: identity.id,
+          authorization,
+          capabilityScope,
           documentKey,
           formId: form.id,
           metadata,
@@ -2270,10 +2743,9 @@ export function createApp(options: AppOptions = {}) {
         set.status = 202;
         launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
         return {
-          operationCapability: scopedEditorCapability(
+          operationCapability: operationEditorCapability(
             identity,
             capabilityScope,
-            "poll-operation",
             operation.id
           ),
           operationId: operation.id,
@@ -2514,7 +2986,7 @@ export function createApp(options: AppOptions = {}) {
     .post(
       "/api/forms/:publicId/draft",
       async ({ request, params, body, set }) => {
-        const authorization = await editorAuthorization(request);
+        const authorization = await requireActionEditorAuthorization(request);
         const { actor: identity } = authorization;
         const form = await findFormByPublicId(params.publicId);
         const input = asRecord(body);
@@ -2542,6 +3014,7 @@ export function createApp(options: AppOptions = {}) {
           ...capabilityScope,
           action: "save-draft",
         });
+        await requireActiveEditorLease(authorization, capabilityScope);
         const data = await normalizeResponseData(form, response, input.data);
         if (await activeOperationForResponse(response.id)) {
           fail(
@@ -2575,6 +3048,8 @@ export function createApp(options: AppOptions = {}) {
         };
         const operation = await createOperation({
           actorId: identity.id,
+          authorization,
+          capabilityScope,
           documentKey,
           formId: form.id,
           metadata,
@@ -2588,10 +3063,9 @@ export function createApp(options: AppOptions = {}) {
         set.status = 202;
         launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
         return {
-          operationCapability: scopedEditorCapability(
+          operationCapability: operationEditorCapability(
             identity,
             capabilityScope,
-            "poll-operation",
             operation.id
           ),
           operationId: operation.id,
@@ -2603,7 +3077,7 @@ export function createApp(options: AppOptions = {}) {
     .post(
       "/api/forms/:publicId/submit",
       async ({ request, params, body, set }) => {
-        const authorization = await editorAuthorization(request);
+        const authorization = await requireActionEditorAuthorization(request);
         const { actor: identity } = authorization;
         const form = await findFormByPublicId(params.publicId);
         const input = asRecord(body);
@@ -2631,6 +3105,7 @@ export function createApp(options: AppOptions = {}) {
           ...capabilityScope,
           action: "submit",
         });
+        await requireActiveEditorLease(authorization, capabilityScope);
         const data = await normalizeResponseData(form, response, input.data);
         if (await activeOperationForResponse(response.id)) {
           fail(
@@ -2668,6 +3143,7 @@ export function createApp(options: AppOptions = {}) {
         };
         const operation = await prisma.$transaction(
           async (tx) => {
+            await lockActiveEditorLease(tx, authorization, capabilityScope);
             const claimed = await tx.response.updateMany({
               data: {
                 status: ResponseStatus.submitting,
@@ -2705,10 +3181,9 @@ export function createApp(options: AppOptions = {}) {
         set.status = 202;
         launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
         return {
-          operationCapability: scopedEditorCapability(
+          operationCapability: operationEditorCapability(
             identity,
             capabilityScope,
-            "poll-operation",
             operation.id
           ),
           operationId: operation.id,
@@ -2919,6 +3394,9 @@ export function createApp(options: AppOptions = {}) {
         if (status !== 6 && status !== 7) {
           return { error: 0 };
         }
+        if (typeof payload.userdata !== "string") {
+          return { error: 1 };
+        }
         const claim = callbackClaim(payload.userdata);
         if (!claim) {
           return { error: 1 };
@@ -2935,28 +3413,33 @@ export function createApp(options: AppOptions = {}) {
         ) {
           return { error: 1 };
         }
+        const consumption = await consumeCallbackClaim(
+          operation.id,
+          payload.userdata
+        );
+        if (consumption === "invalid") {
+          return { error: 1 };
+        }
         if (
+          consumption === "replayed" ||
           operation.status === OperationStatus.completed ||
           operation.status === OperationStatus.failed
         ) {
-          await cleanupTerminalOperationObjects(operation);
-          return { error: 0 };
-        }
-        if (status === 7) {
-          const metadata = operationMetadata(operation.metadata);
-          await updateOperationFailed(
-            operation.id,
-            "ONLYOFFICE reported a document error"
-          );
-          if (metadata.action === "submit" && metadata.responseId) {
-            await rollbackSubmit(metadata.responseId);
+          if (
+            operation.status === OperationStatus.completed ||
+            operation.status === OperationStatus.failed
+          ) {
+            await cleanupTerminalOperationObjects(operation);
           }
           return { error: 0 };
         }
-        if (callbackClaims.has(operation.id)) {
+        if (status === 7) {
+          await updateOperationFailed(
+            operation.id,
+            "onlyoffice_document_error"
+          );
           return { error: 0 };
         }
-        callbackClaims.add(operation.id);
         try {
           await finalizeCallback(
             operation.id,
@@ -2966,15 +3449,12 @@ export function createApp(options: AppOptions = {}) {
             callbackMaximumBytes
           );
           return { error: 0 };
-        } catch (error) {
-          const metadata = operationMetadata(operation.metadata);
-          await updateOperationFailed(operation.id, errorMessage(error));
-          if (metadata.action === "submit" && metadata.responseId) {
-            await rollbackSubmit(metadata.responseId);
-          }
+        } catch {
+          await updateOperationFailed(
+            operation.id,
+            "callback_processing_failed"
+          );
           return { error: 1 };
-        } finally {
-          callbackClaims.delete(operation.id);
         }
       },
       { parse: "none" }

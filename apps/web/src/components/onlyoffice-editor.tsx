@@ -1,10 +1,19 @@
 import { useEffect, useId, useRef, useState } from "react";
 
 import { Notice, Spinner } from "@/components/ui";
-import { API_ORIGIN, apiGet } from "@/lib/api";
+import { API_ORIGIN, apiGet, apiPost } from "@/lib/api";
 
 type EditorAction = "save-template" | "publish" | "save-draft" | "submit";
 type EditorOperationStatus = "pending" | "completed" | "failed";
+
+interface EditorLease {
+  id: string;
+  expiresAt: string;
+  renewUrl: string;
+  releaseUrl: string;
+}
+
+const leaseRenewalIntervalMs = 30_000;
 
 interface EditorConfig {
   apiScriptUrl?: string;
@@ -12,6 +21,7 @@ interface EditorConfig {
   bridge?: {
     capabilities?: Partial<Record<EditorAction, string>>;
     id?: string;
+    lease?: EditorLease;
     pluginOrigin?: string;
   };
   config?: Record<string, unknown>;
@@ -177,8 +187,58 @@ export const OnlyOfficeEditor = ({
   const pinnedSourceRef = useRef<MessageEventSource | null>(null);
   const terminalOperationIdsRef = useRef(new Set<string>());
   const editorId = useId().replaceAll(":", "");
+  const leaseRef = useRef<EditorLease | null>(null);
   const [config, setConfig] = useState<EditorConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const lease = configUrl ? config?.bridge?.lease : undefined;
+    if (!lease) {
+      leaseRef.current = null;
+      return;
+    }
+
+    let cancelled = false;
+    leaseRef.current = lease;
+
+    const renewLease = async () => {
+      const currentLease = leaseRef.current;
+      if (cancelled || !currentLease) {
+        return;
+      }
+
+      try {
+        const response = await apiPost<{
+          lease: Pick<EditorLease, "expiresAt" | "id">;
+        }>(currentLease.renewUrl);
+        const activeLease = leaseRef.current;
+        if (
+          !cancelled &&
+          activeLease?.id === currentLease.id &&
+          response.lease.id === currentLease.id
+        ) {
+          leaseRef.current = {
+            ...activeLease,
+            expiresAt: response.lease.expiresAt,
+          };
+        }
+      } catch {
+        // A transient heartbeat failure must not tear down unsaved editor state.
+      }
+    };
+
+    const renewalTimer = window.setInterval(() => {
+      void renewLease();
+    }, leaseRenewalIntervalMs);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(renewalTimer);
+      if (leaseRef.current?.id === lease.id) {
+        leaseRef.current = null;
+      }
+    };
+  }, [config, configUrl]);
 
   useEffect(() => {
     onBridgeMessageRef.current = onBridgeMessage;
@@ -284,6 +344,7 @@ export const OnlyOfficeEditor = ({
         return;
       }
 
+      const requestedLeaseId = leaseRef.current?.id;
       try {
         const path = configUrl.startsWith("http")
           ? configUrl.replace(API_ORIGIN, "")
@@ -292,6 +353,15 @@ export const OnlyOfficeEditor = ({
         if (cancelled) {
           return;
         }
+        const freshLease = fresh.bridge?.lease;
+        if (
+          freshLease &&
+          requestedLeaseId &&
+          leaseRef.current?.id === requestedLeaseId
+        ) {
+          leaseRef.current = freshLease;
+        }
+
         const capability = fresh.bridge?.capabilities?.[request.action];
         if (typeof capability !== "string" || !capability) {
           respondToCapabilityRequest(request, {

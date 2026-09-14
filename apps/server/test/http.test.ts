@@ -1,12 +1,18 @@
-// oxlint-disable no-await-in-loop complexity -- The end-to-end journey deliberately keeps sequential transitions in one test.
 import { expect, test } from "bun:test";
+// oxlint-disable no-await-in-loop complexity -- The end-to-end journey deliberately keeps sequential transitions in one test.
+import { createHash } from "node:crypto";
 
 import { auth, ensureBootstrapAdmin } from "@onlyoffice/auth";
 import { prisma } from "@onlyoffice/db";
 
-import { createApp, resolveCallbackDocumentUrl } from "../src/app";
+import {
+  createApp,
+  reconcileRecoverableState,
+  resolveCallbackDocumentUrl,
+} from "../src/app";
 import type { EditorCapabilityAction } from "../src/onlyoffice";
 import {
+  callbackClaim,
   createCallbackUserdata,
   createDocumentAccessToken,
   createEditorCapability,
@@ -60,6 +66,12 @@ interface EditorConfigBody {
   bridge: {
     capabilities: Partial<Record<EditorCapabilityAction, string>>;
     id: string;
+    lease: {
+      expiresAt: string;
+      id: string;
+      releaseUrl: string;
+      renewUrl: string;
+    };
     pluginOrigin: string;
   };
   config: {
@@ -178,6 +190,33 @@ const callbackPayload = (
   url,
   userdata: operation.userdata,
 });
+const persistCallbackClaim = async ({
+  expiresAt,
+  operationId,
+  userdata,
+}: {
+  expiresAt?: Date;
+  operationId: string;
+  userdata: string;
+}): Promise<void> => {
+  const claim = callbackClaim(userdata);
+  const persistedExpiresAt =
+    expiresAt ?? (claim ? new Date(claim.expiresAt * 1000) : undefined);
+  if (!persistedExpiresAt) {
+    throw new Error("The callback userdata did not contain a live claim");
+  }
+  await prisma.callbackClaim.create({
+    data: {
+      createdAt: new Date(
+        Math.min(Date.now(), persistedExpiresAt.getTime() - 1)
+      ),
+      expiresAt: persistedExpiresAt,
+      id: crypto.randomUUID(),
+      operationId,
+      tokenDigest: createHash("sha256").update(userdata).digest("hex"),
+    },
+  });
+};
 
 const tamperAuthorization = (authorization: string): string => {
   const [scheme, token] = authorization.split(" ");
@@ -392,9 +431,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   const adminEditor = (await adminEditorResponse.json()) as EditorConfigBody;
   const adminPluginOptions =
     adminEditor.config.editorConfig.plugins.options[pluginGuid];
+  const adminLease = adminEditor.bridge.lease;
   const publishCapability = adminEditor.bridge.capabilities.publish;
-  const saveTemplateCapability =
-    adminEditor.bridge.capabilities["save-template"];
+  let saveTemplateCapability = adminEditor.bridge.capabilities["save-template"];
   if (!adminPluginOptions || !publishCapability || !saveTemplateCapability) {
     throw new Error("The Admin editor capabilities were not returned");
   }
@@ -410,18 +449,115 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     new URL(process.env.CORS_ORIGIN ?? "http://localhost:5173").origin
   );
   expect(adminEditor.config.token.length).toBeGreaterThan(20);
+  expect(adminLease).toEqual({
+    expiresAt: expect.any(String),
+    id: expect.any(String),
+    releaseUrl: expect.any(String),
+    renewUrl: expect.any(String),
+  });
+  for (const leaseValue of Object.values(adminLease)) {
+    expect(JSON.stringify(adminEditor.config)).not.toContain(leaseValue);
+  }
+  expect(adminPluginOptions).not.toHaveProperty("lease");
+  const adminLeaseRow = await prisma.editorLease.findUnique({
+    where: { id: adminLease.id },
+  });
+  if (!adminLeaseRow) {
+    throw new Error("The Admin editor lease was not persisted");
+  }
+  expect(
+    Math.abs(
+      adminLeaseRow.expiresAt.getTime() -
+        adminLeaseRow.createdAt.getTime() -
+        90 * 1000
+    )
+  ).toBeLessThanOrEqual(1000);
+
+  const competingAdminBearer = await bearerFor(
+    adminEmail,
+    password,
+    `ticket-06-competing-admin-${crypto.randomUUID()}`
+  );
+  const competingAdminEditorResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/editor-config`, {
+      headers: { Authorization: `Bearer ${competingAdminBearer}` },
+    })
+  );
+  expect(competingAdminEditorResponse.status).toBe(409);
+  expect(await competingAdminEditorResponse.json()).toMatchObject({
+    error: "editor_in_use",
+  });
+
+  const renewResponse = await app.handle(
+    new Request(new URL(adminLease.renewUrl, "http://test.local").toString(), {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+      method: "POST",
+    })
+  );
+  expect(renewResponse.status).toBe(200);
+  const renewedBody = (await renewResponse.json()) as {
+    lease?: { expiresAt?: string; id?: string };
+  };
+  expect(renewedBody).toMatchObject({
+    lease: {
+      expiresAt: expect.any(String),
+      id: adminLease.id,
+    },
+  });
+  const renewedLeaseRow = await prisma.editorLease.findUnique({
+    where: { id: adminLease.id },
+  });
+  if (!renewedLeaseRow || !renewedBody.lease?.expiresAt) {
+    throw new Error("The Admin editor lease was not renewed");
+  }
+  expect(renewedLeaseRow.renewedAt.getTime()).toBeGreaterThanOrEqual(
+    renewedLeaseRow.createdAt.getTime()
+  );
+  expect(
+    Math.abs(
+      renewedLeaseRow.expiresAt.getTime() -
+        renewedLeaseRow.renewedAt.getTime() -
+        90 * 1000
+    )
+  ).toBeLessThanOrEqual(1000);
+
   const publishClaims = verifyEditorCapability(publishCapability);
   expect(publishClaims).toMatchObject({
     action: "publish",
     actorId: adminId,
     documentKey: templateDocumentKey,
     formId,
+    leaseId: adminLease.id,
+    leaseProof: expect.any(String),
     role: "admin",
     targetType: "template-draft",
   });
   expect((publishClaims?.expiresAt ?? 0) - (publishClaims?.issuedAt ?? 0)).toBe(
     5 * 60
   );
+
+  const sessionOnlyAdminSaveResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+      body: JSON.stringify({ documentKey: templateDocumentKey }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "POST",
+    })
+  );
+  expect(sessionOnlyAdminSaveResponse.status).toBe(401);
+  expect(await sessionOnlyAdminSaveResponse.json()).toMatchObject({
+    error: "editor_capability_required",
+  });
+  const sessionOnlyAdminPublishResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/publish`, {
+      body: JSON.stringify({ documentKey: templateDocumentKey }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "POST",
+    })
+  );
+  expect(sessionOnlyAdminPublishResponse.status).toBe(401);
+  expect(await sessionOnlyAdminPublishResponse.json()).toMatchObject({
+    error: "editor_capability_required",
+  });
 
   const capabilityHeaders = (capability: string): Record<string, string> => ({
     ...jsonHeaders,
@@ -464,6 +600,8 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     documentKey: publishClaims.documentKey,
     expiresAt: Math.floor(Date.now() / 1000) - 1,
     formId: publishClaims.formId,
+    leaseId: publishClaims.leaseId,
+    leaseProof: publishClaims.leaseProof,
     role: publishClaims.role,
     targetId: publishClaims.targetId,
     targetType: publishClaims.targetType,
@@ -581,6 +719,79 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(pluginConfigResponse.headers.get("access-control-allow-origin")).toBe(
     allowedPluginOrigin
   );
+  const releaseResponse = await app.handle(
+    new Request(
+      new URL(adminLease.releaseUrl, "http://test.local").toString(),
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+        method: "DELETE",
+      }
+    )
+  );
+  expect(releaseResponse.status).toBe(200);
+  expect(await releaseResponse.json()).toEqual({ ok: true });
+  expect(
+    await prisma.editorLease.findUnique({ where: { id: adminLease.id } })
+  ).toBeNull();
+
+  const competingAdminEditorAfterReleaseResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/editor-config`, {
+      headers: { Authorization: `Bearer ${competingAdminBearer}` },
+    })
+  );
+  expect(competingAdminEditorAfterReleaseResponse.status).toBe(200);
+  const competingAdminEditor =
+    (await competingAdminEditorAfterReleaseResponse.json()) as EditorConfigBody;
+  const competingLease = competingAdminEditor.bridge.lease;
+  const competingSaveTemplateCapability =
+    competingAdminEditor.bridge.capabilities["save-template"];
+  if (!competingSaveTemplateCapability) {
+    throw new Error("The competing Admin editor capability was not returned");
+  }
+  expect(competingLease.id).toBeTruthy();
+  const releasedCapabilityResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+      body: JSON.stringify({ documentKey: templateDocumentKey }),
+      headers: capabilityHeaders(saveTemplateCapability),
+      method: "POST",
+    })
+  );
+  expect(releasedCapabilityResponse.status).toBe(409);
+  expect(await releasedCapabilityResponse.json()).toMatchObject({
+    error: "editor_lease_inactive",
+  });
+
+  await prisma.editorLease.update({
+    data: { createdAt: new Date(0), expiresAt: new Date(1) },
+    where: { id: competingLease.id },
+  });
+  const reclaimedAdminEditorResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/editor-config`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(reclaimedAdminEditorResponse.status).toBe(200);
+  const reclaimedAdminEditor =
+    (await reclaimedAdminEditorResponse.json()) as EditorConfigBody;
+  expect(reclaimedAdminEditor.bridge.lease.id).not.toBe(competingLease.id);
+  const reclaimedSaveTemplateCapability =
+    reclaimedAdminEditor.bridge.capabilities["save-template"];
+  if (!reclaimedSaveTemplateCapability) {
+    throw new Error("The reclaimed Admin editor capability was not returned");
+  }
+  const expiredCompetingCapabilityResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+      body: JSON.stringify({ documentKey: templateDocumentKey }),
+      headers: capabilityHeaders(competingSaveTemplateCapability),
+      method: "POST",
+    })
+  );
+  expect(expiredCompetingCapabilityResponse.status).toBe(409);
+  expect(await expiredCompetingCapabilityResponse.json()).toMatchObject({
+    error: "editor_lease_inactive",
+  });
+  saveTemplateCapability = reclaimedSaveTemplateCapability;
+
   const saveTemplateResponse = await app.handle(
     new Request(`http://test.local/api/admin/forms/${formId}/save`, {
       body: JSON.stringify({ documentKey: templateDocumentKey }),
@@ -659,6 +870,99 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     "X-Editor-Capability": publishBody.operationCapability,
   });
   expect(publishOperation.status).toBe("completed");
+
+  const concurrentSaveCapability =
+    refreshedAdminEditor.bridge.capabilities["save-template"];
+  if (!concurrentSaveCapability) {
+    throw new Error("The concurrency editor capability was not returned");
+  }
+  const stableTemplateBeforeConcurrency = await prisma.templateDraft.findUnique(
+    {
+      select: { documentKey: true, objectKey: true },
+      where: { formId },
+    }
+  );
+  if (!stableTemplateBeforeConcurrency) {
+    throw new Error("The stable template was not found");
+  }
+  const stableTemplateBytes = await readObject(
+    stableTemplateBeforeConcurrency.objectKey
+  );
+  const { promise: forceSaveGate, resolve: releaseForceSave } =
+    Promise.withResolvers<undefined>();
+  const deterministicApp = createApp({
+    onlyOffice: {
+      convertDocxToPdf: () =>
+        Promise.resolve(new TextEncoder().encode("%PDF-test")),
+      forceSave: async () => {
+        await forceSaveGate;
+        throw new Error("deterministic force-save failure");
+      },
+    },
+    requestIp: (request) => request.headers.get("x-test-ip"),
+  });
+  const concurrentSaveResponses = await Promise.all([
+    deterministicApp.handle(
+      new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+        body: JSON.stringify({ documentKey: activeTemplateDocumentKey }),
+        headers: capabilityHeaders(concurrentSaveCapability),
+        method: "POST",
+      })
+    ),
+    deterministicApp.handle(
+      new Request(`http://test.local/api/admin/forms/${formId}/save`, {
+        body: JSON.stringify({ documentKey: activeTemplateDocumentKey }),
+        headers: capabilityHeaders(concurrentSaveCapability),
+        method: "POST",
+      })
+    ),
+  ]);
+  expect(
+    concurrentSaveResponses
+      .map((response) => response.status)
+      .toSorted((left, right) => left - right)
+  ).toEqual([202, 409]);
+  const rejectedConcurrentSaveResponse = concurrentSaveResponses.find(
+    (response) => response.status === 409
+  );
+  if (!rejectedConcurrentSaveResponse) {
+    throw new Error("The competing template save was not rejected");
+  }
+  const rejectedConcurrentSaveBody =
+    (await rejectedConcurrentSaveResponse.json()) as { error?: string };
+  expect(rejectedConcurrentSaveBody.error).toBe("operation_in_progress");
+  const acceptedConcurrentSaveResponse = concurrentSaveResponses.find(
+    (response) => response.status === 202
+  );
+  if (!acceptedConcurrentSaveResponse) {
+    throw new Error("The winning template save was not accepted");
+  }
+  const acceptedConcurrentSaveBody =
+    (await acceptedConcurrentSaveResponse.json()) as {
+      operationCapability?: string;
+      operationId?: string;
+    };
+  if (
+    !acceptedConcurrentSaveBody.operationCapability ||
+    !acceptedConcurrentSaveBody.operationId
+  ) {
+    throw new Error("The winning template save operation was not created");
+  }
+  releaseForceSave();
+  const failedConcurrentOperation = await waitForOperation(
+    acceptedConcurrentSaveBody.operationId,
+    { "X-Editor-Capability": acceptedConcurrentSaveBody.operationCapability }
+  );
+  expect(failedConcurrentOperation.status).toBe("failed");
+  expect(
+    await prisma.templateDraft.findUnique({
+      select: { documentKey: true, objectKey: true },
+      where: { formId },
+    })
+  ).toEqual(stableTemplateBeforeConcurrency);
+  expect(await readObject(stableTemplateBeforeConcurrency.objectKey)).toEqual(
+    stableTemplateBytes
+  );
 
   const user = await createCredentialFixture({
     email: userEmail,
@@ -746,6 +1050,47 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   ) {
     throw new Error("The User editor capabilities were not returned");
   }
+  const userLease = editorConfig.bridge.lease;
+  expect(userLease).toEqual({
+    expiresAt: expect.any(String),
+    id: expect.any(String),
+    releaseUrl: expect.any(String),
+    renewUrl: expect.any(String),
+  });
+  for (const leaseValue of Object.values(userLease)) {
+    expect(JSON.stringify(editorConfig.config)).not.toContain(leaseValue);
+  }
+  expect(userPluginOptions).not.toHaveProperty("lease");
+  const sessionOnlyUserDraftResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
+      body: JSON.stringify({
+        data: {},
+        documentKey: responseDocumentKey,
+        responseId,
+      }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  expect(sessionOnlyUserDraftResponse.status).toBe(401);
+  expect(await sessionOnlyUserDraftResponse.json()).toMatchObject({
+    error: "editor_capability_required",
+  });
+  const sessionOnlyUserSubmitResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/submit`, {
+      body: JSON.stringify({
+        data: {},
+        documentKey: responseDocumentKey,
+        responseId,
+      }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  expect(sessionOnlyUserSubmitResponse.status).toBe(401);
+  expect(await sessionOnlyUserSubmitResponse.json()).toMatchObject({
+    error: "editor_capability_required",
+  });
   const userEditorSerialized = JSON.stringify(editorConfig);
   expect(userEditorSerialized).not.toContain(userBearer);
   expect(userEditorSerialized).not.toContain('"authToken"');
@@ -759,12 +1104,29 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     actorId: userId,
     documentKey: responseDocumentKey,
     formId,
+    leaseId: userLease.id,
+    leaseProof: expect.any(String),
     role: "user",
     targetId: responseId,
     targetType: "response",
   });
   if (!saveDraftClaims) {
     throw new Error("The save-draft capability was invalid");
+  }
+  const submitClaims = verifyEditorCapability(submitCapability);
+  expect(submitClaims).toMatchObject({
+    action: "submit",
+    actorId: userId,
+    documentKey: responseDocumentKey,
+    formId,
+    leaseId: userLease.id,
+    leaseProof: expect.any(String),
+    role: "user",
+    targetId: responseId,
+    targetType: "response",
+  });
+  if (!submitClaims) {
+    throw new Error("The submit capability was invalid");
   }
   await prisma.user.update({
     data: { enabled: false },
@@ -868,6 +1230,24 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     "X-Editor-Capability": submitBody.operationCapability,
   });
   expect(submitOperation.status).toBe("completed");
+  const ownerOperationVisibilityResponse = await app.handle(
+    new Request(`http://test.local/api/operations/${submitBody.operationId}`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(ownerOperationVisibilityResponse.status).toBe(200);
+  expect(await ownerOperationVisibilityResponse.json()).toMatchObject({
+    operation: { id: submitBody.operationId, status: "completed" },
+  });
+  const adminOperationVisibilityResponse = await app.handle(
+    new Request(`http://test.local/api/operations/${submitBody.operationId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(adminOperationVisibilityResponse.status).toBe(200);
+  expect(await adminOperationVisibilityResponse.json()).toMatchObject({
+    operation: { id: submitBody.operationId, status: "completed" },
+  });
   const crossOperationPollResponse = await app.handle(
     new Request(`http://test.local/api/operations/${submitBody.operationId}`, {
       headers: {
@@ -876,7 +1256,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     })
   );
   expect(crossOperationPollResponse.status).toBe(403);
-  await createCredentialFixture({
+  const otherUser = await createCredentialFixture({
     email: otherUserEmail,
     name: "Ticket 04 Other User",
     password,
@@ -935,6 +1315,46 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   );
   expect(pdfResponse.status).toBe(200);
   expect(await pdfResponse.text()).toBe("%PDF-test");
+  const stableSubmissionBeforeConversion = await prisma.submission.findUnique({
+    select: {
+      data: true,
+      documentKey: true,
+      objectKey: true,
+    },
+    where: { id: completedSubmissionId },
+  });
+  const conversionFailureApp = createApp({
+    onlyOffice: {
+      convertDocxToPdf: () =>
+        Promise.reject(new Error("deterministic conversion failure")),
+      forceSave: () => Promise.resolve(false),
+    },
+  });
+  const conversionFailureResponse = await conversionFailureApp.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/pdf`,
+      {
+        headers: { Authorization: `Bearer ${userBearer}` },
+      }
+    )
+  );
+  expect(conversionFailureResponse.status).toBe(500);
+  expect(
+    await prisma.submission.findUnique({
+      select: {
+        data: true,
+        documentKey: true,
+        objectKey: true,
+      },
+      where: { id: completedSubmissionId },
+    })
+  ).toEqual(stableSubmissionBeforeConversion);
+  if (!stableSubmissionBeforeConversion) {
+    throw new Error("The stable submission was not found");
+  }
+  expect(await readObject(stableSubmissionBeforeConversion.objectKey)).toEqual(
+    submissionDocument
+  );
   const staleOperationId = crypto.randomUUID();
   const staleStagingObjectKey = objectKey(
     "operations",
@@ -946,6 +1366,12 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     staleOperationId,
     "final.docx"
   );
+  const staleOperationUserdata = createCallbackUserdata({
+    documentKey: templateDraft.documentKey,
+    expiresAt: Math.floor(Date.now() / 1000) - 1,
+    operationId: staleOperationId,
+    operationType: "save_template_draft",
+  });
   await Promise.all([
     putObject(staleStagingObjectKey, sourceDocument, DOCX_CONTENT_TYPE),
     putObject(staleFinalObjectKey, sourceDocument, DOCX_CONTENT_TYPE),
@@ -972,6 +1398,11 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       updatedAt: new Date(0),
     },
   });
+  await persistCallbackClaim({
+    expiresAt: new Date(0),
+    operationId: staleOperationId,
+    userdata: staleOperationUserdata,
+  });
   const staleOperationCapability = createEditorCapability({
     action: "poll-operation",
     actorId: adminId,
@@ -982,18 +1413,178 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     targetId: templateDraft.id,
     targetType: "template-draft",
   });
-  const expiredOperationResponse = await app.handle(
+
+  const publishedTemplate = await prisma.publishedTemplate.findUnique({
+    select: { id: true, version: true },
+    where: { formId },
+  });
+  if (!publishedTemplate) {
+    throw new Error("The published template was not found");
+  }
+  const staleResponseId = crypto.randomUUID();
+  const staleResponseDocumentKey = `response-${staleResponseId}-${crypto.randomUUID()}`;
+  const staleResponseObjectKey = objectKey(
+    "responses",
+    staleResponseId,
+    "draft",
+    crypto.randomUUID(),
+    "docx"
+  );
+  const staleSubmitOperationId = crypto.randomUUID();
+  const staleSubmitStagingObjectKey = objectKey(
+    "operations",
+    staleSubmitOperationId,
+    "staged.docx"
+  );
+  const staleSubmitFinalObjectKey = objectKey(
+    "operations",
+    staleSubmitOperationId,
+    "final.docx"
+  );
+  const staleSubmissionId = crypto.randomUUID();
+  const staleSubmitUserdata = createCallbackUserdata({
+    documentKey: staleResponseDocumentKey,
+    expiresAt: Math.floor(Date.now() / 1000) - 1,
+    operationId: staleSubmitOperationId,
+    operationType: "submit_response",
+  });
+  await Promise.all([
+    putObject(staleResponseObjectKey, sourceDocument, DOCX_CONTENT_TYPE),
+    putObject(staleSubmitStagingObjectKey, sourceDocument, DOCX_CONTENT_TYPE),
+    putObject(staleSubmitFinalObjectKey, sourceDocument, DOCX_CONTENT_TYPE),
+  ]);
+  await prisma.response.create({
+    data: {
+      draftData: {},
+      draftDocumentKey: staleResponseDocumentKey,
+      draftObjectKey: staleResponseObjectKey,
+      form: { connect: { id: formId } },
+      id: staleResponseId,
+      owner: { connect: { id: otherUser.id } },
+      publishedTemplate: { connect: { id: publishedTemplate.id } },
+      publishedVersion: publishedTemplate.version,
+      status: "submitting",
+    },
+  });
+  await prisma.operation.create({
+    data: {
+      actorId: otherUser.id,
+      documentKey: staleResponseDocumentKey,
+      errorCode: null,
+      formId,
+      id: staleSubmitOperationId,
+      metadata: {
+        action: "submit",
+        finalObjectKey: staleSubmitFinalObjectKey,
+        formId,
+        responseId: staleResponseId,
+        stagedObjectKey: staleSubmitStagingObjectKey,
+        submissionDocumentKey: `submission-${staleSubmissionId}-${crypto.randomUUID()}`,
+        submissionId: staleSubmissionId,
+      },
+      ownerUserId: otherUser.id,
+      responseId: staleResponseId,
+      stagingObjectKey: staleSubmitStagingObjectKey,
+      status: "processing",
+      targetId: staleResponseId,
+      targetType: "response",
+      type: "submit_response",
+      updatedAt: new Date(0),
+    },
+  });
+  await persistCallbackClaim({
+    expiresAt: new Date(0),
+    operationId: staleSubmitOperationId,
+    userdata: staleSubmitUserdata,
+  });
+
+  const expiredLease = await prisma.editorLease.findUnique({
+    where: {
+      targetType_targetId: {
+        targetId: templateDraft.id,
+        targetType: "template_draft",
+      },
+    },
+  });
+  if (!expiredLease) {
+    throw new Error("The active template lease was not found");
+  }
+  await prisma.editorLease.update({
+    data: { createdAt: new Date(0), expiresAt: new Date(1) },
+    where: { id: expiredLease.id },
+  });
+  await reconcileRecoverableState();
+
+  expect(
+    await prisma.operation.findUnique({
+      select: { errorCode: true, status: true },
+      where: { id: staleOperationId },
+    })
+  ).toEqual({ errorCode: "operation_timeout", status: "failed" });
+  expect(
+    await prisma.operation.findUnique({
+      select: { errorCode: true, status: true },
+      where: { id: staleSubmitOperationId },
+    })
+  ).toEqual({ errorCode: "operation_timeout", status: "failed" });
+  expect(
+    await prisma.response.findUnique({
+      select: {
+        draftDocumentKey: true,
+        draftObjectKey: true,
+        status: true,
+      },
+      where: { id: staleResponseId },
+    })
+  ).toEqual({
+    draftDocumentKey: staleResponseDocumentKey,
+    draftObjectKey: staleResponseObjectKey,
+    status: "draft",
+  });
+  expect(
+    await prisma.editorLease.findUnique({ where: { id: expiredLease.id } })
+  ).toBeNull();
+  expect(
+    await prisma.callbackClaim.findUnique({
+      where: { operationId: staleOperationId },
+    })
+  ).toBeNull();
+  expect(
+    await prisma.callbackClaim.findUnique({
+      where: { operationId: staleSubmitOperationId },
+    })
+  ).toBeNull();
+  expect(await objectExists(staleStagingObjectKey)).toBe(false);
+  expect(await objectExists(staleFinalObjectKey)).toBe(false);
+  expect(await objectExists(staleSubmitStagingObjectKey)).toBe(false);
+  expect(await objectExists(staleSubmitFinalObjectKey)).toBe(false);
+  expect(await objectExists(staleResponseObjectKey)).toBe(true);
+  expect(await objectExists(templateDraft.objectKey)).toBe(true);
+  expect(await readObject(templateDraft.objectKey)).toEqual(sourceDocument);
+
+  const reconciledOperationResponse = await app.handle(
     new Request(`http://test.local/api/operations/${staleOperationId}`, {
       headers: { "X-Editor-Capability": staleOperationCapability },
     })
   );
-  expect(expiredOperationResponse.status).toBe(200);
-  expect(await expiredOperationResponse.json()).toMatchObject({
-    operation: { id: staleOperationId, status: "failed" },
+  expect(reconciledOperationResponse.status).toBe(200);
+  expect(await reconciledOperationResponse.json()).toMatchObject({
+    operation: {
+      error: "operation_timeout",
+      id: staleOperationId,
+      status: "failed",
+    },
   });
-  expect(await objectExists(staleStagingObjectKey)).toBe(false);
-  expect(await objectExists(staleFinalObjectKey)).toBe(false);
-  expect(await objectExists(templateDraft.objectKey)).toBe(true);
+  const reclaimedAfterReconcileResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formId}/editor-config`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(reclaimedAfterReconcileResponse.status).toBe(200);
+  const reclaimedAfterReconcile =
+    (await reclaimedAfterReconcileResponse.json()) as EditorConfigBody;
+  expect(reclaimedAfterReconcile.bridge.lease.id).toBeTruthy();
+
   const callbackDocument = new TextEncoder().encode("callback-docx");
   const callbackDownloadPaths = new Set<string>();
   const callbackDocumentServer = Bun.serve({
@@ -1033,6 +1624,15 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       onlyOfficeCallbackMaxBytes: 16,
       onlyOfficeCallbackOrigins: [callbackOrigin],
     });
+    const callbackAppReplica = createApp({
+      onlyOffice: {
+        convertDocxToPdf: () =>
+          Promise.resolve(new TextEncoder().encode("%PDF-test")),
+        forceSave: () => Promise.resolve(false),
+      },
+      onlyOfficeCallbackMaxBytes: 16,
+      onlyOfficeCallbackOrigins: [callbackOrigin],
+    });
     const createCallbackOperation =
       async (): Promise<CallbackOperationFixture> => {
         const id = crypto.randomUUID();
@@ -1046,6 +1646,11 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
           id,
           "callback-final.docx"
         );
+        const userdata = createCallbackUserdata({
+          documentKey: templateDraft.documentKey,
+          operationId: id,
+          operationType: "save_template_draft",
+        });
         await prisma.operation.create({
           data: {
             actorId: adminId,
@@ -1067,23 +1672,21 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
             type: "save_template_draft",
           },
         });
+        await persistCallbackClaim({ operationId: id, userdata });
         return {
           documentKey: templateDraft.documentKey,
           finalObjectKey,
           id,
-          userdata: createCallbackUserdata({
-            documentKey: templateDraft.documentKey,
-            operationId: id,
-            operationType: "save_template_draft",
-          }),
+          userdata,
         };
       };
     const postCallback = (
       payload: Record<string, unknown>,
       authorization = createOnlyOfficeAuthorization(payload),
-      bodyToken = createOnlyOfficeBodyToken(payload)
+      bodyToken = createOnlyOfficeBodyToken(payload),
+      callbackHandler = callbackApp
     ): Promise<Response> =>
-      callbackApp.handle(
+      callbackHandler.handle(
         new Request("http://test.local/onlyoffice/callback", {
           body: JSON.stringify({ ...payload, token: bodyToken }),
           headers: {
@@ -1095,6 +1698,16 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       );
 
     const trustOperation = await createCallbackOperation();
+    const persistedTrustClaim = await prisma.callbackClaim.findUnique({
+      where: { operationId: trustOperation.id },
+    });
+    if (!persistedTrustClaim) {
+      throw new Error("The callback claim was not persisted");
+    }
+    expect(persistedTrustClaim.tokenDigest).toMatch(/^[0-9a-f]{64}$/u);
+    expect(persistedTrustClaim.tokenDigest).toBe(
+      createHash("sha256").update(trustOperation.userdata).digest("hex")
+    );
     const trustedPayload = callbackPayload(
       trustOperation,
       `${callbackOrigin}/ok.docx`
@@ -1230,6 +1843,50 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     expect(await readObject(trustOperation.finalObjectKey)).toEqual(
       callbackDocument
     );
+    const consumedTrustClaim = await prisma.callbackClaim.findUnique({
+      where: { operationId: trustOperation.id },
+    });
+    expect(consumedTrustClaim?.consumedAt).not.toBeNull();
+
+    const concurrentCallbackOperation = await createCallbackOperation();
+    const concurrentCallbackPayload = callbackPayload(
+      concurrentCallbackOperation,
+      `${callbackOrigin}/ok.docx`
+    );
+    const [concurrentCallbackA, concurrentCallbackB] = await Promise.all([
+      postCallback(concurrentCallbackPayload),
+      postCallback(
+        concurrentCallbackPayload,
+        undefined,
+        undefined,
+        callbackAppReplica
+      ),
+    ]);
+    expect(await concurrentCallbackA.json()).toEqual({ error: 0 });
+    expect(await concurrentCallbackB.json()).toEqual({ error: 0 });
+    const concurrentCallbackState = await prisma.operation.findUnique({
+      select: { result: true, status: true },
+      where: { id: concurrentCallbackOperation.id },
+    });
+    expect(concurrentCallbackState).toMatchObject({ status: "completed" });
+    const concurrentCallbackClaim = await prisma.callbackClaim.findUnique({
+      where: { operationId: concurrentCallbackOperation.id },
+    });
+    expect(concurrentCallbackClaim?.consumedAt).not.toBeNull();
+    expect(
+      await readObject(concurrentCallbackOperation.finalObjectKey)
+    ).toEqual(callbackDocument);
+    const replayedCallbackResponse = await postCallback(
+      concurrentCallbackPayload
+    );
+    expect(await replayedCallbackResponse.json()).toEqual({ error: 0 });
+    expect(
+      await prisma.operation.findUnique({
+        select: { result: true, status: true },
+        where: { id: concurrentCallbackOperation.id },
+      })
+    ).toEqual(concurrentCallbackState);
+
     expect(callbackDownloadPaths).toEqual(
       new Set(["/large.docx", "/ok.docx", "/redirect.docx"])
     );

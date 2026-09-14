@@ -169,7 +169,7 @@ localStorage["onlyoffice.sessionToken"]
 
 ไม่ควรเปิดดูหรือแชร์ Token นี้
 
-Bearer session นี้ใช้เฉพาะระหว่าง Web กับ API และจะไม่ถูกส่งเข้า ONLYOFFICE หรือ Plugin ก่อนทำแต่ละ Editor action หน้า Web จะใช้ Session ขอ capability อายุ 5 นาทีใหม่ แล้วส่งเฉพาะ capability นั้นผ่าน bridge ที่ตรวจ origin และ window source โดย capability ผูกกับผู้ใช้, role, Form, document และ action เดียว เช่น Save Draft หรือ Submit ส่วน Document Server ใช้ `ONLYOFFICE_JWT_SECRET` แยกต่างหากสำหรับเปิดไฟล์ private, callback, command และ conversion
+Bearer session นี้ใช้เฉพาะระหว่าง Web กับ API และจะไม่ถูกส่งเข้า ONLYOFFICE หรือ Plugin เมื่อเปิด Editor ระบบจะ claim Editor Lease อายุ 90 วินาทีให้กับ Browser Session หนึ่งรายการต่อ Template Draft หรือ Response และ Browser จะต่ออายุทุก 30 วินาที Session อื่นจะเปิดแก้ไขไม่ได้จนกว่า Lease ถูกปล่อยหรือหมดอายุ ก่อนทำแต่ละ Editor action หน้า Web จะใช้ Session ขอ capability อายุ 5 นาทีใหม่ แล้วส่งเฉพาะ capability ที่ผูกกับผู้ใช้, role, Form, document, action และ Lease ที่ยัง active ผ่าน bridge ที่ตรวจ origin และ window source ส่วน Document Server ใช้ `ONLYOFFICE_JWT_SECRET` แยกต่างหากสำหรับเปิดไฟล์ private, callback, command และ conversion
 
 ## 3. ทดลองใช้งานในฐานะ User
 
@@ -317,7 +317,7 @@ submissions/<submissionId>/filled/<uuid>/docx
 operations/<operationId>/<kind>/<uuid>/docx
 ```
 
-Database เก็บ object key ไม่ใช่ Absolute path ของเครื่อง Bucket ไม่มี public access Browser และ ONLYOFFICE ต้องอ่านผ่าน API ที่ตรวจสิทธิ์และใช้ authorization อายุสั้นเท่านั้น ระบบเขียน staging object ให้สำเร็จก่อนเปลี่ยน reference ใน Database แล้วจึงลบ object เก่าหรือ staging ที่หมดหน้าที่
+Database เก็บ object key ไม่ใช่ Absolute path ของเครื่อง Bucket ไม่มี public access Browser และ ONLYOFFICE ต้องอ่านผ่าน API ที่ตรวจสิทธิ์และใช้ authorization อายุสั้นเท่านั้น ระบบเขียน staging object ให้สำเร็จก่อนเปลี่ยน reference ใน Database แล้วจึงลบ object เก่าหรือ staging ที่หมดหน้าที่ Callback claim ถูกเก็บและ consume แบบครั้งเดียวใน Database เพื่อให้ replay protection ยังทำงานหลัง restart และตอนเริ่ม Server ระบบจะ fail Operation ที่ค้างเกินเวลา, rollback Response ที่กำลัง submit และล้าง Lease หรือ callback claim ที่หมดอายุโดยไม่เปลี่ยน reference ของเอกสารที่ commit แล้ว
 
 PDF ถูกสร้างเมื่อดาวน์โหลด ส่งกลับใน response แล้วทิ้งทันที ไม่มี PDF object ถาวรหรือ path ใน Database
 
