@@ -1,5 +1,10 @@
 // oxlint-disable func-style prefer-destructuring no-await-in-loop no-use-before-define no-nested-ternary complexity no-shadow -- Route modules keep declaration order and sequential persistence invariants.
-import { createHash, createHmac, randomBytes } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  timingSafeEqual,
+} from "node:crypto";
 import path from "node:path";
 
 import { cors } from "@elysiajs/cors";
@@ -9,6 +14,7 @@ import {
   AuditOutcome,
   FieldType,
   FormStatus,
+  HandoffStatus,
   OperationStatus,
   OperationTargetType,
   PrefillPolicy,
@@ -77,12 +83,16 @@ const fallbackTemplatePath = path.resolve(
 );
 const idPattern = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
 const publicIdPattern = /^[0-9a-f]{32}$/u;
-const accountEmailPattern = /^[^\s@]+@[^\s@]+$/u;
+const accountEmailPattern = /^[^\s@]+@[^\s@]+$/iu;
 const operationTimeoutMs = 4 * 60_000;
 const editorLeaseDurationMs = 90_000;
 const callbackClaimLifetimeSeconds = 5 * 60;
-// ponytail: 15 minutes bounds an abandoned upload; use claimed cleanup jobs if uploads can exceed it.
 const objectCleanupIntentGraceMs = 15 * 60_000;
+const handoffCodeLifetimeMs = 120_000;
+const pendingClaimLifetimeSeconds = 10 * 60;
+const handoffCodeMaximumLength = 256;
+const handoffExternalReferenceMaximumLength = 512;
+const prefillHandoffBodyMaximumBytes = 512 * 1024;
 const maxTemplateUploadBytes = 25 * 1024 * 1024;
 const maxTemplateMultipartOverheadBytes = 64 * 1024;
 const maxTemplateMultipartBodyBytes =
@@ -395,15 +405,17 @@ type FormAuditAction =
   | "archive_form"
   | "configure_field_rule"
   | "create_form"
+  | "create_handoff"
   | "delete_form"
   | "duplicate_form"
+  | "launch_handoff"
   | "publish_form"
+  | "redeem_handoff"
   | "save_template_draft"
   | "unarchive_form"
   | "update_form_metadata";
 type FormAuditErrorCode =
   | "callback_claim_invalid"
-  | "blank_template_unavailable"
   | "callback_document_unavailable"
   | "callback_key_mismatch"
   | "callback_processing_failed"
@@ -413,13 +425,14 @@ type FormAuditErrorCode =
   | "editor_in_use"
   | "editor_lease_inactive"
   | "force_save_failed"
+  | "invalid_template"
   | "form_has_responses"
   | "form_not_draft"
+  | "handoff_unavailable"
   | "internal_error"
   | "invalid_editor_capability"
   | "invalid_file_type"
   | "invalid_request"
-  | "invalid_template"
   | "not_found"
   | "onlyoffice_document_error"
   | "operation_in_progress"
@@ -427,7 +440,8 @@ type FormAuditErrorCode =
   | "payload_too_large"
   | "published_immutable"
   | "stale_document"
-  | "stale_operation";
+  | "stale_operation"
+  | "unauthorized";
 interface FormAuditMetadata {
   errorCode?: FormAuditErrorCode;
   source?: FormSource;
@@ -474,6 +488,7 @@ export interface AppOptions {
   onlyOffice?: OnlyOfficeClient;
   onlyOfficeCallbackOrigins?: readonly string[];
   onlyOfficeCallbackMaxBytes?: number;
+  prefillHandoffSecret?: string;
   requestIp?: (request: Request) => string | null | undefined;
 }
 
@@ -784,6 +799,25 @@ function databaseErrorCode(error: unknown): string | null {
   const code = error.code;
   return typeof code === "string" ? code : null;
 }
+function isSerializationConflict(error: unknown): boolean {
+  if (databaseErrorCode(error) === "P2034") {
+    return true;
+  }
+  if (databaseErrorCode(error) !== "P2010") {
+    return false;
+  }
+  if (
+    !error ||
+    typeof error !== "object" ||
+    !("meta" in error) ||
+    !error.meta ||
+    typeof error.meta !== "object" ||
+    !("code" in error.meta)
+  ) {
+    return false;
+  }
+  return error.meta.code === "40001";
+}
 
 function contentHash(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -965,6 +999,265 @@ function bearerTokenFor(request: Request): string | undefined {
 
 function normalizeEmail(value: string): string {
   return value.trim().toLowerCase();
+}
+const pendingClaimCookieName = "__Host-folio-pending-claim";
+
+interface PrefillHandoffCreateInput {
+  email: string;
+  externalReference: string;
+  publicId: string;
+  values: JsonRecord;
+}
+
+function prefillHandoffSecretMatches(
+  expectedSecret: string,
+  receivedSecret: string | null
+): boolean {
+  if (!receivedSecret) {
+    return false;
+  }
+  const expectedDigest = createHash("sha256").update(expectedSecret).digest();
+  const receivedDigest = createHash("sha256").update(receivedSecret).digest();
+  return timingSafeEqual(expectedDigest, receivedDigest);
+}
+
+function pendingClaimCookie(value: string, maxAge: number): string {
+  return `${pendingClaimCookieName}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function pendingClaimFor(request: Request): string | undefined {
+  const cookieHeader = request.headers.get("cookie");
+  if (!cookieHeader) {
+    return undefined;
+  }
+  for (const part of cookieHeader.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator === -1) {
+      continue;
+    }
+    const name = part.slice(0, separator).trim();
+    if (name !== pendingClaimCookieName) {
+      continue;
+    }
+    const value = part.slice(separator + 1).trim();
+    return value.length > 0 && value.length <= handoffCodeMaximumLength
+      ? value
+      : undefined;
+  }
+  return undefined;
+}
+
+function handoffUnavailable(): never {
+  fail(409, "handoff_unavailable", "The prefill handoff is unavailable");
+}
+
+function prefillRequired(): never {
+  fail(409, "prefill_required", "A prefill handoff is required");
+}
+
+function handoffEmail(value: unknown): string {
+  if (typeof value !== "string") {
+    fail(400, "invalid_request", "email must be a valid email address");
+  }
+  const email = normalizeEmail(value);
+  if (
+    email.length > accountEmailMaximumLength ||
+    !accountEmailPattern.test(email)
+  ) {
+    fail(400, "invalid_request", "email must be a valid email address");
+  }
+  return email;
+}
+
+function handoffExternalReference(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    value.trim().length > handoffExternalReferenceMaximumLength
+  ) {
+    fail(
+      400,
+      "invalid_request",
+      "externalReference must be a non-empty bounded string"
+    );
+  }
+  return value.trim();
+}
+
+function handoffCode(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    value.trim().length > handoffCodeMaximumLength
+  ) {
+    fail(400, "invalid_request", "code is required");
+  }
+  return value.trim();
+}
+
+function handoffCreateInput(input: JsonRecord): PrefillHandoffCreateInput {
+  const keys = Object.keys(input);
+  const expectedKeys = new Set([
+    "email",
+    "externalReference",
+    "publicId",
+    "values",
+  ]);
+  if (
+    keys.length !== expectedKeys.size ||
+    keys.some((key) => !expectedKeys.has(key))
+  ) {
+    fail(
+      400,
+      "invalid_request",
+      "publicId, email, externalReference, and values are required"
+    );
+  }
+  if (typeof input.publicId !== "string") {
+    fail(404, "not_found", "Form was not found");
+  }
+  const values = asRecord(input.values, "values must be a JSON object");
+  return {
+    email: handoffEmail(input.email),
+    externalReference: handoffExternalReference(input.externalReference),
+    publicId: input.publicId,
+    values,
+  };
+}
+
+async function readPrefillHandoffCode(request: Request): Promise<string> {
+  const contentType =
+    request.headers
+      .get("content-type")
+      ?.split(";", 1)[0]
+      ?.trim()
+      .toLowerCase() ?? "";
+  if (contentType === "" || contentType === "application/json") {
+    const body = await readJsonRecord(request, prefillHandoffBodyMaximumBytes);
+    return handoffCode(body.code);
+  }
+  const bytes = await readRequestBytes(
+    request,
+    prefillHandoffBodyMaximumBytes,
+    "The handoff code is required"
+  );
+  if (contentType === "application/x-www-form-urlencoded") {
+    const entries = new Map<string, string>();
+    for (const [key, value] of new URLSearchParams(
+      new TextDecoder().decode(bytes)
+    )) {
+      if (key !== "code" || entries.has(key)) {
+        fail(400, "invalid_request", "Only code is accepted");
+      }
+      entries.set(key, value);
+    }
+    return handoffCode(entries.get("code"));
+  }
+  if (contentType === "multipart/form-data") {
+    const multipartRequest = new Request(request.url, {
+      body: bytes,
+      headers: {
+        "content-type": request.headers.get("content-type") as string,
+      },
+      method: "POST",
+    });
+    let formData: Awaited<ReturnType<typeof multipartRequest.formData>>;
+    try {
+      formData = await multipartRequest.formData();
+    } catch {
+      fail(400, "invalid_request", "Multipart form data is invalid");
+    }
+    let code: string | undefined;
+    for (const [key, value] of formData.entries()) {
+      if (key !== "code" || typeof value !== "string" || code !== undefined) {
+        fail(400, "invalid_request", "Only code is accepted");
+      }
+      code = value;
+    }
+    return handoffCode(code);
+  }
+  fail(415, "invalid_request", "The handoff code body format is unsupported");
+}
+
+function externalPointerSegments(pointer: string): string[] | null {
+  if (!pointer.startsWith("/")) {
+    return null;
+  }
+  if (pointer === "/") {
+    return [""];
+  }
+  return pointer
+    .slice(1)
+    .split("/")
+    .map((segment) => {
+      let decoded = "";
+      for (let index = 0; index < segment.length; index += 1) {
+        const character = segment[index];
+        if (character !== "~") {
+          decoded += character;
+          continue;
+        }
+        const escape = segment[index + 1];
+        if (escape === "0") {
+          decoded += "~";
+        } else if (escape === "1") {
+          decoded += "/";
+        } else {
+          return "";
+        }
+        index += 1;
+      }
+      return decoded;
+    });
+}
+
+function externalValueAtPointer(values: JsonRecord, pointer: string): unknown {
+  if (Object.hasOwn(values, pointer)) {
+    return values[pointer];
+  }
+  const segments = externalPointerSegments(pointer);
+  if (!segments) {
+    return undefined;
+  }
+  let current: unknown = values;
+  for (const segment of segments) {
+    if (
+      !current ||
+      typeof current !== "object" ||
+      Array.isArray(current) ||
+      !Object.hasOwn(current, segment)
+    ) {
+      return undefined;
+    }
+    current = (current as JsonRecord)[segment];
+  }
+  return current;
+}
+
+function externalValueMatchesSchema(pointer: string, value: unknown): boolean {
+  const schemaItem = externalSchemaItems.find(
+    (candidate) => candidate.pointer === pointer
+  );
+  return (
+    schemaItem !== undefined &&
+    externalSchemaLeafType(value) === schemaItem.type
+  );
+}
+function filteredPrefillValues(
+  values: JsonRecord,
+  fields: readonly { pointer: string; tag: string }[]
+): JsonRecord {
+  const filtered: JsonRecord = {};
+  for (const field of fields) {
+    const value = externalValueAtPointer(values, field.pointer);
+    if (
+      value !== undefined &&
+      externalValueMatchesSchema(field.pointer, value)
+    ) {
+      filtered[field.tag] = value;
+    }
+  }
+  return filtered;
 }
 
 function loginDigest(kind: "email" | "ip", value: string): string {
@@ -1747,6 +2040,7 @@ const formAuditErrorCodes: Record<string, true> = {
   force_save_failed: true,
   form_has_responses: true,
   form_not_draft: true,
+  handoff_unavailable: true,
   internal_error: true,
   invalid_editor_capability: true,
   invalid_file_type: true,
@@ -1760,6 +2054,7 @@ const formAuditErrorCodes: Record<string, true> = {
   published_immutable: true,
   stale_document: true,
   stale_operation: true,
+  unauthorized: true,
 };
 
 function formAuditErrorCode(error: unknown): FormAuditErrorCode {
@@ -4532,6 +4827,520 @@ async function findFormByPublicId(
   return form;
 }
 
+interface PrefillHandoffLaunch {
+  claimToken: string;
+  publicId: string;
+}
+
+interface PrefillHandoffRedeemResult {
+  cleanupObjectKeys: string[];
+  response: ResponseWithSnapshot;
+}
+
+function publishedPrefillConfiguration(
+  form: {
+    publishedTemplate: {
+      contentHash: string;
+      id: string;
+      prefillConfiguration: {
+        configurationHash: string;
+        fields: { pointer: string; policy: PrefillPolicy; tag: string }[];
+        publishedTemplateId: string | null;
+      } | null;
+    } | null;
+    status: FormStatus;
+  } | null
+): {
+  configurationHash: string;
+  fields: { pointer: string; policy: PrefillPolicy; tag: string }[];
+  publishedTemplateId: string;
+  templateId: string;
+} | null {
+  const template = form?.publishedTemplate;
+  const configuration = template?.prefillConfiguration;
+  if (
+    !template ||
+    !configuration ||
+    configuration.fields.length === 0 ||
+    configuration.publishedTemplateId !== template.id ||
+    configuration.configurationHash !== template.contentHash ||
+    form.status !== FormStatus.published
+  ) {
+    return null;
+  }
+  return {
+    configurationHash: configuration.configurationHash,
+    fields: configuration.fields,
+    publishedTemplateId: configuration.publishedTemplateId,
+    templateId: template.id,
+  };
+}
+
+async function createPrefillHandoff(
+  input: PrefillHandoffCreateInput
+): Promise<{ code: string; launchPath: string }> {
+  if (!publicIdPattern.test(input.publicId)) {
+    fail(404, "not_found", "Form was not found");
+  }
+  const form = await prisma.form.findUnique({
+    include: {
+      publishedTemplate: {
+        include: { prefillConfiguration: { include: { fields: true } } },
+      },
+    },
+    where: { publicId: input.publicId },
+  });
+  if (!form) {
+    fail(404, "not_found", "Form was not found");
+  }
+  const configuration = publishedPrefillConfiguration(form);
+  if (!configuration) {
+    fail(404, "not_found", "Form was not found");
+  }
+  const filteredValues = filteredPrefillValues(
+    input.values,
+    configuration.fields
+  );
+  const code = randomBytes(32).toString("base64url");
+  const codeDigest = tokenDigest(code);
+  const externalReferenceDigest = tokenDigest(input.externalReference);
+  const expiresAt = new Date(Date.now() + handoffCodeLifetimeMs);
+
+  try {
+    await prisma.$transaction(
+      async (tx) => {
+        const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
+          Prisma.sql`
+            SELECT "id"
+            FROM "forms"
+            WHERE "id" = ${form.id}::uuid
+            FOR UPDATE
+          `
+        );
+        if (!lockedForm) {
+          fail(404, "not_found", "Form was not found");
+        }
+        const current = await tx.form.findUnique({
+          include: {
+            publishedTemplate: {
+              include: {
+                prefillConfiguration: { include: { fields: true } },
+              },
+            },
+          },
+          where: { id: lockedForm.id },
+        });
+        const currentConfiguration = publishedPrefillConfiguration(current);
+        if (!current || !currentConfiguration) {
+          fail(404, "not_found", "Form was not found");
+        }
+        if (
+          currentConfiguration.configurationHash !==
+          configuration.configurationHash
+        ) {
+          fail(404, "not_found", "Form was not found");
+        }
+        await tx.handoff.create({
+          data: {
+            codeDigest,
+            configurationHash: currentConfiguration.configurationHash,
+            expiresAt,
+            externalReferenceDigest,
+            filteredValues: jsonValue(filteredValues),
+            form: { connect: { id: current.id } },
+            id: crypto.randomUUID(),
+            normalizedEmail: input.email,
+          },
+        });
+        await createFormAudit(tx, {
+          action: "create_handoff",
+          actorId: null,
+          outcome: AuditOutcome.success,
+          safeMetadata: {},
+          targetId: current.publicId,
+        });
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    );
+  } catch (error) {
+    try {
+      await createFormFailureAudit({
+        action: "create_handoff",
+        actorId: null,
+        error,
+        targetId: publicIdPattern.test(input.publicId) ? input.publicId : null,
+      });
+    } catch {
+      // Preserve the route error if the failure audit cannot be persisted.
+    }
+    throw error;
+  }
+  return { code, launchPath: "/prefill/handoff" };
+}
+
+async function launchPrefillHandoff(
+  code: string
+): Promise<PrefillHandoffLaunch> {
+  const codeDigest = tokenDigest(code);
+  let auditTargetId: string | null = null;
+  try {
+    const launch = await prisma.$transaction(
+      async (tx) => {
+        const [lockedHandoff] = await tx.$queryRaw<{ id: string }[]>(
+          Prisma.sql`
+            SELECT "id"
+            FROM "handoffs"
+            WHERE "code_digest" = ${codeDigest}
+            FOR UPDATE
+          `
+        );
+        if (!lockedHandoff) {
+          handoffUnavailable();
+        }
+        const handoff = await tx.handoff.findUnique({
+          where: { id: lockedHandoff.id },
+        });
+        const form = handoff
+          ? await tx.form.findUnique({
+              include: {
+                publishedTemplate: {
+                  include: {
+                    prefillConfiguration: { include: { fields: true } },
+                  },
+                },
+              },
+              where: { id: handoff.formId },
+            })
+          : null;
+        auditTargetId =
+          form && publicIdPattern.test(form.publicId) ? form.publicId : null;
+        const configuration = publishedPrefillConfiguration(form);
+        const now = new Date();
+        if (
+          !handoff ||
+          !form ||
+          !configuration ||
+          handoff.status !== HandoffStatus.pending ||
+          handoff.expiresAt <= now
+        ) {
+          handoffUnavailable();
+        }
+        const claimToken = randomBytes(32).toString("base64url");
+        await tx.pendingClaim.create({
+          data: {
+            claimDigest: tokenDigest(claimToken),
+            expiresAt: new Date(
+              now.getTime() + pendingClaimLifetimeSeconds * 1000
+            ),
+            handoff: { connect: { id: handoff.id } },
+            id: crypto.randomUUID(),
+          },
+        });
+        const reserved = await tx.handoff.updateMany({
+          data: { reservedAt: now, status: HandoffStatus.reserved },
+          where: {
+            expiresAt: { gt: now },
+            id: handoff.id,
+            status: HandoffStatus.pending,
+          },
+        });
+        if (reserved.count !== 1) {
+          handoffUnavailable();
+        }
+        await createFormAudit(tx, {
+          action: "launch_handoff",
+          actorId: null,
+          outcome: AuditOutcome.success,
+          safeMetadata: {},
+          targetId: form.publicId,
+        });
+        return { claimToken, publicId: form.publicId };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    );
+    return launch;
+  } catch (error) {
+    try {
+      await createFormFailureAudit({
+        action: "launch_handoff",
+        actorId: null,
+        error,
+        targetId: auditTargetId,
+      });
+    } catch {
+      // Preserve the route error if the failure audit cannot be persisted.
+    }
+    throw error;
+  }
+}
+
+async function redeemPrefillHandoff(
+  form: FormWithDocuments,
+  identity: Identity,
+  claimToken: string
+): Promise<PrefillHandoffRedeemResult> {
+  const responseHint = await prisma.response.findUnique({
+    select: { id: true, status: true },
+    where: { formId_userId: { formId: form.id, userId: identity.id } },
+  });
+  if (responseHint?.status === ResponseStatus.submitted) {
+    handoffUnavailable();
+  }
+  const responseId = responseHint?.id ?? crypto.randomUUID();
+  const publishedTemplate = form.publishedTemplate;
+  if (!publishedTemplate?.objectKey || !publishedTemplate.documentKey) {
+    handoffUnavailable();
+  }
+  if (!(await objectExists(publishedTemplate.objectKey))) {
+    handoffUnavailable();
+  }
+  const document = await readObject(publishedTemplate.objectKey);
+  const draftObjectKey = objectKey(
+    "responses",
+    responseId,
+    "draft",
+    crypto.randomUUID(),
+    "docx"
+  );
+  const draftDocumentKey = `response-${responseId}-${crypto.randomUUID()}`;
+  await putObject(draftObjectKey, document, DOCX_CONTENT_TYPE);
+  const claimDigest = tokenDigest(claimToken);
+  let oldDraftObjectKey: string | null = null;
+  try {
+    const response = await prisma.$transaction(
+      async (tx) => {
+        const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
+          Prisma.sql`
+            SELECT "id"
+            FROM "forms"
+            WHERE "id" = ${form.id}::uuid
+            FOR UPDATE
+          `
+        );
+        if (!lockedForm) {
+          handoffUnavailable();
+        }
+        const currentForm = await tx.form.findUnique({
+          include: {
+            publishedTemplate: {
+              include: {
+                prefillConfiguration: { include: { fields: true } },
+              },
+            },
+          },
+          where: { id: lockedForm.id },
+        });
+        const configuration = publishedPrefillConfiguration(currentForm);
+        if (
+          !currentForm ||
+          currentForm.publicId !== form.publicId ||
+          !configuration ||
+          !currentForm.publishedTemplate
+        ) {
+          handoffUnavailable();
+        }
+        const [lockedClaim] = await tx.$queryRaw<{ id: string }[]>(
+          Prisma.sql`
+            SELECT "id"
+            FROM "pending_claims"
+            WHERE "claim_digest" = ${claimDigest}
+            FOR UPDATE
+          `
+        );
+        if (!lockedClaim) {
+          handoffUnavailable();
+        }
+        const pendingClaim = await tx.pendingClaim.findUnique({
+          include: { handoff: true },
+          where: { id: lockedClaim.id },
+        });
+        const handoff = pendingClaim?.handoff;
+        const now = new Date();
+        if (
+          !pendingClaim ||
+          !handoff ||
+          pendingClaim.consumedAt ||
+          pendingClaim.expiresAt <= now ||
+          handoff.formId !== currentForm.id ||
+          handoff.status !== HandoffStatus.reserved ||
+          handoff.consumedAt ||
+          handoff.expiresAt <= now ||
+          handoff.normalizedEmail !== normalizeEmail(identity.email) ||
+          handoff.configurationHash !== configuration.configurationHash ||
+          configuration.publishedTemplateId !==
+            currentForm.publishedTemplate.id ||
+          configuration.configurationHash !==
+            currentForm.publishedTemplate.contentHash
+        ) {
+          handoffUnavailable();
+        }
+        const currentResponse = await tx.response.findUnique({
+          include: { submission: true },
+          where: {
+            formId_userId: { formId: currentForm.id, userId: identity.id },
+          },
+        });
+        if (
+          currentResponse?.status === ResponseStatus.submitted ||
+          currentResponse?.status === ResponseStatus.submitting ||
+          (currentResponse &&
+            (await tx.operation.findFirst({
+              select: { id: true },
+              where: {
+                responseId: currentResponse.id,
+                status: {
+                  in: [OperationStatus.pending, OperationStatus.processing],
+                },
+              },
+            })))
+        ) {
+          handoffUnavailable();
+        }
+        const storedValues = jsonRecord(
+          handoff.filteredValues,
+          "The prefill handoff values are invalid"
+        );
+        const values: JsonRecord = {};
+        const lockedFields: JsonRecord = {};
+        for (const field of configuration.fields) {
+          const value = storedValues[field.tag];
+          if (
+            value !== undefined &&
+            externalValueMatchesSchema(field.pointer, value)
+          ) {
+            values[field.tag] = value;
+            lockedFields[field.tag] =
+              field.policy === PrefillPolicy.lock_when_available;
+          }
+        }
+        const responseTargetId = currentResponse?.id ?? responseId;
+        oldDraftObjectKey = currentResponse?.draftObjectKey ?? null;
+        if (currentResponse) {
+          await tx.editorLease.deleteMany({
+            where: {
+              targetId: currentResponse.id,
+              targetType: OperationTargetType.response,
+            },
+          });
+          await tx.operation.deleteMany({
+            where: { responseId: currentResponse.id },
+          });
+          await tx.prefillSnapshot.deleteMany({
+            where: { responseId: currentResponse.id },
+          });
+          await tx.response.update({
+            data: {
+              draftData: Prisma.DbNull,
+              draftDocumentKey,
+              draftObjectKey,
+              externalReferenceDigest: handoff.externalReferenceDigest,
+              publishedTemplateId: currentForm.publishedTemplate.id,
+              publishedVersion: currentForm.version,
+              status: ResponseStatus.draft,
+              updatedAt: now,
+            },
+            where: { id: responseTargetId },
+          });
+        } else {
+          await tx.response.create({
+            data: {
+              draftData: Prisma.DbNull,
+              draftDocumentKey,
+              draftObjectKey,
+              externalReferenceDigest: handoff.externalReferenceDigest,
+              form: { connect: { id: currentForm.id } },
+              id: responseTargetId,
+              owner: { connect: { id: identity.id } },
+              publishedTemplate: {
+                connect: { id: currentForm.publishedTemplate.id },
+              },
+              publishedVersion: currentForm.version,
+              status: ResponseStatus.draft,
+            },
+          });
+        }
+        await tx.prefillSnapshot.create({
+          data: {
+            form: { connect: { id: currentForm.id } },
+            id: crypto.randomUUID(),
+            lockedFields: jsonValue(lockedFields),
+            owner: { connect: { id: identity.id } },
+            response: { connect: { id: responseTargetId } },
+            values: jsonValue(values),
+          },
+        });
+        const consumedClaim = await tx.pendingClaim.updateMany({
+          data: { consumedAt: now },
+          where: {
+            consumedAt: null,
+            expiresAt: { gt: now },
+            id: pendingClaim.id,
+          },
+        });
+        if (consumedClaim.count !== 1) {
+          handoffUnavailable();
+        }
+        const consumedHandoff = await tx.handoff.updateMany({
+          data: {
+            consumedAt: now,
+            responseId: responseTargetId,
+            status: HandoffStatus.consumed,
+          },
+          where: {
+            consumedAt: null,
+            expiresAt: { gt: now },
+            id: handoff.id,
+            status: HandoffStatus.reserved,
+          },
+        });
+        if (consumedHandoff.count !== 1) {
+          handoffUnavailable();
+        }
+        await createFormAudit(tx, {
+          action: "redeem_handoff",
+          actorId: identity.id,
+          outcome: AuditOutcome.success,
+          safeMetadata: {},
+          targetId: currentForm.publicId,
+        });
+        const created = await tx.response.findUnique({
+          include: { prefillSnapshot: true },
+          where: { id: responseTargetId },
+        });
+        if (!created) {
+          fail(500, "start_failed", "Unable to redeem prefill handoff");
+        }
+        return created;
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    );
+    return {
+      cleanupObjectKeys: uniqueObjectKeys([oldDraftObjectKey]),
+      response,
+    };
+  } catch (error) {
+    await deleteObjectUnlessCanonical(draftObjectKey);
+    const normalizedError =
+      databaseErrorCode(error) === "P2002" || isSerializationConflict(error)
+        ? new HttpError(
+            409,
+            "handoff_unavailable",
+            "The prefill handoff is unavailable"
+          )
+        : error;
+    try {
+      await createFormFailureAudit({
+        action: "redeem_handoff",
+        actorId: identity.id,
+        error: normalizedError,
+        targetId: publicIdPattern.test(form.publicId) ? form.publicId : null,
+      });
+    } catch {
+      // Preserve the route error if the failure audit cannot be persisted.
+    }
+    throw normalizedError;
+  }
+}
 async function findOwnedResponse(
   responseId: string,
   formId: string,
@@ -4654,6 +5463,8 @@ export function createApp(options: AppOptions = {}) {
     : callbackOrigins;
   const callbackMaximumBytes =
     options.onlyOfficeCallbackMaxBytes ?? maxCallbackDocumentBytes;
+  const prefillHandoffSecret =
+    options.prefillHandoffSecret ?? env.EDITOR_CAPABILITY_SECRET;
   return new Elysia()
     .onError(({ error, set }) => {
       if (error instanceof HttpError) {
@@ -4680,15 +5491,98 @@ export function createApp(options: AppOptions = {}) {
     .use(
       cors({
         allowedHeaders: [
-          "Content-Type",
           "Authorization",
+          "Content-Type",
           "X-Editor-Capability",
+          "X-Prefill-Handoff-Secret",
         ],
         credentials: true,
         methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         origin: env.CORS_ORIGIN,
       })
     )
+    .post("/api/integrations/prefill/handoffs", async ({ body, request }) => {
+      if (
+        !prefillHandoffSecretMatches(
+          prefillHandoffSecret,
+          request.headers.get("x-prefill-handoff-secret")
+        )
+      ) {
+        try {
+          await createFormFailureAudit({
+            action: "create_handoff",
+            actorId: null,
+            error: new HttpError(
+              404,
+              "handoff_unavailable",
+              "The prefill handoff is unavailable"
+            ),
+            targetId: null,
+          });
+        } catch {
+          // Preserve the non-enumerating response if the audit cannot be written.
+        }
+        fail(404, "handoff_unavailable", "The prefill handoff is unavailable");
+      }
+      try {
+        return await createPrefillHandoff(handoffCreateInput(asRecord(body)));
+      } catch (error) {
+        if (error instanceof HttpError && error.code === "not_found") {
+          fail(
+            404,
+            "handoff_unavailable",
+            "The prefill handoff is unavailable"
+          );
+        }
+        throw error;
+      }
+    })
+    .post(
+      "/prefill/handoff",
+      async ({ request }) => {
+        try {
+          const launch = await launchPrefillHandoff(
+            await readPrefillHandoffCode(request)
+          );
+          return new Response(null, {
+            headers: {
+              Location: `/forms/${launch.publicId}/fill`,
+              "Set-Cookie": pendingClaimCookie(
+                launch.claimToken,
+                pendingClaimLifetimeSeconds
+              ),
+            },
+            status: 303,
+          });
+        } catch (error) {
+          try {
+            await createFormFailureAudit({
+              action: "launch_handoff",
+              actorId: null,
+              error,
+              targetId: null,
+            });
+          } catch {
+            // Preserve the retryable redirect if the audit cannot be written.
+          }
+          return new Response(null, {
+            headers: {
+              Location: "/handoff?error=handoff_unavailable",
+              "Set-Cookie": pendingClaimCookie("", 0),
+            },
+            status: 303,
+          });
+        }
+      },
+      { parse: "none" }
+    )
+    .get("/prefill/handoff", () => {
+      fail(
+        405,
+        "handoff_unavailable",
+        "The prefill handoff must be launched with a top-level POST"
+      );
+    })
     .post("/api/auth/sign-in/email", ({ body, request, server }) => {
       const sourceIp =
         options.requestIp?.(request) ??
@@ -6298,10 +7192,19 @@ export function createApp(options: AppOptions = {}) {
         return userEditorConfig(form, identity, responseId, requestedAction);
       }
     )
-    .post("/api/forms/:publicId/start", async ({ request, params }) => {
+    .post("/api/forms/:publicId/start", async ({ request, params, set }) => {
       const identity = await requireIdentity(request);
       const form = await findFormByPublicId(params.publicId);
       const publishedTemplate = form.publishedTemplate;
+      const pendingClaimToken = pendingClaimFor(request);
+      const prefillConfiguration = publishedTemplate
+        ? await prisma.prefillConfiguration.findUnique({
+            include: { fields: true },
+            where: { publishedTemplateId: publishedTemplate.id },
+          })
+        : null;
+      const hasPrefillConfiguration =
+        (prefillConfiguration?.fields.length ?? 0) > 0;
       const existing = await prisma.response.findUnique({
         include: { prefillSnapshot: true, submission: true },
         where: {
@@ -6339,6 +7242,36 @@ export function createApp(options: AppOptions = {}) {
           "operation_in_progress",
           "Your submission is being processed"
         );
+      }
+      if (pendingClaimToken) {
+        if (!hasPrefillConfiguration) {
+          handoffUnavailable();
+        }
+        try {
+          const redeemed = await redeemPrefillHandoff(
+            form,
+            identity,
+            pendingClaimToken
+          );
+          await deleteObjects(redeemed.cleanupObjectKeys);
+          set.headers["Set-Cookie"] = pendingClaimCookie("", 0);
+          return {
+            editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${redeemed.response.id}&action=fill`,
+            prefill: {
+              data: jsonRecord(redeemed.response.prefillSnapshot?.values),
+              editableFields: redeemed.response.prefillSnapshot
+                ? editableFieldsForSnapshot(redeemed.response.prefillSnapshot)
+                : {},
+            },
+            response: responseSummary(redeemed.response),
+          };
+        } catch (error) {
+          set.headers["Set-Cookie"] = pendingClaimCookie("", 0);
+          throw error;
+        }
+      }
+      if (hasPrefillConfiguration && !existing) {
+        prefillRequired();
       }
       if (
         existing?.status === ResponseStatus.draft &&
@@ -6691,6 +7624,22 @@ export function createApp(options: AppOptions = {}) {
           },
         });
         await tx.operation.deleteMany({ where: { responseId: current.id } });
+        await tx.pendingClaim.deleteMany({
+          where: { handoff: { responseId: current.id } },
+        });
+        await tx.handoff.updateMany({
+          data: { status: HandoffStatus.deleted },
+          where: {
+            responseId: current.id,
+            status: {
+              in: [
+                HandoffStatus.pending,
+                HandoffStatus.reserved,
+                HandoffStatus.consumed,
+              ],
+            },
+          },
+        });
         await tx.response.delete({ where: { id: current.id } });
         await tx.auditEvent.create({
           data: {

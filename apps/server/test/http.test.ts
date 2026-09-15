@@ -1346,7 +1346,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   );
   expect(emptyRulesResponse.status).toBe(200);
   expect(await emptyRulesResponse.json()).toEqual({ rules: [] });
-  const selectedPointer = schemaFirst.items[0]?.pointer;
+  const selectedPointer = schemaFirst.items.find(
+    (item) => item.type === "string"
+  )?.pointer;
   if (!selectedPointer) {
     throw new Error("Schema did not return a selectable pointer");
   }
@@ -2831,6 +2833,263 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   if (!formRecord) {
     throw new Error("The published test form was not found");
   }
+  const prefillHandoffSecret = process.env.EDITOR_CAPABILITY_SECRET ?? "";
+  const handoffExternalReference = `ticket-17-reference-${crypto.randomUUID()}`;
+  const handoffCandidateValues = {
+    account: { active: true },
+    person: { name: "Ticket 17 Prefill" },
+    [selectedPointer]: selectedPointer.endsWith("/active")
+      ? true
+      : "Ticket 17 Prefill",
+  };
+  const ordinaryStartBeforeHandoff = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  expect(ordinaryStartBeforeHandoff.status).toBe(409);
+  expect(await ordinaryStartBeforeHandoff.json()).toMatchObject({
+    error: "prefill_required",
+  });
+  const invalidHandoffSecret = await app.handle(
+    new Request("http://test.local/api/integrations/prefill/handoffs", {
+      body: JSON.stringify({
+        email: userEmail,
+        externalReference: handoffExternalReference,
+        publicId: formRecord.publicId,
+        values: handoffCandidateValues,
+      }),
+      headers: {
+        ...jsonHeaders,
+        "X-Prefill-Handoff-Secret": "wrong-secret",
+      },
+      method: "POST",
+    })
+  );
+  expect(invalidHandoffSecret.status).toBe(404);
+  expect(await invalidHandoffSecret.json()).toMatchObject({
+    error: "handoff_unavailable",
+  });
+  const handoffCreateResponse = await app.handle(
+    new Request("http://test.local/api/integrations/prefill/handoffs", {
+      body: JSON.stringify({
+        email: ` ${userEmail.toUpperCase()} `,
+        externalReference: handoffExternalReference,
+        publicId: formRecord.publicId,
+        values: handoffCandidateValues,
+      }),
+      headers: {
+        ...jsonHeaders,
+        "X-Prefill-Handoff-Secret": prefillHandoffSecret,
+      },
+      method: "POST",
+    })
+  );
+  expect(handoffCreateResponse.status).toBe(200);
+  const handoffCreateBody = (await handoffCreateResponse.json()) as {
+    code?: string;
+    launchPath?: string;
+  };
+  if (!handoffCreateBody.code) {
+    throw new Error("The external mock did not return a handoff code");
+  }
+  expect(handoffCreateBody.code).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+  expect(handoffCreateBody.launchPath).toBe("/prefill/handoff");
+  const handoffRecord = await prisma.handoff.findFirstOrThrow({
+    orderBy: { createdAt: "desc" },
+    where: {
+      externalReferenceDigest: createHash("sha256")
+        .update(handoffExternalReference)
+        .digest("hex"),
+    },
+  });
+  expect(handoffRecord.codeDigest).toBe(
+    createHash("sha256").update(handoffCreateBody.code).digest("hex")
+  );
+  expect(handoffRecord.codeDigest).not.toBe(handoffCreateBody.code);
+  expect(handoffRecord.codeDigest).toHaveLength(64);
+  expect(handoffRecord.expiresAt.getTime()).toBeGreaterThan(Date.now());
+  expect(handoffRecord.expiresAt.getTime()).toBeLessThanOrEqual(
+    Date.now() + 120_000 + 1000
+  );
+  expect(handoffRecord.filteredValues).toEqual({
+    full_name: selectedPointer.endsWith("/active") ? true : "Ticket 17 Prefill",
+  });
+  const getLaunchResponse = await app.handle(
+    new Request(
+      `http://test.local${handoffCreateBody.launchPath}?code=${handoffCreateBody.code}`
+    )
+  );
+  expect(getLaunchResponse.status).toBe(405);
+  const launchResponse = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: handoffCreateBody.code }),
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      method: "POST",
+    })
+  );
+  expect(launchResponse.status).toBe(303);
+  expect(launchResponse.headers.get("location")).toBe(
+    `/forms/${formRecord.publicId}/fill`
+  );
+  const pendingCookie = launchResponse.headers
+    .get("set-cookie")
+    ?.split(";", 1)[0];
+  if (!pendingCookie) {
+    throw new Error("The handoff launch did not set a pending claim cookie");
+  }
+  const launchCookieHeader = launchResponse.headers.get("set-cookie") ?? "";
+  expect(launchCookieHeader).toContain("__Host-folio-pending-claim=");
+  expect(launchCookieHeader).toContain("Path=/");
+  expect(launchCookieHeader).toContain("Max-Age=600");
+  expect(launchCookieHeader).toContain("HttpOnly");
+  expect(launchCookieHeader).toContain("Secure");
+  expect(launchCookieHeader).toContain("SameSite=Lax");
+  const redeemedStartResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: {
+        Authorization: `Bearer ${userBearer}`,
+        Cookie: pendingCookie,
+      },
+      method: "POST",
+    })
+  );
+  expect(redeemedStartResponse.status).toBe(200);
+  const redeemedStartBody = (await redeemedStartResponse.json()) as {
+    editorConfigUrl?: string;
+    prefill?: { data?: Record<string, unknown> };
+    response?: { id?: string };
+  };
+  expect(redeemedStartBody.editorConfigUrl).toContain("action=fill");
+  expect(redeemedStartBody.prefill?.data).toEqual({
+    full_name: selectedPointer.endsWith("/active") ? true : "Ticket 17 Prefill",
+  });
+  const handoffResponseId = redeemedStartBody.response?.id;
+  if (!handoffResponseId) {
+    throw new Error("The handoff did not create a Response");
+  }
+  const redeemedSnapshot = await prisma.prefillSnapshot.findUniqueOrThrow({
+    where: { responseId: handoffResponseId },
+  });
+  expect(redeemedSnapshot.values).toEqual({
+    full_name: selectedPointer.endsWith("/active") ? true : "Ticket 17 Prefill",
+  });
+  expect(
+    await prisma.response.findUniqueOrThrow({
+      select: { externalReferenceDigest: true },
+      where: { id: handoffResponseId },
+    })
+  ).toEqual({
+    externalReferenceDigest: createHash("sha256")
+      .update(handoffExternalReference)
+      .digest("hex"),
+  });
+  const replayedHandoffStart = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: {
+        Authorization: `Bearer ${userBearer}`,
+        Cookie: pendingCookie,
+      },
+      method: "POST",
+    })
+  );
+  expect(replayedHandoffStart.status).toBe(409);
+  expect(await replayedHandoffStart.json()).toMatchObject({
+    error: "handoff_unavailable",
+  });
+  const redeemedHandoffRecord = await prisma.handoff.findUniqueOrThrow({
+    where: { id: handoffRecord.id },
+  });
+  expect(redeemedHandoffRecord.status).toBe("consumed");
+  expect(redeemedHandoffRecord.responseId).toBe(handoffResponseId);
+  const raceUserEmail = `ticket-17-race-${crypto.randomUUID()}@example.com`;
+  await createCredentialFixture({
+    email: raceUserEmail,
+    name: "Ticket 17 Race User",
+    password,
+  });
+  const raceUserBearer = await bearerFor(raceUserEmail, password);
+  const raceHandoffReference = `ticket-17-race-${crypto.randomUUID()}`;
+  const raceHandoffCreate = await app.handle(
+    new Request("http://test.local/api/integrations/prefill/handoffs", {
+      body: JSON.stringify({
+        email: raceUserEmail,
+        externalReference: raceHandoffReference,
+        publicId: formRecord.publicId,
+        values: handoffCandidateValues,
+      }),
+      headers: {
+        ...jsonHeaders,
+        "X-Prefill-Handoff-Secret": prefillHandoffSecret,
+      },
+      method: "POST",
+    })
+  );
+  expect(raceHandoffCreate.status).toBe(200);
+  const raceHandoffCode = ((await raceHandoffCreate.json()) as { code: string })
+    .code;
+  const raceHandoffLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: raceHandoffCode }),
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      method: "POST",
+    })
+  );
+  expect(raceHandoffLaunch.status).toBe(303);
+  const racePendingCookie = raceHandoffLaunch.headers
+    .get("set-cookie")
+    ?.split(";", 1)[0];
+  if (!racePendingCookie) {
+    throw new Error("The race handoff did not set a pending claim cookie");
+  }
+  const raceStarts = await Promise.all(
+    [0, 1].map(() =>
+      app.handle(
+        new Request(
+          `http://test.local/api/forms/${formRecord.publicId}/start`,
+          {
+            headers: {
+              Authorization: `Bearer ${raceUserBearer}`,
+              Cookie: racePendingCookie,
+            },
+            method: "POST",
+          }
+        )
+      )
+    )
+  );
+  expect(raceStarts.map((response) => response.status).toSorted()).toEqual([
+    200, 409,
+  ]);
+  const handoffRaceBodies = (await Promise.all(
+    raceStarts.map((response) => response.json())
+  )) as { response?: { id?: string } }[];
+  const raceResponseId = handoffRaceBodies.find((body) => body.response?.id)
+    ?.response?.id;
+  if (!raceResponseId) {
+    throw new Error("The handoff race did not create a Response");
+  }
+  const raceHandoffRecord = await prisma.handoff.findFirstOrThrow({
+    where: {
+      externalReferenceDigest: createHash("sha256")
+        .update(raceHandoffReference)
+        .digest("hex"),
+    },
+  });
+  expect(raceHandoffRecord.status).toBe("consumed");
+  expect(raceHandoffRecord.responseId).toBe(raceResponseId);
+  const raceDiscard = await app.handle(
+    new Request(`http://test.local/api/responses/${raceResponseId}`, {
+      headers: { Authorization: `Bearer ${raceUserBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(raceDiscard.status).toBe(200);
+  const deletedRaceHandoff = await prisma.handoff.findUniqueOrThrow({
+    where: { id: raceHandoffRecord.id },
+  });
+  expect(deletedRaceHandoff.status).toBe("deleted");
   const concurrentStarts = await Promise.all(
     [0, 1].map(() =>
       app.handle(
@@ -4208,9 +4467,46 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       version: 1,
     },
   });
+  const archivedHandoffReference = `ticket-17-archived-${crypto.randomUUID()}`;
+  const archivedHandoffCreate = await app.handle(
+    new Request("http://test.local/api/integrations/prefill/handoffs", {
+      body: JSON.stringify({
+        email: archivedNoResponseEmail,
+        externalReference: archivedHandoffReference,
+        publicId: formPublicId,
+        values: handoffCandidateValues,
+      }),
+      headers: {
+        ...jsonHeaders,
+        "X-Prefill-Handoff-Secret": prefillHandoffSecret,
+      },
+      method: "POST",
+    })
+  );
+  expect(archivedHandoffCreate.status).toBe(200);
+  const archivedHandoffCode = (
+    (await archivedHandoffCreate.json()) as { code: string }
+  ).code;
+  const archivedHandoffLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: archivedHandoffCode }),
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      method: "POST",
+    })
+  );
+  expect(archivedHandoffLaunch.status).toBe(303);
+  const archivedPendingCookie = archivedHandoffLaunch.headers
+    .get("set-cookie")
+    ?.split(";", 1)[0];
+  if (!archivedPendingCookie) {
+    throw new Error("The archived handoff did not set a pending claim cookie");
+  }
   const unarchivedStartResponse = await app.handle(
     new Request(`http://test.local/api/forms/${formPublicId}/start`, {
-      headers: { Authorization: `Bearer ${archivedNoResponseBearer}` },
+      headers: {
+        Authorization: `Bearer ${archivedNoResponseBearer}`,
+        Cookie: archivedPendingCookie,
+      },
       method: "POST",
     })
   );
@@ -4280,9 +4576,46 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     })
   );
   expect(await responsesAfterDiscard.json()).toEqual({ responses: [] });
+  const restartHandoffReference = `ticket-17-restart-${crypto.randomUUID()}`;
+  const restartHandoffCreate = await app.handle(
+    new Request("http://test.local/api/integrations/prefill/handoffs", {
+      body: JSON.stringify({
+        email: archivedNoResponseEmail,
+        externalReference: restartHandoffReference,
+        publicId: formPublicId,
+        values: handoffCandidateValues,
+      }),
+      headers: {
+        ...jsonHeaders,
+        "X-Prefill-Handoff-Secret": prefillHandoffSecret,
+      },
+      method: "POST",
+    })
+  );
+  expect(restartHandoffCreate.status).toBe(200);
+  const restartHandoffCode = (
+    (await restartHandoffCreate.json()) as { code: string }
+  ).code;
+  const restartHandoffLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: restartHandoffCode }),
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      method: "POST",
+    })
+  );
+  expect(restartHandoffLaunch.status).toBe(303);
+  const restartPendingCookie = restartHandoffLaunch.headers
+    .get("set-cookie")
+    ?.split(";", 1)[0];
+  if (!restartPendingCookie) {
+    throw new Error("The restart handoff did not set a pending claim cookie");
+  }
   const restartAfterDiscard = await app.handle(
     new Request(`http://test.local/api/forms/${formPublicId}/start`, {
-      headers: { Authorization: `Bearer ${archivedNoResponseBearer}` },
+      headers: {
+        Authorization: `Bearer ${archivedNoResponseBearer}`,
+        Cookie: restartPendingCookie,
+      },
       method: "POST",
     })
   );

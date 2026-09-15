@@ -238,7 +238,11 @@ const request = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
-  const response = await fetch(`${API_ORIGIN}${path}`, { ...init, headers });
+  const response = await fetch(`${API_ORIGIN}${path}`, {
+    ...init,
+    credentials: "include",
+    headers,
+  });
   const text = await response.text();
   let body: ApiErrorBody | T | string | null = null;
   if (text) {
@@ -288,6 +292,7 @@ export const apiDelete = <T>(path: string) =>
 export const downloadArtifact = async (path: string, filename: string) => {
   const token = getToken();
   const response = await fetch(`${API_ORIGIN}${path}`, {
+    credentials: "include",
     headers: token ? { Authorization: `Bearer ${token}` } : undefined,
   });
   if (!response.ok) {
@@ -314,6 +319,7 @@ export const signIn = async (
 ): Promise<SignInResponse> => {
   const response = await fetch(`${API_ORIGIN}/api/auth/sign-in/email`, {
     body: JSON.stringify({ email, password }),
+    credentials: "include",
     headers: { "Content-Type": "application/json" },
     method: "POST",
   });

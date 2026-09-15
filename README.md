@@ -197,6 +197,15 @@ The prefill is snapshotted when the response starts. Resuming a draft does not r
 Static document images remain non-editable. Picture input uses ONLYOFFICE's native control; the canonical DOCX is authoritative, with no separate image upload or image object.
 Submission is complete only after the extracted field JSON and canonical filled DOCX are persisted. PDF is an on-demand export and is not durable submission state.
 
+### External editable Prefill handoff
+
+An external system uses the deterministic mock's schema pointers, then calls `POST /api/integrations/prefill/handoffs` with `X-Prefill-Handoff-Secret` and the published Form public ID, normalized email, external reference, and candidate scalar object. Folio filters the candidate through the immutable Prefill Configuration and retains only configured tag values. Invalid credentials and unavailable Forms return the same non-enumerating failure.
+
+The response contains a 32-byte random, base64url one-time code and the `/prefill/handoff` launch path. The external system must submit that code in the body of a top-level `POST` form; codes in URLs are not accepted. Folio stores only SHA-256 digests, expires the launch code after 120 seconds, and exchanges it for a ten-minute `__Host-folio-pending-claim` cookie (`Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`). The pending claim survives login and mandatory password replacement; no code or Prefill value is written to a URL, localStorage, or sessionStorage.
+
+After authentication, the clean Form path redeems the claim once. Folio verifies the email, Form, published Prefill Configuration, and expiry inside one serializable transaction before creating the user's Response, copying the published DOCX, and snapshotting editable or `lock-when-available` Prefill values. A configured Form rejects an ordinary share-link start. Discarding its Draft invalidates the claim and requires a new external Handoff. Invalid, expired, replayed, or mismatched claims return an accessible Thai retry state, and Handoff Audit Events contain only safe target references.
+
+
 ## DOCX template requirements
 
 Fields are ONLYOFFICE content controls. Their tags are the stable field keys used in JSON and prefill data.

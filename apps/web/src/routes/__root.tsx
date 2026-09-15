@@ -120,7 +120,9 @@ const AuthGate = () => {
   }
 
   const authenticationRoute =
-    pathname === "/login" || pathname === "/change-password";
+    pathname === "/login" ||
+    pathname === "/change-password" ||
+    pathname === "/handoff";
   if (!user && !authenticationRoute) {
     return (
       <Navigate
@@ -134,7 +136,8 @@ const AuthGate = () => {
   const restricted =
     user?.mustChangePassword &&
     pathname !== "/login" &&
-    pathname !== "/change-password";
+    pathname !== "/change-password" &&
+    pathname !== "/handoff";
   if (restricted) {
     return (
       <Navigate

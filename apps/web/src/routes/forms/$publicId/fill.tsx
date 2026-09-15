@@ -32,6 +32,12 @@ import {
 
 const formRequestError = (error: unknown, fallback: string) => {
   if (error instanceof ApiError) {
+    if (error.code === "handoff_unavailable") {
+      return "ลิงก์เปิดแบบฟอร์มหมดอายุหรือใช้ไม่ได้ กรุณากลับไปยังระบบต้นทางแล้วลองใหม่";
+    }
+    if (error.code === "prefill_required") {
+      return "แบบฟอร์มนี้ต้องเปิดจากระบบต้นทาง กรุณากลับไปยังระบบต้นทางแล้วลองใหม่";
+    }
     if (error.status === 401) {
       return "เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่";
     }
@@ -40,6 +46,21 @@ const formRequestError = (error: unknown, fallback: string) => {
     }
   }
   return fallback;
+};
+
+const isHandoffError = (error: unknown): error is ApiError =>
+  error instanceof ApiError &&
+  (error.code === "handoff_unavailable" || error.code === "prefill_required");
+
+const returnToSource = () => {
+  if (typeof window === "undefined") {
+    return;
+  }
+  if (window.history.length > 1) {
+    window.history.back();
+    return;
+  }
+  window.location.assign("/");
 };
 type ExitIntent = "dashboard" | "navigation" | "reauth";
 
@@ -69,7 +90,10 @@ const FillRoute = () => {
   const [editorConfigUrl, setEditorConfigUrl] = useState<string | null>(null);
   const [activeResponseId, setActiveResponseId] = useState(responseId);
   const [loading, setLoading] = useState(true);
+  const [startBusy, setStartBusy] = useState(false);
+  const [startAttempt, setStartAttempt] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [handoffError, setHandoffError] = useState(false);
   const [operationError, setOperationError] = useState<string | null>(null);
   const [operation, setOperation] = useState<Operation | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -82,6 +106,7 @@ const FillRoute = () => {
   );
   const [clearDirtyRequest, setClearDirtyRequest] = useState(0);
   const [discardBusy, setDiscardBusy] = useState(false);
+  const startErrorRef = useRef<HTMLDivElement>(null);
   const exportSaveResolverRef = useRef<{
     reject: (reason?: unknown) => void;
     resolve: (value: boolean | PromiseLike<boolean>) => void;
@@ -124,6 +149,7 @@ const FillRoute = () => {
     setForm(null);
     setEditorConfigUrl(null);
     setError(null);
+    setHandoffError(false);
     const loadForm = async () => {
       try {
         const payload = await apiGet<{ form: PublicForm } | PublicForm>(
@@ -178,12 +204,21 @@ const FillRoute = () => {
     document.querySelector<HTMLElement>("#unsaved-cancel")?.focus();
   }, [exitIntent]);
   useEffect(() => {
+    if (error) {
+      startErrorRef.current?.focus();
+    }
+  }, [error]);
+  useEffect(() => {
     if (authLoading || !user || !form || editorConfigUrl) {
       return;
     }
 
     let cancelled = false;
     const startResponse = async () => {
+      setLoading(true);
+      setStartBusy(true);
+      setError(null);
+      setHandoffError(false);
       try {
         const result = await apiPost<{
           editorConfigUrl?: string;
@@ -206,9 +241,15 @@ const FillRoute = () => {
         setEditorConfigUrl(result.editorConfigUrl ?? null);
       } catch (caughtError) {
         if (!cancelled) {
+          setHandoffError(isHandoffError(caughtError));
           setError(
             formRequestError(caughtError, "ไม่สามารถเริ่มคำตอบนี้ได้ กรุณาลองใหม่")
           );
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+          setStartBusy(false);
         }
       }
     };
@@ -217,7 +258,7 @@ const FillRoute = () => {
     return () => {
       cancelled = true;
     };
-  }, [activeResponseId, authLoading, editorConfigUrl, form, publicId, user]);
+  }, [activeResponseId, authLoading, editorConfigUrl, form, publicId, startAttempt, user]);
 
   const handleBridgeMessage = async (message: EditorBridgeMessage) => {
     if (message.type === "dirty-state") {
@@ -329,9 +370,28 @@ const FillRoute = () => {
   if (error || !form) {
     return (
       <div className="mx-auto max-w-xl px-5 py-16">
-        <Notice tone="danger">
-          {error ?? "ไม่พบแบบฟอร์มนี้ หรือแบบฟอร์มยังไม่พร้อมใช้งาน"}
-        </Notice>
+        <div ref={startErrorRef} tabIndex={-1}>
+          <Notice tone="danger">
+            {error ?? "ไม่พบแบบฟอร์มนี้ หรือแบบฟอร์มยังไม่พร้อมใช้งาน"}
+          </Notice>
+        </div>
+        {handoffError ? (
+          <div className="mt-5 flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => setStartAttempt((attempt) => attempt + 1)}
+              disabled={startBusy}
+            >
+              {startBusy ? <Spinner /> : null}
+              {startBusy ? "กำลังลองใหม่…" : "ลองใหม่"}
+            </Button>
+            <Button type="button" variant="ghost" onClick={returnToSource}>
+              <ArrowLeft size={16} />
+              กลับไปยังระบบต้นทาง
+            </Button>
+          </div>
+        ) : null}
       </div>
     );
   }

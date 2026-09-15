@@ -210,6 +210,16 @@ Admin เก็บถาวรได้เฉพาะ Form ที่ Publish �
 
 ระบบเตือนก่อน Session หมดอายุ 5 นาที ผู้ใช้สามารถบันทึกก่อนเข้าสู่ระบบใหม่ได้ หลัง Re-authentication ระบบกลับมาที่ Response เดิมด้วย `responseId` แบบ opaque เท่านั้น ไม่ส่งค่าฟิลด์, Prefill, claims หรือ token ผ่าน URL หรือ localStorage
 
+### 3.4 External editable Prefill Handoff
+
+ระบบตัวอย่างภายนอกใช้ Schema pointer จาก External Mock แล้วเรียก `POST /api/integrations/prefill/handoffs` ด้วย Header `X-Prefill-Handoff-Secret` และข้อมูล `publicId`, email, External Reference และค่า scalar candidate ระบบจะ normalize email และเลือกเก็บเฉพาะค่าที่ตรงกับ Prefill Configuration ที่ Publish แล้วเท่านั้น ค่าใน Schema ที่ไม่ได้ผูกกับ Field จะไม่ถูกเก็บ และ error เรื่อง secret ไม่ถูกต้องหรือ Form ใช้งานไม่ได้จะไม่เปิดเผยว่า Form มีอยู่หรือไม่
+
+ผลลัพธ์มี one-time code จาก random 32 bytes และ `launchPath` เท่านั้น ระบบต้นทางต้องส่ง code ใน body ของฟอร์ม `POST` แบบ top-level ไปยัง `/prefill/handoff` ห้ามใส่ code ใน URL ระบบเก็บเฉพาะ digest ของ code และหมดอายุใน 120 วินาที เมื่อ Launch สำเร็จ Folio จะแลก code เป็น Cookie `__Host-folio-pending-claim` อายุ 10 นาที โดยมี `Secure`, `HttpOnly`, `SameSite=Lax` และ `Path=/` Cookie นี้เป็น claim แบบชั่วคราว ไม่เปิดให้ JavaScript อ่าน และไม่มี code หรือค่า Prefill ใน URL, `localStorage` หรือ `sessionStorage`
+
+หลัง Login และ Password replacement เสร็จ หน้า Form เดิมจะส่ง claim ไป redeem เพียงครั้งเดียว ระบบตรวจ email, Form, configuration hash และอายุใน transaction แบบ serializable ก่อนสร้าง Response เดียว, คัดลอก Published DOCX และ snapshot ค่า Prefill ตาม policy (`editable` หรือ `lock-when-available`) Form ที่มี Prefill fields จะไม่รับการเริ่มแบบ share link ปกติ ส่วน Form ที่ไม่มี Prefill fields ยังเริ่มแบบปกติได้ การทิ้ง Draft จะล้าง Prefill และทำให้ต้องขอ Handoff ใหม่
+
+Code ที่ผิด, หมดอายุ, ใช้ซ้ำ หรือผูกกับ email/Form/configuration ไม่ตรงกันจะปิดกั้นการ redeem และแสดงสถานะภาษาไทยที่มีปุ่มลองใหม่/กลับไปยังระบบต้นทาง Audit Event ของ Handoff เก็บเฉพาะ target reference ที่ปลอดภัย ไม่เก็บค่า Prefill, code, secret, document หรือ identity
+
 ## 4. ทดลองใช้งานในฐานะ Admin
 
 1. เปิด `http://localhost:5173/login`
