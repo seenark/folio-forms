@@ -1055,8 +1055,15 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     adminEditor.config.editorConfig.plugins.options[pluginGuid];
   const adminLease = adminEditor.bridge.lease;
   const publishCapability = adminEditor.bridge.capabilities.publish;
+  const configureFieldsCapability =
+    adminEditor.bridge.capabilities["configure-fields"];
   let saveTemplateCapability = adminEditor.bridge.capabilities["save-template"];
-  if (!adminPluginOptions || !publishCapability || !saveTemplateCapability) {
+  if (
+    !adminPluginOptions ||
+    !publishCapability ||
+    !configureFieldsCapability ||
+    !saveTemplateCapability
+  ) {
     throw new Error("The Admin editor capabilities were not returned");
   }
   const adminEditorSerialized = JSON.stringify(adminEditor);
@@ -1090,6 +1097,253 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   if (!adminLeaseRow) {
     throw new Error("The Admin editor lease was not persisted");
   }
+  const configureClaims = verifyEditorCapability(configureFieldsCapability);
+  expect(configureClaims).toMatchObject({
+    action: "configure-fields",
+    actorId: adminId,
+    documentKey: templateDocumentKey,
+    formId,
+    leaseId: adminLease.id,
+    targetId: createdFormRecord.templateDraft.id,
+    targetType: "template-draft",
+  });
+  const schemaWithoutCapabilityResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/schema`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(schemaWithoutCapabilityResponse.status).toBe(401);
+  expect(await schemaWithoutCapabilityResponse.json()).toMatchObject({
+    error: "editor_capability_required",
+  });
+  const configureHeaders = {
+    ...jsonHeaders,
+    "X-Editor-Capability": configureFieldsCapability,
+  };
+  const schemaFirstResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/schema`, {
+      headers: configureHeaders,
+    })
+  );
+  expect(schemaFirstResponse.status).toBe(200);
+  const schemaFirst = (await schemaFirstResponse.json()) as {
+    items: Array<{ pointer: string; type: string }>;
+    nextCursor: string | null;
+  };
+  expect(schemaFirst.items).toHaveLength(5);
+  expect(schemaFirst.nextCursor).toEqual(expect.any(String));
+  expect(
+    schemaFirst.items.every(
+      (item) =>
+        item.type === "string" ||
+        item.type === "number" ||
+        item.type === "boolean" ||
+        item.type === "null"
+    )
+  ).toBe(true);
+  expect(
+    schemaFirst.items.some((item) => item.pointer.includes("/contacts/"))
+  ).toBe(false);
+  const schemaSecondResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/schema?cursor=${encodeURIComponent(schemaFirst.nextCursor ?? "")}`,
+      { headers: configureHeaders }
+    )
+  );
+  expect(schemaSecondResponse.status).toBe(200);
+  const schemaSecond = (await schemaSecondResponse.json()) as {
+    items: Array<{ pointer: string; type: string }>;
+    nextCursor: string | null;
+  };
+  expect(schemaSecond.items.length).toBeGreaterThan(0);
+  expect(new Set(schemaSecond.items.map((item) => item.pointer)).size).toBe(
+    schemaSecond.items.length
+  );
+  const schemaFilteredResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/schema?q=${encodeURIComponent("ADDRESS")}`,
+      { headers: configureHeaders }
+    )
+  );
+  expect(schemaFilteredResponse.status).toBe(200);
+  const schemaFiltered = (await schemaFilteredResponse.json()) as {
+    items: Array<{ pointer: string; type: string }>;
+    nextCursor: string | null;
+  };
+  expect(schemaFiltered.items.length).toBeGreaterThan(0);
+  expect(
+    schemaFiltered.items.every((item) =>
+      item.pointer.toLowerCase().includes("address")
+    )
+  ).toBe(true);
+  const escapedSchemaResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/schema?q=${encodeURIComponent("display")}`,
+      { headers: configureHeaders }
+    )
+  );
+  expect(escapedSchemaResponse.status).toBe(200);
+  expect(await escapedSchemaResponse.json()).toMatchObject({
+    items: [{ pointer: "/account/display~1name", type: "string" }],
+  });
+  const invalidSchemaCursorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/schema?cursor=invalid`,
+      { headers: configureHeaders }
+    )
+  );
+  expect(invalidSchemaCursorResponse.status).toBe(400);
+  expect(await invalidSchemaCursorResponse.json()).toMatchObject({
+    error: "invalid_schema_cursor",
+  });
+  const emptyRulesResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/field-rules`,
+      {
+        headers: configureHeaders,
+      }
+    )
+  );
+  expect(emptyRulesResponse.status).toBe(200);
+  expect(await emptyRulesResponse.json()).toEqual({ rules: [] });
+  const selectedPointer = schemaFirst.items[0]?.pointer;
+  if (!selectedPointer) {
+    throw new Error("Schema did not return a selectable pointer");
+  }
+  const createRuleResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/field-rules`,
+      {
+        body: JSON.stringify({
+          documentKey: templateDocumentKey,
+          previousTag: null,
+          prefillPointer: selectedPointer,
+          prefillPolicy: "lock-when-available",
+          required: true,
+          tag: "ticket-09-field",
+        }),
+        headers: configureHeaders,
+        method: "PATCH",
+      }
+    )
+  );
+  expect(createRuleResponse.status).toBe(200);
+  expect(await createRuleResponse.json()).toEqual({
+    rule: {
+      prefillPointer: selectedPointer,
+      prefillPolicy: "lock-when-available",
+      required: true,
+      tag: "ticket-09-field",
+    },
+  });
+  const conflictingPointerResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/field-rules`,
+      {
+        body: JSON.stringify({
+          documentKey: templateDocumentKey,
+          previousTag: null,
+          prefillPointer: selectedPointer,
+          prefillPolicy: "editable",
+          required: false,
+          tag: "ticket-09-conflict",
+        }),
+        headers: configureHeaders,
+        method: "PATCH",
+      }
+    )
+  );
+  expect(conflictingPointerResponse.status).toBe(409);
+  expect(await conflictingPointerResponse.json()).toMatchObject({
+    error: "field_rule_conflict",
+  });
+  const renamedRuleResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/field-rules`,
+      {
+        body: JSON.stringify({
+          documentKey: templateDocumentKey,
+          previousTag: "ticket-09-field",
+          prefillPointer: selectedPointer,
+          prefillPolicy: "editable",
+          required: false,
+          tag: "ticket-09-renamed",
+        }),
+        headers: configureHeaders,
+        method: "PATCH",
+      }
+    )
+  );
+  expect(renamedRuleResponse.status).toBe(200);
+  expect(await renamedRuleResponse.json()).toEqual({
+    rule: {
+      prefillPointer: selectedPointer,
+      prefillPolicy: "editable",
+      required: false,
+      tag: "ticket-09-renamed",
+    },
+  });
+  const reopenedRulesResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/field-rules`,
+      {
+        headers: configureHeaders,
+      }
+    )
+  );
+  expect(await reopenedRulesResponse.json()).toEqual({
+    rules: [
+      {
+        prefillPointer: selectedPointer,
+        prefillPolicy: "editable",
+        required: false,
+        tag: "ticket-09-renamed",
+      },
+    ],
+  });
+  const invalidPolicyResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/field-rules`,
+      {
+        body: JSON.stringify({
+          documentKey: templateDocumentKey,
+          previousTag: "ticket-09-renamed",
+          prefillPointer: null,
+          prefillPolicy: "lock-when-available",
+          required: false,
+          tag: "ticket-09-renamed",
+        }),
+        headers: configureHeaders,
+        method: "PATCH",
+      }
+    )
+  );
+  expect(invalidPolicyResponse.status).toBe(400);
+  expect(await invalidPolicyResponse.json()).toMatchObject({
+    error: "invalid_field_config",
+  });
+  const staleDocumentResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/field-rules`,
+      {
+        body: JSON.stringify({
+          documentKey: "template-stale",
+          previousTag: "ticket-09-renamed",
+          prefillPointer: selectedPointer,
+          prefillPolicy: "editable",
+          required: false,
+          tag: "ticket-09-renamed",
+        }),
+        headers: configureHeaders,
+        method: "PATCH",
+      }
+    )
+  );
+  expect(staleDocumentResponse.status).toBe(409);
+  expect(await staleDocumentResponse.json()).toMatchObject({
+    error: "stale_document",
+  });
+
   expect(
     Math.abs(
       adminLeaseRow.expiresAt.getTime() -

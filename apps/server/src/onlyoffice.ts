@@ -18,6 +18,7 @@ const editorCapabilityActions = new Set<unknown>([
   "publish",
   "save-draft",
   "submit",
+  "configure-fields",
   "poll-operation",
 ]);
 const editorCapabilityTargets = new Set<unknown>([
@@ -47,6 +48,7 @@ export type EditorCapabilityAction =
   | "publish"
   | "save-draft"
   | "submit"
+  | "configure-fields"
   | "poll-operation";
 export type EditorCapabilityTarget = "template-draft" | "response";
 type PluginAction = "template-edit" | "fill" | "draft" | "submit";

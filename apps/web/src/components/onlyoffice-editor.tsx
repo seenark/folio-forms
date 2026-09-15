@@ -3,7 +3,21 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Button, Notice, Spinner } from "@/components/ui";
 import { ApiError, API_ORIGIN, apiDelete, apiGet, apiPost } from "@/lib/api";
 
-type EditorAction = "save-template" | "publish" | "save-draft" | "submit";
+type EditorAction =
+  | "save-template"
+  | "publish"
+  | "save-draft"
+  | "submit"
+  | "configure-fields";
+type EditorOperationAction = Exclude<EditorAction, "configure-fields">;
+type FieldControlType =
+  | "text"
+  | "checkbox"
+  | "date"
+  | "dropdown"
+  | "combo"
+  | "picture"
+  | "unsupported";
 type EditorOperationStatus = "pending" | "completed" | "failed";
 export type OnlyOfficeEditorState = "loading" | "ready" | "blocked" | "error";
 
@@ -43,17 +57,38 @@ interface CapabilityRequestMessage {
   source: "form-bridge";
   type: "capability-request";
 }
+interface FieldSelectionBridgeMessage {
+  bridgeId: string;
+  controlType: FieldControlType;
+  selectionId: string;
+  selected: boolean;
+  source: "form-bridge";
+  tag: string | null;
+  type: "field-selection";
+}
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
 const isNonEmptyString = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0;
-const isEditorAction = (value: unknown): value is EditorAction =>
+const isEditorOperationAction = (
+  value: unknown
+): value is EditorOperationAction =>
   value === "save-template" ||
   value === "publish" ||
   value === "save-draft" ||
   value === "submit";
+const isEditorAction = (value: unknown): value is EditorAction =>
+  value === "configure-fields" || isEditorOperationAction(value);
+const isFieldControlType = (value: unknown): value is FieldControlType =>
+  value === "text" ||
+  value === "checkbox" ||
+  value === "date" ||
+  value === "dropdown" ||
+  value === "combo" ||
+  value === "picture" ||
+  value === "unsupported";
 
 const isOperationStatus = (value: unknown): value is EditorOperationStatus =>
   value === "pending" || value === "completed" || value === "failed";
@@ -87,17 +122,37 @@ const parseCapabilityRequest = (
   return value as unknown as CapabilityRequestMessage;
 };
 
+const parseFieldSelectionMessage = (
+  value: unknown,
+  bridgeId: string
+): FieldSelectionBridgeMessage | null => {
+  if (
+    !isRecord(value) ||
+    value.bridgeId !== bridgeId ||
+    value.source !== "form-bridge" ||
+    value.type !== "field-selection" ||
+    !isNonEmptyString(value.selectionId) ||
+    typeof value.selected !== "boolean" ||
+    (value.tag !== null && typeof value.tag !== "string") ||
+    !isFieldControlType(value.controlType)
+  ) {
+    return null;
+  }
+
+  return value as unknown as FieldSelectionBridgeMessage;
+};
+
 const parseOperationMessage = (
   value: unknown,
   bridgeId: string
-): EditorBridgeMessage | null => {
+): EditorOperationBridgeMessage | null => {
   if (
     !isRecord(value) ||
     value.bridgeId !== bridgeId ||
     value.source !== "form-bridge" ||
     value.type !== "operation" ||
     typeof value.action !== "string" ||
-    !isEditorAction(value.action) ||
+    !isEditorOperationAction(value.action) ||
     !isOperationStatus(value.status) ||
     (value.operationId !== undefined && !isNonEmptyString(value.operationId)) ||
     (value.status !== "failed" && !isNonEmptyString(value.operationId)) ||
@@ -123,11 +178,11 @@ const parseOperationMessage = (
     }
   }
 
-  return value as unknown as EditorBridgeMessage;
+  return value as unknown as EditorOperationBridgeMessage;
 };
 
-export interface EditorBridgeMessage {
-  action: EditorAction;
+interface EditorOperationBridgeMessage {
+  action: EditorOperationAction;
   bridgeId: string;
   error?: string;
   operation?: {
@@ -140,6 +195,10 @@ export interface EditorBridgeMessage {
   status: EditorOperationStatus;
   type: "operation";
 }
+
+export type EditorBridgeMessage =
+  | EditorOperationBridgeMessage
+  | FieldSelectionBridgeMessage;
 
 const acknowledgeBridge = (
   source: MessageEventSource,
@@ -486,7 +545,11 @@ export const OnlyOfficeEditor = ({
         void renewCapability(capabilityRequest);
         return;
       }
-
+      const fieldSelection = parseFieldSelectionMessage(data, bridgeId);
+      if (fieldSelection) {
+        onBridgeMessageRef.current?.(fieldSelection);
+        return;
+      }
       const message = parseOperationMessage(data, bridgeId);
       if (!message) {
         return;

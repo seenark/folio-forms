@@ -217,9 +217,20 @@ Share Link เป็น opaque public ID ที่ระบบสร้างใ
 - ทุก Content Control ต้องมี Tag
 - Tag ต้องไม่ซ้ำกันใน Form เดียวกัน
 - Tag เป็นชื่อที่ใช้ใน JSON และ Prefill
-- Tag ควรเป็นชื่อที่สื่อความหมาย เช่น `full_name`
+- Tag ควรเป็นชื่อที่สื่อความหมาย เช่น `/person/name` (RFC 6901 JSON Pointer)
 
 Editor หนึ่งรายการมี Admin แก้ไขได้ครั้งละหนึ่ง Browser Session เท่านั้น Admin คนที่สองจะเห็นสถานะไม่สามารถแก้ไขได้และสามารถลองใหม่หลัง Lease ถูกปล่อยหรือหมดอายุ
+
+#### ตั้งค่า Field ในแผงด้านข้าง
+
+ขณะเปิด Template Draft ใน ONLYOFFICE ให้เลือก Content Control แล้วใช้แผง **Form Bridge** ด้านขวา แผงนี้จะแสดง Tag ของ Field ที่เลือก, ตัวเลือก Required และนโยบาย Prefill:
+
+- `editable` — ผู้ใช้แก้ค่าได้เมื่อมีค่า Prefill
+- `lock-when-available` — ล็อกเฉพาะเมื่อ Handoff ที่เชื่อถือได้มีค่าสำหรับ Field นี้
+
+การค้นหา Schema ใช้ External Mock เดียวของระบบและแบ่งผลลัพธ์ด้วย Cursor ผลลัพธ์มีเฉพาะ Leaf ที่เป็น scalar พร้อม RFC 6901 JSON Pointer เช่น `/person/name` และไม่แสดง Object, Array, User record หรือค่าจริงของ record กด **คัดลอกคีย์** เพื่อคัดลอก Pointer ที่ตรงตัว หรือกด **ใช้เป็น Tag** เพื่อใส่ Pointer นั้นใน Content Control ที่เลือก จากนั้นกด **บันทึกการตั้งค่า Field** การเปลี่ยน Tag จะล้างนโยบายของ Tag เดิมแบบ atomic เพื่อไม่ให้เหลือกฎขัดแย้ง
+
+รองรับ Content Control สำหรับ Text, Checkbox, Date, Dropdown, Combo box และ Picture การ Save Template จะเก็บเอกสารล่าสุดและกฎ Field เพื่อเปิดกลับมาได้เหมือนเดิม ส่วนการตรวจชนิดและตัวเลือกขั้นสุดท้ายเกิดตอน Publish
 
 เมื่อแก้ไข Template เสร็จ:
 
@@ -283,8 +294,6 @@ apps/
     src/storage.ts     Private RustFS object primitives
     src/onlyoffice.ts  Editor capability, ONLYOFFICE JWT, document access, force-save และ PDF conversion
     .env               Environment local จริง
-
-  web/
     src/routes/        หน้า Login, Dashboard, Admin, Fill และ Receipt
     src/components/
       onlyoffice-editor.tsx  ฝัง ONLYOFFICE ในหน้าเว็บ
@@ -292,8 +301,8 @@ apps/
       api.ts            API client และ session token
 
   onlyoffice-plugin/
-    index.html          Plugin entrypoint
-    plugin.js           Form tab, Prefill, Extract, Save Draft และ Submit
+    index.html          Plugin entrypoint and Admin right-side Field panel
+    plugin.js           Form panel, schema search, Field policy, Prefill, Extract, Save Draft และ Submit
 
 packages/
   auth/

@@ -165,7 +165,7 @@ Each privileged account attempt appends an immutable Audit Event with its actor,
 2. Select **New form**, enter a title and description, then choose the bundled starter DOCX or upload a `.docx` no larger than 25 MiB.
 3. The API validates the file type, size, and required DOCX package parts before creating the Form.
 4. Open the leased DOCX editor. A second Admin sees a blocked, non-editable state until the active lease is released or expires.
-5. Add tagged content controls to the template.
+5. Add tagged content controls to the template. While the Template Draft is open, the ONLYOFFICE right-side Form Bridge panel is available only to this authorized Admin editor. Select a content control to inspect its exact tag, mark it required, and choose `editable` or `lock-when-available` Prefill policy. The panel searches the one deterministic external mock schema with bounded cursor paging and shows only nested scalar RFC 6901 JSON Pointers; it never shows external record values, User records, or a mapping canvas. Copy a pointer or apply that exact pointer as the selected control tag before saving the policy.
 6. Select **Save Template** and wait for its Operation. A completed save is the exact Draft reopened later; a failed save leaves the prior Draft available for retry.
 7. Select **Publish** when the template is ready.
 8. Copy the generated share link.
@@ -203,7 +203,7 @@ Submission is complete only after the extracted field JSON and canonical filled 
 
 Fields are ONLYOFFICE content controls. Their tags are the stable field keys used in JSON and prefill data.
 
-Each Form defines its own unique, non-empty tags. Supported controls include text, checkbox, date, dropdown, combo box, and picture fields.
+Each Form defines its own unique, non-empty tags. Supported controls include text, checkbox, date, dropdown, combo box, and picture fields. The Form Bridge panel uses the exact content-control tag as the Field identity. JSON Pointer tags such as `/person/name` are stored literally (RFC 6901 escaping applies to `/` and `~` inside a segment); the panel's external schema search returns pointer keys and scalar types only. Supported authoring controls are text, checkbox, date, dropdown, combo box, and Picture; publication remains the authority that validates their final types and options.
 
 The plugin extracts:
 
@@ -326,6 +326,9 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 | `POST` | `/api/admin/forms` | Create from the starter or an uploaded validated DOCX |
 | `GET` | `/api/admin/forms/:publicId` | Read safe form detail and counts |
 | `GET` | `/api/admin/forms/:publicId/editor-config` | Claim the exclusive lease and get template editor config |
+| `GET` | `/api/admin/forms/:publicId/schema?q=&cursor=` | Search the deterministic scalar-only external schema with cursor paging |
+| `GET` | `/api/admin/forms/:publicId/field-rules` | Read the current Draft Field required and Prefill policies through the editor capability |
+| `PATCH` | `/api/admin/forms/:publicId/field-rules` | Save one exact Field tag, required state, and Prefill pointer/policy |
 | `POST` | `/api/admin/forms/:publicId/save` | Save the Template Draft through an asynchronous Operation |
 | `POST` | `/api/admin/forms/:publicId/publish` | Publish a validated template |
 | `GET` | `/api/admin/forms/:publicId/submissions` | List all submissions for a form |

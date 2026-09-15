@@ -59,6 +59,8 @@ type Response = Prisma.ResponseGetPayload<Prisma.ResponseDefaultArgs>;
 type Submission = Prisma.SubmissionGetPayload<Prisma.SubmissionDefaultArgs>;
 type TemplateDraft =
   Prisma.TemplateDraftGetPayload<Prisma.TemplateDraftDefaultArgs>;
+type DraftFieldRule =
+  Prisma.DraftFieldRuleGetPayload<Prisma.DraftFieldRuleDefaultArgs>;
 
 function originOf(value: string): string | null {
   try {
@@ -94,6 +96,11 @@ const loginFailureWindowMs = 15 * 60_000;
 const passwordMinimumLength = 12;
 const passwordMaximumLength = 128;
 const maxResponseDataBytes = 256 * 1024;
+const fieldRuleBodyMaximumBytes = 8 * 1024;
+const fieldTagMaximumLength = 512;
+const fieldPointerMaximumLength = 2048;
+const schemaPageSize = 5;
+const schemaQueryMaximumLength = 200;
 const accountUserPageSize = 20;
 const accountBodyMaximumBytes = 64 * 1024;
 const documentActionBodyMaximumBytes = 8 * 1024;
@@ -176,6 +183,185 @@ interface ActiveEditorLease {
   holderUserId: string;
 }
 type JsonRecord = Record<string, unknown>;
+type ExternalSchemaType = "string" | "number" | "boolean" | "null";
+interface ExternalSchemaItem {
+  pointer: string;
+  type: ExternalSchemaType;
+}
+
+const externalMockSchema = {
+  account: {
+    id: "",
+    active: true,
+    loginCount: 0,
+    score: 0,
+    "display/name": "",
+    "tilde~key": "",
+    contact: {
+      email: "",
+      phone: "",
+    },
+    address: {
+      city: "",
+      postalCode: "",
+      country: "",
+    },
+    consent: {
+      terms: true,
+      privacy: true,
+    },
+    settings: {
+      language: "",
+      timezone: "",
+    },
+    contacts: [{ name: "" }],
+  },
+  person: {
+    name: "",
+    birthDate: "",
+    "contact/details": {
+      "line~1": "",
+    },
+  },
+  ignoredObject: {
+    nested: {
+      value: null,
+    },
+  },
+} as const;
+
+function externalSchemaPointerSegment(value: string): string {
+  return value.replaceAll("~", "~0").replaceAll("/", "~1");
+}
+
+function externalSchemaLeafType(value: unknown): ExternalSchemaType | null {
+  if (value === null) {
+    return "null";
+  }
+  if (typeof value === "string") {
+    return "string";
+  }
+  if (typeof value === "number") {
+    return "number";
+  }
+  if (typeof value === "boolean") {
+    return "boolean";
+  }
+  return null;
+}
+
+function flattenExternalSchema(
+  value: unknown,
+  parentPointer = "",
+  items: ExternalSchemaItem[] = []
+): ExternalSchemaItem[] {
+  const type = externalSchemaLeafType(value);
+  if (type) {
+    items.push({ pointer: parentPointer, type });
+    return items;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return items;
+  }
+  for (const key of Object.keys(value).sort()) {
+    const pointer = `${parentPointer}/${externalSchemaPointerSegment(key)}`;
+    flattenExternalSchema(
+      (value as Record<string, unknown>)[key],
+      pointer,
+      items
+    );
+  }
+  return items;
+}
+
+const externalSchemaItems = flattenExternalSchema(externalMockSchema);
+
+function schemaCursor(query: string, offset: number): string {
+  const payload = Buffer.from(JSON.stringify({ offset, query })).toString(
+    "base64url"
+  );
+  const unsigned = `schema-v1.${payload}`;
+  const signature = createHmac("sha256", env.EDITOR_CAPABILITY_SECRET)
+    .update(unsigned)
+    .digest("base64url");
+  return `${unsigned}.${signature}`;
+}
+
+function schemaCursorOffset(cursor: string, query: string): number {
+  const [version, payload, signature, extra] = cursor.split(".");
+  if (!version || !payload || !signature || extra || version !== "schema-v1") {
+    fail(400, "invalid_schema_cursor", "Schema cursor is invalid");
+  }
+  const unsigned = `${version}.${payload}`;
+  const expected = createHmac("sha256", env.EDITOR_CAPABILITY_SECRET)
+    .update(unsigned)
+    .digest("base64url");
+  if (signature !== expected) {
+    fail(400, "invalid_schema_cursor", "Schema cursor is invalid");
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8"));
+  } catch {
+    fail(400, "invalid_schema_cursor", "Schema cursor is invalid");
+  }
+  if (
+    !decoded ||
+    typeof decoded !== "object" ||
+    Array.isArray(decoded) ||
+    !("offset" in decoded) ||
+    !("query" in decoded) ||
+    typeof decoded.offset !== "number" ||
+    !Number.isInteger(decoded.offset) ||
+    decoded.offset < 0 ||
+    typeof decoded.query !== "string" ||
+    decoded.query !== query ||
+    decoded.offset > externalSchemaItems.length
+  ) {
+    fail(400, "invalid_schema_cursor", "Schema cursor is invalid");
+  }
+  return decoded.offset;
+}
+
+function schemaQueryValue(value: unknown): string {
+  if (value === undefined) {
+    return "";
+  }
+  if (typeof value !== "string") {
+    fail(400, "invalid_schema_query", "Schema query must be a string");
+  }
+  const query = value.trim().toLowerCase();
+  if (query.length > schemaQueryMaximumLength) {
+    fail(400, "invalid_schema_query", "Schema query is too long");
+  }
+  return query;
+}
+
+function schemaPage(
+  queryValue: unknown,
+  cursorValue: unknown
+): { items: ExternalSchemaItem[]; nextCursor: string | null } {
+  const query = schemaQueryValue(queryValue);
+  const matching = externalSchemaItems.filter((item) =>
+    item.pointer.toLowerCase().includes(query)
+  );
+  const offset =
+    cursorValue === undefined
+      ? 0
+      : typeof cursorValue === "string"
+        ? schemaCursorOffset(cursorValue, query)
+        : fail(400, "invalid_schema_cursor", "Schema cursor is invalid");
+  if (offset > matching.length) {
+    fail(400, "invalid_schema_cursor", "Schema cursor is invalid");
+  }
+  const items = matching.slice(offset, offset + schemaPageSize);
+  const nextOffset = offset + items.length;
+  return {
+    items,
+    nextCursor:
+      nextOffset < matching.length ? schemaCursor(query, nextOffset) : null,
+  };
+}
 type OperationAction = "save-template" | "publish" | "save-draft" | "submit";
 const operationTypeForAction: Record<OperationAction, OperationType> = {
   publish: "publish_form",
@@ -192,7 +378,11 @@ type OperationErrorCode =
   | "onlyoffice_document_error"
   | "operation_timeout";
 type FormSource = "blank" | "upload";
-type FormAuditAction = "create_form" | "save_template_draft" | "delete_form";
+type FormAuditAction =
+  | "configure_field_rule"
+  | "create_form"
+  | "save_template_draft"
+  | "delete_form";
 type FormAuditErrorCode =
   | "callback_claim_invalid"
   | "blank_template_unavailable"
@@ -918,7 +1108,7 @@ function requireEditorScope(
 function actionEditorCapability(
   actor: Actor,
   scope: Omit<EditorCapabilityScope, "action" | "operationId">,
-  action: OperationAction,
+  action: Exclude<EditorCapabilityAction, "poll-operation">,
   lease: EditorLeaseGrant
 ): string {
   return createEditorCapability({
@@ -2954,6 +3144,164 @@ async function finalizeCallback(
   await deleteObjects(completion?.cleanupObjectKeys ?? []);
 }
 
+type FieldRulePolicy = "editable" | "lock-when-available";
+interface FieldRuleInput {
+  documentKey: string;
+  previousTag: string | null;
+  prefillPointer: string | null;
+  prefillPolicy: FieldRulePolicy;
+  required: boolean;
+  tag: string;
+}
+
+function fieldRuleDto(rule: {
+  prefillPointer: string | null;
+  prefillPolicy: PrefillPolicy;
+  required: boolean;
+  tag: string;
+}): {
+  prefillPointer: string | null;
+  prefillPolicy: FieldRulePolicy;
+  required: boolean;
+  tag: string;
+} {
+  return {
+    prefillPointer: rule.prefillPointer,
+    prefillPolicy:
+      rule.prefillPolicy === PrefillPolicy.lock_when_available
+        ? "lock-when-available"
+        : "editable",
+    required: rule.required,
+    tag: rule.tag,
+  };
+}
+
+function fieldRuleTag(value: unknown, field: string): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.trim().length === 0 ||
+    value.length > fieldTagMaximumLength
+  ) {
+    fail(400, "invalid_field_selection", `${field} is invalid`);
+  }
+  return value;
+}
+
+function fieldRuleInput(input: JsonRecord): FieldRuleInput {
+  const expectedKeys = new Set([
+    "documentKey",
+    "previousTag",
+    "tag",
+    "required",
+    "prefillPointer",
+    "prefillPolicy",
+  ]);
+  const keys = Object.keys(input);
+  if (
+    keys.length !== expectedKeys.size ||
+    keys.some((key) => !expectedKeys.has(key))
+  ) {
+    fail(
+      400,
+      "invalid_field_config",
+      "documentKey, previousTag, tag, required, prefillPointer, and prefillPolicy are required"
+    );
+  }
+  if (
+    typeof input.documentKey !== "string" ||
+    input.documentKey.trim().length === 0
+  ) {
+    fail(400, "invalid_field_config", "documentKey is required");
+  }
+  if (typeof input.required !== "boolean") {
+    fail(400, "invalid_field_config", "required must be a boolean");
+  }
+  const tag = fieldRuleTag(input.tag, "tag");
+  let previousTag: string | null;
+  if (input.previousTag === null) {
+    previousTag = null;
+  } else {
+    previousTag = fieldRuleTag(input.previousTag, "previousTag");
+  }
+  let prefillPointer: string | null;
+  if (input.prefillPointer === null) {
+    prefillPointer = null;
+  } else if (
+    typeof input.prefillPointer !== "string" ||
+    input.prefillPointer.length === 0 ||
+    input.prefillPointer.length > fieldPointerMaximumLength
+  ) {
+    fail(400, "invalid_field_config", "prefillPointer is invalid");
+  } else {
+    prefillPointer = input.prefillPointer;
+  }
+  if (
+    input.prefillPolicy !== "editable" &&
+    input.prefillPolicy !== "lock-when-available"
+  ) {
+    fail(400, "invalid_field_config", "prefillPolicy is invalid");
+  }
+  if (
+    input.prefillPolicy === "lock-when-available" &&
+    prefillPointer === null
+  ) {
+    fail(
+      400,
+      "invalid_field_config",
+      "lock-when-available requires prefillPointer"
+    );
+  }
+  return {
+    documentKey: input.documentKey,
+    previousTag,
+    prefillPointer,
+    prefillPolicy: input.prefillPolicy,
+    required: input.required,
+    tag,
+  };
+}
+
+function fieldRulePrefillPolicy(policy: FieldRulePolicy): PrefillPolicy {
+  return policy === "lock-when-available"
+    ? PrefillPolicy.lock_when_available
+    : PrefillPolicy.editable;
+}
+
+function requireTemplateDraft(
+  form: FormWithDocuments,
+  missingMessage = "No template DOCX is configured"
+): TemplateDraft {
+  if (!form.templateDraft) {
+    fail(409, "document_unavailable", missingMessage);
+  }
+  return form.templateDraft;
+}
+
+function fieldRuleCapabilityScope(
+  form: FormWithDocuments,
+  templateDraft: TemplateDraft
+): Omit<EditorCapabilityScope, "action" | "operationId"> {
+  return {
+    documentKey: templateDraft.documentKey,
+    formId: form.id,
+    targetId: templateDraft.id,
+    targetType: "template-draft",
+  };
+}
+
+function validateFieldRulePointer(prefillPointer: string | null): void {
+  if (
+    prefillPointer !== null &&
+    !externalSchemaItems.some((item) => item.pointer === prefillPointer)
+  ) {
+    fail(
+      400,
+      "invalid_field_selection",
+      "prefillPointer is not a selectable schema field"
+    );
+  }
+}
 async function findFormByPublicId(
   publicId: string
 ): Promise<FormWithDocuments> {
@@ -3921,6 +4269,12 @@ export function createApp(options: AppOptions = {}) {
           {
             action: "template-edit",
             capabilities: {
+              "configure-fields": actionEditorCapability(
+                identity,
+                capabilityScope,
+                "configure-fields",
+                lease
+              ),
               publish: actionEditorCapability(
                 identity,
                 capabilityScope,
@@ -3941,6 +4295,188 @@ export function createApp(options: AppOptions = {}) {
           identity
         );
       }
+    )
+    .get(
+      "/api/admin/forms/:publicId/schema",
+      async ({ request, params, query }) => {
+        const authorization = await requireActionEditorAuthorization(request);
+        const { actor: identity } = authorization;
+        requireAdmin(identity);
+        const form = await findFormByPublicId(params.publicId);
+        const templateDraft = requireTemplateDraft(form);
+        const capabilityScope = fieldRuleCapabilityScope(form, templateDraft);
+        requireEditorScope(authorization, {
+          ...capabilityScope,
+          action: "configure-fields",
+        });
+        await requireActiveEditorLease(authorization, capabilityScope);
+        const queryRecord = query as unknown as JsonRecord;
+        return schemaPage(queryRecord.q, queryRecord.cursor);
+      }
+    )
+    .get(
+      "/api/admin/forms/:publicId/field-rules",
+      async ({ request, params }) => {
+        const authorization = await requireActionEditorAuthorization(request);
+        const { actor: identity } = authorization;
+        requireAdmin(identity);
+        const form = await findFormByPublicId(params.publicId);
+        const templateDraft = requireTemplateDraft(form);
+        const capabilityScope = fieldRuleCapabilityScope(form, templateDraft);
+        requireEditorScope(authorization, {
+          ...capabilityScope,
+          action: "configure-fields",
+        });
+        await requireActiveEditorLease(authorization, capabilityScope);
+        const rules = await prisma.draftFieldRule.findMany({
+          orderBy: { tag: "asc" },
+          select: {
+            prefillPointer: true,
+            prefillPolicy: true,
+            required: true,
+            tag: true,
+          },
+          where: { templateDraftId: templateDraft.id },
+        });
+        return { rules: rules.map(fieldRuleDto) };
+      }
+    )
+    .patch(
+      "/api/admin/forms/:publicId/field-rules",
+      async ({ request, params }) => {
+        const authorization = await requireActionEditorAuthorization(request);
+        const { actor: identity } = authorization;
+        requireAdmin(identity);
+        const form = await findFormByPublicId(params.publicId);
+        const templateDraft = requireTemplateDraft(form);
+        const capabilityScope = fieldRuleCapabilityScope(form, templateDraft);
+        requireEditorScope(authorization, {
+          ...capabilityScope,
+          action: "configure-fields",
+        });
+        await requireActiveEditorLease(authorization, capabilityScope);
+        const input = fieldRuleInput(
+          await readJsonRecord(request, fieldRuleBodyMaximumBytes)
+        );
+        if (input.documentKey !== templateDraft.documentKey) {
+          fail(
+            409,
+            "stale_document",
+            "The editor document is no longer current"
+          );
+        }
+        validateFieldRulePointer(input.prefillPointer);
+        let rule: DraftFieldRule;
+        try {
+          rule = await prisma.$transaction(
+            async (tx) => {
+              await lockActiveEditorLease(tx, authorization, capabilityScope);
+              const previousRule = input.previousTag
+                ? await tx.draftFieldRule.findUnique({
+                    where: {
+                      templateDraftId_tag: {
+                        tag: input.previousTag,
+                        templateDraftId: templateDraft.id,
+                      },
+                    },
+                  })
+                : null;
+              if (input.previousTag !== null && !previousRule) {
+                fail(
+                  400,
+                  "invalid_field_selection",
+                  "previousTag does not identify a configured field"
+                );
+              }
+              const targetRule = await tx.draftFieldRule.findUnique({
+                where: {
+                  templateDraftId_tag: {
+                    tag: input.tag,
+                    templateDraftId: templateDraft.id,
+                  },
+                },
+              });
+              if (targetRule && targetRule.id !== previousRule?.id) {
+                fail(
+                  409,
+                  "field_rule_conflict",
+                  "The field tag is already configured"
+                );
+              }
+              const pointerRule =
+                input.prefillPointer === null
+                  ? null
+                  : await tx.draftFieldRule.findFirst({
+                      where: {
+                        prefillPointer: input.prefillPointer,
+                        templateDraftId: templateDraft.id,
+                      },
+                    });
+              if (pointerRule && pointerRule.id !== previousRule?.id) {
+                fail(
+                  409,
+                  "field_rule_conflict",
+                  "The schema pointer is already configured"
+                );
+              }
+              const data = {
+                prefillPointer: input.prefillPointer,
+                prefillPolicy: fieldRulePrefillPolicy(input.prefillPolicy),
+                required: input.required,
+                tag: input.tag,
+              };
+              let persistedRule: DraftFieldRule;
+              if (previousRule && previousRule.tag !== input.tag) {
+                await tx.draftFieldRule.delete({
+                  where: { id: previousRule.id },
+                });
+                persistedRule = await tx.draftFieldRule.create({
+                  data: { ...data, templateDraftId: templateDraft.id },
+                });
+              } else if (previousRule) {
+                persistedRule = await tx.draftFieldRule.update({
+                  data,
+                  where: { id: previousRule.id },
+                });
+              } else {
+                persistedRule = await tx.draftFieldRule.create({
+                  data: { ...data, templateDraftId: templateDraft.id },
+                });
+              }
+              await createFormAudit(tx, {
+                action: "configure_field_rule",
+                actorId: identity.id,
+                outcome: AuditOutcome.success,
+                safeMetadata: {},
+                targetId: form.publicId,
+              });
+              return persistedRule;
+            },
+            { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+          );
+        } catch (error) {
+          try {
+            await createFormFailureAudit({
+              action: "configure_field_rule",
+              actorId: identity.id,
+              error,
+              targetId: form.publicId,
+            });
+          } catch {
+            // Preserve the route error if the failure audit cannot be persisted.
+          }
+          if (databaseErrorCode(error) === "P2002") {
+            fail(
+              409,
+              "field_rule_conflict",
+              "The field tag or schema pointer is already configured"
+            );
+          }
+          throw error;
+        }
+        return { rule: fieldRuleDto(rule) };
+      },
+      { parse: "none" }
     )
     .post(
       "/api/admin/forms/:publicId/save",
@@ -4734,19 +5270,26 @@ export function createApp(options: AppOptions = {}) {
       }
       return {
         guid: pluginGuid,
-        name: "Form Bridge",
+        name: "ตั้งค่าฟิลด์",
         variations: [
           {
             EditorsSupport: ["word"],
             buttons: [],
-            description: "Form Bridge",
-            events: ["onToolbarMenuClick", "onDocumentContentReady"],
+            description: "แผงตั้งค่าฟิลด์สำหรับแบบฟอร์ม",
+            events: [
+              "onToolbarMenuClick",
+              "onDocumentContentReady",
+              "onTargetPositionChanged",
+            ],
             initData: "",
             initDataType: "none",
+            initOnSelectionChanged: true,
+            isActivated: true,
             isInsideMode: false,
             isModal: false,
-            isViewer: true,
-            isVisual: false,
+            isViewer: false,
+            isVisual: true,
+            type: "panelRight",
             url: "index.html",
           },
         ],

@@ -1,40 +1,328 @@
 <!doctype html>
-<html>
+<html lang="th">
   <head>
     <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
 
     <style>
+      :root {
+        color-scheme: light;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
       html,
       body {
+        background: #f8fafc;
+        color: #172033;
         margin: 0;
         min-height: 100%;
       }
 
-      #form-bridge-status {
-        color: #4b5563;
-        font:
-          12px/1.4 -apple-system,
-          BlinkMacSystemFont,
-          "Segoe UI",
-          sans-serif;
-        padding: 6px 8px;
+      body {
+        padding: 10px;
       }
 
+      button,
+      input,
+      select {
+        box-sizing: border-box;
+        font: inherit;
+      }
+
+      button {
+        background: #0f766e;
+        border: 1px solid #0f766e;
+        border-radius: 5px;
+        color: #fff;
+        cursor: pointer;
+        min-height: 32px;
+        padding: 5px 9px;
+      }
+
+      button:hover:not(:disabled),
+      button:focus-visible:not(:disabled) {
+        background: #115e59;
+      }
+
+      button:disabled,
+      input:disabled,
+      select:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      input,
+      select {
+        background: #fff;
+        border: 1px solid #94a3b8;
+        border-radius: 5px;
+        min-height: 32px;
+        padding: 5px 7px;
+        width: 100%;
+      }
+
+      input:focus-visible,
+      select:focus-visible,
+      button:focus-visible {
+        outline: 3px solid #99f6e4;
+        outline-offset: 1px;
+      }
+
+      #field-panel {
+        display: grid;
+        gap: 10px;
+        max-width: 340px;
+      }
+
+      #field-panel[hidden] {
+        display: none;
+      }
+
+      .panel-heading {
+        border-bottom: 1px solid #cbd5e1;
+        padding-bottom: 8px;
+      }
+
+      .panel-heading h1,
+      .panel-section h2 {
+        margin: 0;
+      }
+
+      .panel-heading h1 {
+        font-size: 17px;
+      }
+
+      .panel-heading p,
+      .panel-help {
+        color: #475569;
+        margin: 3px 0 0;
+      }
+
+      .panel-section {
+        background: #fff;
+        border: 1px solid #cbd5e1;
+        border-radius: 7px;
+        display: grid;
+        gap: 8px;
+        padding: 9px;
+      }
+
+      .panel-section h2 {
+        font-size: 14px;
+      }
+
+      .selection-summary {
+        display: grid;
+        gap: 3px;
+        grid-template-columns: auto 1fr;
+        margin: 0;
+      }
+
+      .selection-summary dt {
+        color: #475569;
+        font-weight: 600;
+      }
+
+      .selection-summary dd {
+        margin: 0;
+        overflow-wrap: anywhere;
+      }
+
+      .field-label {
+        display: grid;
+        font-weight: 600;
+        gap: 4px;
+      }
+
+      .checkbox-label {
+        align-items: center;
+        display: flex;
+        font-weight: 600;
+        gap: 7px;
+      }
+
+      .checkbox-label input {
+        min-height: auto;
+        width: auto;
+      }
+
+      .inline-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .secondary-action {
+        background: #fff;
+        border-color: #0f766e;
+        color: #0f766e;
+      }
+
+      .secondary-action:hover:not(:disabled),
+      .secondary-action:focus-visible:not(:disabled) {
+        background: #f0fdfa;
+      }
+
+      #field-schema-list {
+        display: grid;
+        gap: 6px;
+        list-style: none;
+        margin: 0;
+        max-height: 210px;
+        overflow: auto;
+        padding: 0;
+      }
+
+      .schema-item {
+        align-items: center;
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 5px;
+        display: grid;
+        gap: 6px;
+        grid-template-columns: minmax(0, 1fr) auto;
+        padding: 6px;
+      }
+
+      .schema-pointer {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        overflow-wrap: anywhere;
+      }
+
+      .schema-type {
+        color: #475569;
+        display: block;
+        font-size: 11px;
+      }
+
+      .schema-item .inline-actions {
+        grid-column: 1 / -1;
+      }
+
+      #field-panel-status,
+      #form-bridge-status {
+        border-radius: 5px;
+        margin: 0;
+        min-height: 19px;
+        padding: 4px 6px;
+      }
+
+      #field-panel-status[data-state="error"],
       #form-bridge-status[data-state="error"] {
+        background: #fef2f2;
         color: #b91c1c;
       }
 
+      #field-panel-status[data-state="success"],
       #form-bridge-status[data-state="success"] {
+        background: #f0fdf4;
         color: #166534;
+      }
+
+      #form-bridge-status {
+        color: #475569;
+        font-size: 12px;
       }
     </style>
 
     <script src="http://localhost:8080/sdkjs-plugins/v1/plugins.js"></script>
-
     <script src="./plugin.js"></script>
   </head>
 
   <body>
-    <div id="form-bridge-status" role="status" aria-live="polite"></div>
+    <aside
+      id="field-panel"
+      aria-describedby="field-panel-description"
+      aria-hidden="true"
+      aria-labelledby="field-panel-title"
+      hidden
+    >
+      <header class="panel-heading">
+        <h1 id="field-panel-title">ตั้งค่าฟิลด์</h1>
+        <p id="field-panel-description">
+          เลือกฟิลด์ในเอกสารเพื่อกำหนดแท็กและการเติมข้อมูลล่วงหน้า
+        </p>
+      </header>
+
+      <section
+        aria-labelledby="field-selection-title"
+        class="panel-section"
+        id="field-selection"
+      >
+        <h2 id="field-selection-title">ฟิลด์ที่เลือก</h2>
+        <dl class="selection-summary">
+          <dt>แท็ก</dt>
+          <dd id="field-selection-tag">ยังไม่ได้เลือก</dd>
+          <dt>ชนิด</dt>
+          <dd id="field-selection-type">ยังไม่ได้เลือก</dd>
+        </dl>
+      </section>
+
+      <form class="panel-section" id="field-policy-form">
+        <h2 id="field-policy-title">นโยบายฟิลด์</h2>
+        <label class="checkbox-label" for="field-required">
+          <input id="field-required" name="required" type="checkbox" disabled />
+          ต้องกรอกฟิลด์นี้
+        </label>
+        <label class="field-label" for="field-prefill-policy">
+          การเติมข้อมูลล่วงหน้า
+          <select id="field-prefill-policy" name="prefillPolicy" disabled>
+            <option value="editable">แก้ไขได้</option>
+            <option value="lock-when-available">ล็อกเมื่อมีข้อมูล</option>
+          </select>
+        </label>
+        <button id="field-save" type="submit" disabled>บันทึกนโยบาย</button>
+      </form>
+
+      <section aria-labelledby="field-schema-title" class="panel-section">
+        <h2 id="field-schema-title">ตัวชี้ข้อมูล</h2>
+        <label class="field-label" for="field-schema-query">
+          ค้นหาตัวชี้
+          <input
+            autocomplete="off"
+            id="field-schema-query"
+            maxlength="128"
+            name="schemaQuery"
+            placeholder="เช่น /customer/name"
+            type="search"
+            disabled
+          />
+        </label>
+        <div class="inline-actions">
+          <button
+            class="secondary-action"
+            id="field-schema-search"
+            type="button"
+            disabled
+          >
+            ค้นหา
+          </button>
+          <button
+            class="secondary-action"
+            id="field-schema-next"
+            type="button"
+            disabled
+          >
+            หน้าถัดไป
+          </button>
+        </div>
+        <p class="panel-help">แสดงเฉพาะตัวชี้ของค่าพื้นฐานที่ใช้กับฟิลด์ได้</p>
+        <ul aria-live="polite" id="field-schema-list"></ul>
+        <button
+          class="secondary-action"
+          id="field-apply-pointer"
+          type="button"
+          disabled
+        >
+          ใช้ตัวชี้ที่เลือกเป็นแท็ก
+        </button>
+      </section>
+
+      <p id="field-panel-status" role="status" aria-live="polite"></p>
+    </aside>
+
+    <p id="form-bridge-status" role="status" aria-live="polite"></p>
   </body>
 </html>

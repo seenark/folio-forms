@@ -1,5 +1,6 @@
 // oxlint-disable func-style sort-keys no-implicit-globals no-unused-vars consistent-function-scoping complexity prefer-named-capture-group require-unicode-regexp avoid-new prefer-await-to-callbacks no-empty-function no-useless-return logical-assignment-operators no-useless-spread no-await-in-loop prefer-await-to-then
 const ACTIONS = Object.freeze({
+  CONFIGURE_FIELDS: "configure-fields",
   DRAFT: "draft",
   FILL: "fill",
   PUBLISH: "publish",
@@ -26,7 +27,35 @@ const CAPABILITY_ACTIONS = Object.freeze([
   ACTIONS.PUBLISH,
   ACTIONS.SAVE_DRAFT,
   ACTIONS.SUBMIT,
+  ACTIONS.CONFIGURE_FIELDS,
 ]);
+
+const FIELD_CONTROL_TYPES = Object.freeze([
+  "text",
+  "checkbox",
+  "date",
+  "dropdown",
+  "combo",
+  "picture",
+  "unsupported",
+]);
+const FIELD_RULE_POLICIES = Object.freeze(["editable", "lock-when-available"]);
+const PANEL_IDS = Object.freeze({
+  applyPointer: "field-apply-pointer",
+  copyPrefix: "field-copy-",
+  list: "field-schema-list",
+  nextPage: "field-schema-next",
+  panel: "field-panel",
+  policyForm: "field-policy-form",
+  policySelect: "field-prefill-policy",
+  query: "field-schema-query",
+  required: "field-required",
+  save: "field-save",
+  search: "field-schema-search",
+  selectionTag: "field-selection-tag",
+  selectionType: "field-selection-type",
+  status: "field-panel-status",
+});
 
 const BRIDGE_MESSAGE_SOURCE = "form-bridge";
 const PARENT_MESSAGE_SOURCE = "folio-parent";
@@ -40,9 +69,32 @@ const CAPABILITY_REQUEST_TIMEOUT_MS = 5000;
 const OPERATION_POLL_INTERVAL_MS = 1000;
 const MAX_OPERATION_POLLS = 300;
 const PREFILL_MAX_ATTEMPTS = 120;
+const MAX_SCHEMA_QUERY_LENGTH = 128;
+const MAX_SCHEMA_PAGE_ITEMS = 200;
+const MAX_SCHEMA_PAGES = 50;
 
 let runtimeOptions = {};
 let actionInFlight = false;
+let panelElements = {};
+let panelEventsAttached = false;
+let panelSelectionEventAttached = false;
+let selectionSequence = 0;
+let schemaRequestSequence = 0;
+let fieldPanelState = {
+  currentPointer: null,
+  prefillPolicy: "editable",
+  required: false,
+  rules: [],
+  schemaCursor: null,
+  schemaItems: [],
+  schemaPageCount: 0,
+  schemaQuery: "",
+  selection: null,
+  selectedPointer: null,
+  saving: false,
+};
+let panelSelectionRequestSequence = 0;
+let pendingFieldSelection;
 let bridgeAcknowledged = false;
 let bridgeMessageListenerAttached = false;
 let bridgeReadySent = false;
@@ -403,6 +455,188 @@ function applyPrefillCommand() {
 }
 
 /**
+ * Read the current content control in ONLYOFFICE document context.
+ *
+ * The returned identifier is kept inside the plugin only. It is never sent
+ * across the form bridge.
+ */
+function getCurrentContentControlCommand() {
+  const doc = Api.GetDocument();
+  const control =
+    typeof doc.GetCurrentContentControl === "function"
+      ? doc.GetCurrentContentControl()
+      : null;
+
+  if (!control) {
+    return JSON.stringify(null);
+  }
+
+  const properties =
+    typeof doc.GetCurrentContentControlPr === "function"
+      ? doc.GetCurrentContentControlPr("none")
+      : {};
+  const readString = (value) => {
+    if (typeof value === "string" || typeof value === "number") {
+      return String(value);
+    }
+
+    return "";
+  };
+  const identifier = readString(
+    properties?.InternalId ??
+      properties?.internalId ??
+      properties?.Id ??
+      properties?.id ??
+      (typeof control.GetInternalId === "function"
+        ? control.GetInternalId()
+        : "")
+  );
+  let controlType = "unsupported";
+  const formType =
+    typeof control.GetFormType === "function"
+      ? readString(control.GetFormType())
+          .toLowerCase()
+          .replaceAll(/[\s_-]+/g, "")
+      : "";
+  let knownFormType = true;
+
+  switch (formType) {
+    case "text":
+    case "textform": {
+      controlType = "text";
+      break;
+    }
+    case "combobox":
+    case "comboboxform": {
+      controlType = "combo";
+      break;
+    }
+    case "dropdown":
+    case "dropdownform": {
+      controlType = "dropdown";
+      break;
+    }
+    case "checkbox":
+    case "checkboxform": {
+      controlType = "checkbox";
+      break;
+    }
+    case "picture":
+    case "pictureform": {
+      controlType = "picture";
+      break;
+    }
+    case "date":
+    case "dateform": {
+      controlType = "date";
+      break;
+    }
+    case "radio":
+    case "radioform":
+    case "complex":
+    case "complexform":
+    case "signature":
+    case "signatureform": {
+      break;
+    }
+    default: {
+      knownFormType = false;
+    }
+  }
+
+  if (!knownFormType) {
+    if (typeof control.IsCheckBox === "function" && control.IsCheckBox()) {
+      controlType = "checkbox";
+    } else if (
+      typeof control.IsDatePicker === "function" &&
+      control.IsDatePicker()
+    ) {
+      controlType = "date";
+    } else if (
+      typeof control.IsDropDownList === "function" &&
+      control.IsDropDownList()
+    ) {
+      controlType = "dropdown";
+    } else if (
+      typeof control.IsComboBox === "function" &&
+      control.IsComboBox()
+    ) {
+      controlType = "combo";
+    } else if (typeof control.IsPicture === "function" && control.IsPicture()) {
+      controlType = "picture";
+    } else if (
+      typeof control.GetClassType === "function" &&
+      (control.GetClassType() === "inlineLvlSdt" ||
+        control.GetClassType() === "blockLvlSdt")
+    ) {
+      controlType = "text";
+    }
+  }
+
+  const tag =
+    typeof control.GetTag === "function" ? readString(control.GetTag()) : "";
+
+  return JSON.stringify({
+    controlType,
+    internalId: identifier || undefined,
+    selected: true,
+    tag: tag || null,
+  });
+}
+
+/**
+ * Runs inside ONLYOFFICE document context and applies one exact schema
+ * pointer as the selected control tag.
+ */
+function setCurrentContentControlTagCommand() {
+  const scope = typeof Asc !== "undefined" && Asc.scope ? Asc.scope : {};
+  const tag =
+    typeof scope.formBridgeSelectionTag === "string"
+      ? scope.formBridgeSelectionTag
+      : "";
+  const targetId =
+    typeof scope.formBridgeSelectionId === "string"
+      ? scope.formBridgeSelectionId
+      : "";
+
+  if (!tag) {
+    return JSON.stringify({ ok: false });
+  }
+
+  const doc = Api.GetDocument();
+  const controls =
+    typeof doc.GetAllContentControls === "function"
+      ? doc.GetAllContentControls()
+      : [];
+  let selectedControl = null;
+
+  for (const control of controls) {
+    if (!control || typeof control.GetInternalId !== "function") {
+      continue;
+    }
+
+    if (targetId && String(control.GetInternalId()) === targetId) {
+      selectedControl = control;
+      break;
+    }
+  }
+
+  if (!selectedControl && typeof doc.GetCurrentContentControl === "function") {
+    selectedControl = doc.GetCurrentContentControl();
+  }
+
+  if (!selectedControl || typeof selectedControl.SetTag !== "function") {
+    return JSON.stringify({ ok: false });
+  }
+
+  const result = selectedControl.SetTag(tag);
+  return JSON.stringify({
+    ok: result !== false,
+    tag,
+  });
+}
+
+/**
  * Call an Office command and expose a Promise for the iframe-side flow.
  */
 function callCommandResult(command) {
@@ -676,6 +910,1122 @@ function ensurePrefill() {
   return prefillPromise;
 }
 
+function panelElement(id) {
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  if (typeof document.getElementById === "function") {
+    const element = document.getElementById(id);
+    if (element) {
+      return element;
+    }
+  }
+
+  if (typeof document.querySelector === "function") {
+    return document.querySelector(`#${id}`);
+  }
+
+  return null;
+}
+
+function setPanelText(element, value) {
+  if (element) {
+    element.textContent = String(value);
+  }
+}
+
+function setPanelDisabled(element, disabled) {
+  if (element) {
+    element.disabled = disabled;
+  }
+}
+
+function setPanelStatus(message, state) {
+  const status = panelElements.status || panelElement(PANEL_IDS.status);
+  if (!status) {
+    return;
+  }
+
+  status.textContent = message;
+  if (status.dataset) {
+    status.dataset.state = state || "info";
+  }
+}
+
+function appendPanelChild(parent, child) {
+  if (!parent || !child) {
+    return;
+  }
+
+  if (typeof parent.append === "function") {
+    parent.append(child);
+  } else if (typeof parent.appendChild === "function") {
+    parent.appendChild(child);
+  }
+}
+
+function clearPanelChildren(element) {
+  if (!element) {
+    return;
+  }
+
+  if (typeof element.replaceChildren === "function") {
+    element.replaceChildren();
+    return;
+  }
+
+  if (typeof element.removeChild !== "function") {
+    return;
+  }
+
+  while (element.firstChild) {
+    element.removeChild(element.firstChild);
+  }
+}
+
+function typeLabel(controlType) {
+  switch (controlType) {
+    case "checkbox":
+      return "ช่องทำเครื่องหมาย";
+    case "date":
+      return "วันที่";
+    case "dropdown":
+      return "รายการเลือก";
+    case "combo":
+      return "รายการเลือกแบบพิมพ์ได้";
+    case "picture":
+      return "รูปภาพ";
+    case "text":
+      return "ข้อความ";
+    default:
+      return "ไม่รองรับ";
+  }
+}
+function schemaTypeLabel(schemaType) {
+  switch (schemaType) {
+    case "boolean":
+      return "จริง/เท็จ";
+    case "number":
+      return "ตัวเลข";
+    case "null":
+      return "ค่าว่าง";
+    case "string":
+      return "ข้อความ";
+    default:
+      return "ไม่รองรับ";
+  }
+}
+
+function nonEmptyString(value) {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function primitiveString(value) {
+  if (typeof value === "string" || typeof value === "number") {
+    return String(value);
+  }
+
+  return null;
+}
+
+function valueFromRecord(record, names) {
+  if (!isRecord(record)) {
+    return null;
+  }
+
+  for (const name of names) {
+    const value = primitiveString(record[name]);
+    if (value) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function normalizeControlType(...values) {
+  for (const value of values) {
+    if (typeof value === "string") {
+      const normalized = value.toLowerCase().replaceAll(/[\s_-]+/g, "");
+
+      if (
+        normalized === "checkbox" ||
+        normalized === "check" ||
+        normalized === "checkboxcontentcontrol"
+      ) {
+        return "checkbox";
+      }
+      if (normalized === "date" || normalized === "datepicker") {
+        return "date";
+      }
+      if (
+        normalized === "dropdown" ||
+        normalized === "dropdownlist" ||
+        normalized === "select"
+      ) {
+        return "dropdown";
+      }
+      if (normalized === "combo" || normalized === "combobox") {
+        return "combo";
+      }
+      if (
+        normalized === "picture" ||
+        normalized === "image" ||
+        normalized === "picturecontentcontrol"
+      ) {
+        return "picture";
+      }
+      if (
+        normalized === "text" ||
+        normalized === "plaintext" ||
+        normalized === "richtext" ||
+        normalized === "inlinelevel" ||
+        normalized === "inlinelevelcontentcontrol" ||
+        normalized === "blocklevel" ||
+        normalized === "blocklevelcontentcontrol"
+      ) {
+        return "text";
+      }
+    }
+
+    if (isRecord(value)) {
+      if (value.CheckBox === true || value.checkbox === true) {
+        return "checkbox";
+      }
+      if (value.DatePicker === true || value.datePicker === true) {
+        return "date";
+      }
+      if (value.DropDownList === true || value.dropdownList === true) {
+        return "dropdown";
+      }
+      if (value.ComboBox === true || value.comboBox === true) {
+        return "combo";
+      }
+      if (value.Picture === true || value.picture === true) {
+        return "picture";
+      }
+
+      const nestedType =
+        value.Type ?? value.type ?? value.ControlType ?? value.controlType;
+      if (nestedType !== value) {
+        const result = normalizeControlType(nestedType);
+        if (result !== "unsupported") {
+          return result;
+        }
+      }
+    }
+  }
+
+  return "unsupported";
+}
+
+function normalizeSelectionSnapshot(currentControl, properties, hint) {
+  const current =
+    isRecord(currentControl) || typeof currentControl === "string"
+      ? currentControl
+      : hint;
+  const props = isRecord(properties) ? properties : {};
+  const currentObject = isRecord(current) ? current : {};
+  const internalId =
+    primitiveString(current) ||
+    valueFromRecord(currentObject, ["InternalId", "internalId", "Id", "id"]) ||
+    valueFromRecord(props, ["InternalId", "internalId", "Id", "id"]);
+  const tag =
+    nonEmptyString(currentObject.Tag) ||
+    nonEmptyString(currentObject.tag) ||
+    nonEmptyString(props.Tag) ||
+    nonEmptyString(props.tag);
+  const controlType = normalizeControlType(
+    currentObject.controlType,
+    currentObject.ControlType,
+    currentObject.Type,
+    props.controlType,
+    props.ControlType,
+    props.Type,
+    props,
+    current
+  );
+  const hasKnownType = controlType !== "unsupported";
+  const explicitlySelected =
+    currentObject.selected === true ||
+    props.selected === true ||
+    current === true;
+
+  if (!internalId && !tag && !hasKnownType && !explicitlySelected) {
+    return null;
+  }
+
+  const controlKey = internalId || `tag:${tag || ""}|type:${controlType}`;
+  return {
+    controlKey,
+    controlType,
+    documentTag: tag || null,
+    internalId: internalId || null,
+    tag: tag || null,
+  };
+}
+
+async function readCurrentSelection(hint) {
+  const plugin = window.Asc?.plugin;
+  let currentControl;
+  let properties;
+
+  if (plugin && typeof plugin.executeMethod === "function") {
+    try {
+      currentControl = await executeMethodResult(
+        "GetCurrentContentControl",
+        []
+      );
+    } catch {
+      currentControl = undefined;
+    }
+
+    try {
+      properties = await executeMethodResult("GetCurrentContentControlPr", [
+        "none",
+      ]);
+    } catch {
+      properties = undefined;
+    }
+
+    const selection = normalizeSelectionSnapshot(
+      currentControl,
+      properties,
+      hint
+    );
+    if (selection?.controlType === "unsupported" && currentControl !== null) {
+      try {
+        const fallback = normalizeSelectionSnapshot(
+          parseCommandResult(
+            await callCommandResult(getCurrentContentControlCommand)
+          ),
+          undefined
+        );
+        if (fallback) {
+          return fallback;
+        }
+      } catch {
+        // Keep the executeMethod snapshot when the Office command is unavailable.
+      }
+    }
+    if (
+      selection ||
+      currentControl === null ||
+      properties === null ||
+      (!hint && currentControl !== undefined && properties !== undefined)
+    ) {
+      return selection;
+    }
+  }
+  if (hint) {
+    const selection = normalizeSelectionSnapshot(undefined, undefined, hint);
+    if (selection) {
+      return selection;
+    }
+  }
+
+  try {
+    const fallback = await callCommandResult(getCurrentContentControlCommand);
+    return normalizeSelectionSnapshot(parseCommandResult(fallback), undefined);
+  } catch {
+    return null;
+  }
+}
+
+function safeFieldSelection(selection) {
+  if (!selection || !selection.controlKey) {
+    return {
+      controlType: "unsupported",
+      selected: false,
+      tag: null,
+    };
+  }
+
+  return {
+    controlType: FIELD_CONTROL_TYPES.includes(selection.controlType)
+      ? selection.controlType
+      : "unsupported",
+    selected: true,
+    tag: selection.tag || null,
+  };
+}
+
+function publishFieldSelection(selection) {
+  const safe = safeFieldSelection(selection);
+  const current = {
+    ...safe,
+    selectionId:
+      fieldPanelState.selection?.selectionId ||
+      `selection-${++selectionSequence}`,
+  };
+  const message = {
+    controlType: current.controlType,
+    selected: current.selected,
+    selectionId: current.selectionId,
+    source: BRIDGE_MESSAGE_SOURCE,
+    tag: current.tag,
+    type: "field-selection",
+  };
+
+  if (!bridgeAcknowledged) {
+    pendingFieldSelection = message;
+    return message;
+  }
+
+  try {
+    postBridgeMessage(message);
+  } catch {
+    setPanelStatus("ไม่สามารถแจ้งการเลือกฟิลด์ได้", "error");
+  }
+  return message;
+}
+function sameSelectionControl(left, right) {
+  return Boolean(left && right && left.controlKey === right.controlKey);
+}
+
+function applyDefaultPolicyState() {
+  fieldPanelState.currentPointer = null;
+  fieldPanelState.prefillPolicy = "editable";
+  fieldPanelState.required = false;
+  fieldPanelState.rules = [];
+  fieldPanelState.selectedPointer = null;
+}
+
+function setSelectionState(snapshot) {
+  const previous = fieldPanelState.selection;
+
+  if (!snapshot) {
+    const selectionId =
+      previous?.selectionId || `selection-${++selectionSequence}`;
+    fieldPanelState.selection = {
+      controlKey: "",
+      controlType: "unsupported",
+      documentTag: null,
+      internalId: null,
+      previousTag: null,
+      rulesLoaded: false,
+      selectionId,
+      tag: null,
+    };
+    applyDefaultPolicyState();
+    updateFieldPanel();
+    return false;
+  }
+
+  const sameControl = sameSelectionControl(previous, snapshot);
+  const selectionId = sameControl
+    ? previous.selectionId
+    : `selection-${++selectionSequence}`;
+  fieldPanelState.selection = {
+    controlKey: snapshot.controlKey,
+    controlType: snapshot.controlType,
+    documentTag: sameControl ? previous.documentTag : snapshot.documentTag,
+    internalId: snapshot.internalId,
+    previousTag: sameControl ? previous.previousTag : snapshot.tag,
+    rulesLoaded: sameControl ? previous.rulesLoaded === true : false,
+    selectionId,
+    tag: snapshot.tag,
+  };
+  if (!sameControl) {
+    applyDefaultPolicyState();
+  }
+  updateFieldPanel();
+  return !sameControl;
+}
+
+function selectionChanged(previous, next) {
+  if (!previous || !next) {
+    return Boolean(previous) !== Boolean(next);
+  }
+
+  return (
+    previous.controlKey !== next.controlKey ||
+    previous.tag !== next.tag ||
+    previous.controlType !== next.controlType
+  );
+}
+
+async function refreshSelection(hint) {
+  if (runtimeOptions.action !== ACTIONS.TEMPLATE_EDIT) {
+    return { ignored: true, selected: false };
+  }
+
+  const requestId = ++panelSelectionRequestSequence;
+  const previous = fieldPanelState.selection;
+  const snapshot = await readCurrentSelection(hint);
+  if (requestId !== panelSelectionRequestSequence) {
+    return { ignored: true, selected: false };
+  }
+
+  const changed = selectionChanged(previous, snapshot);
+  setSelectionState(snapshot);
+  if (changed || !previous) {
+    publishFieldSelection(fieldPanelState.selection);
+  }
+
+  if (!snapshot) {
+    setPanelStatus("ยังไม่ได้เลือกฟิลด์", "info");
+    return { ok: true, selected: false };
+  }
+
+  if (changed || !previous) {
+    await loadFieldRules();
+  }
+  return {
+    controlType: snapshot.controlType,
+    ok: true,
+    selected: true,
+    tag: snapshot.tag,
+  };
+}
+
+function renderSchemaItems() {
+  const list = panelElements.list;
+  clearPanelChildren(list);
+  if (
+    !list ||
+    typeof document === "undefined" ||
+    typeof document.createElement !== "function"
+  ) {
+    return;
+  }
+
+  for (const item of fieldPanelState.schemaItems) {
+    const row = document.createElement("li");
+    const pointerButton = document.createElement("button");
+    const type = document.createElement("span");
+    const actions = document.createElement("span");
+    const copyButton = document.createElement("button");
+    const applyButton = document.createElement("button");
+
+    row.className = "schema-item";
+    pointerButton.className = "schema-pointer";
+    pointerButton.type = "button";
+    pointerButton.textContent = item.pointer;
+    pointerButton.title = "เลือกตัวชี้";
+    pointerButton.addEventListener?.("click", () => {
+      selectSchemaPointer(item.pointer);
+    });
+    type.className = "schema-type";
+    type.textContent = schemaTypeLabel(item.type);
+    actions.className = "inline-actions";
+    copyButton.className = "secondary-action";
+    copyButton.type = "button";
+    copyButton.textContent = "คัดลอก";
+    copyButton.addEventListener?.("click", () => {
+      void copySchemaPointer(item.pointer);
+    });
+    applyButton.type = "button";
+    applyButton.textContent = "ใช้เป็นแท็ก";
+    applyButton.addEventListener?.("click", () => {
+      void applySchemaPointer(item.pointer);
+    });
+    appendPanelChild(row, pointerButton);
+    appendPanelChild(row, type);
+    appendPanelChild(actions, copyButton);
+    appendPanelChild(actions, applyButton);
+    appendPanelChild(row, actions);
+    appendPanelChild(list, row);
+  }
+}
+
+function updateFieldPanel() {
+  const selection = fieldPanelState.selection;
+  const hasSelection = Boolean(selection?.controlKey);
+  const hasTag = Boolean(selection?.tag);
+  const query = panelElements.query;
+  const policy = panelElements.policySelect;
+  const required = panelElements.required;
+
+  setPanelText(
+    panelElements.selectionTag,
+    hasSelection ? selection.tag || "ยังไม่มีแท็ก" : "ยังไม่ได้เลือก"
+  );
+  setPanelText(
+    panelElements.selectionType,
+    hasSelection ? typeLabel(selection.controlType) : "ยังไม่ได้เลือก"
+  );
+  if (required) {
+    required.checked = fieldPanelState.required;
+  }
+  if (policy) {
+    policy.value = fieldPanelState.prefillPolicy;
+  }
+
+  setPanelDisabled(required, !hasSelection);
+  setPanelDisabled(policy, !hasSelection);
+  setPanelDisabled(panelElements.save, !hasSelection || !hasTag);
+  setPanelDisabled(query, !hasSelection);
+  setPanelDisabled(panelElements.search, !hasSelection);
+  setPanelDisabled(
+    panelElements.nextPage,
+    !hasSelection ||
+      !fieldPanelState.schemaCursor ||
+      fieldPanelState.schemaPageCount >= MAX_SCHEMA_PAGES
+  );
+  setPanelDisabled(
+    panelElements.applyPointer,
+    !hasSelection || !fieldPanelState.selectedPointer
+  );
+  renderSchemaItems();
+}
+
+function normalizeFieldRule(value) {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const tag = nonEmptyString(value.tag);
+  const prefillPointer =
+    value.prefillPointer === null ? null : nonEmptyString(value.prefillPointer);
+  const prefillPolicy = FIELD_RULE_POLICIES.includes(value.prefillPolicy)
+    ? value.prefillPolicy
+    : null;
+  if (!tag || typeof value.required !== "boolean" || !prefillPolicy) {
+    return null;
+  }
+
+  return {
+    prefillPointer,
+    prefillPolicy,
+    required: value.required,
+    tag,
+  };
+}
+
+function fieldRulesFromResponse(payload) {
+  if (!isRecord(payload) || !Array.isArray(payload.rules)) {
+    return [];
+  }
+
+  return payload.rules
+    .map((rule) => normalizeFieldRule(rule))
+    .filter((rule) => rule !== null);
+}
+
+function panelErrorStatus(kind) {
+  switch (kind) {
+    case "capability":
+      return "ไม่สามารถยืนยันสิทธิ์การตั้งค่าฟิลด์ได้";
+    case "schema":
+      return "ไม่สามารถโหลดตัวชี้ข้อมูลได้";
+    case "rules":
+      return "ไม่สามารถโหลดนโยบายฟิลด์ได้";
+    case "save":
+      return "ไม่สามารถบันทึกนโยบายฟิลด์ได้";
+    case "selection":
+      return "ไม่สามารถอ่านฟิลด์ที่เลือกได้";
+    case "tag":
+      return "ไม่สามารถใช้ตัวชี้เป็นแท็กได้";
+    case "clipboard":
+      return "ไม่สามารถคัดลอกตัวชี้ได้";
+    default:
+      return "เกิดข้อผิดพลาด กรุณาลองใหม่";
+  }
+}
+
+function fieldRulesPath(suffix) {
+  const publicId = encodeURIComponent(
+    requireOption(runtimeOptions.publicId, "publicId")
+  );
+  return `${API_ROUTES.ADMIN_FORMS}/${publicId}/${suffix}`;
+}
+
+async function requestFieldApi(path, init) {
+  let capability;
+  try {
+    capability = await requestActionCapability(ACTIONS.CONFIGURE_FIELDS);
+  } catch (error) {
+    const wrapped = new Error(panelErrorStatus("capability"));
+    wrapped.cause = error;
+    throw wrapped;
+  }
+
+  return requestJson(path, init, capability);
+}
+
+async function loadFieldRules() {
+  const selection = fieldPanelState.selection;
+  if (!selection?.controlKey) {
+    return { ok: false, rules: [] };
+  }
+
+  const selectionId = selection.selectionId;
+  try {
+    const payload = await requestFieldApi(fieldRulesPath("field-rules"), {
+      method: "GET",
+    });
+    if (fieldPanelState.selection?.selectionId !== selectionId) {
+      return { ignored: true, ok: false, rules: [] };
+    }
+
+    const rules = fieldRulesFromResponse(payload);
+    const baselineTag = selection.rulesLoaded
+      ? selection.previousTag
+      : selection.tag;
+    const rule = baselineTag
+      ? rules.find((candidate) => candidate.tag === baselineTag)
+      : undefined;
+    fieldPanelState.selection.rulesLoaded = true;
+    fieldPanelState.selection.previousTag = rule?.tag || null;
+    fieldPanelState.rules = rules;
+    fieldPanelState.currentPointer = rule?.prefillPointer || null;
+    fieldPanelState.prefillPolicy = rule?.prefillPolicy || "editable";
+    fieldPanelState.required = rule?.required === true;
+    fieldPanelState.selectedPointer = null;
+    updateFieldPanel();
+    setPanelStatus("โหลดนโยบายฟิลด์แล้ว", "success");
+    return { ok: true, rule: rule || null, rules };
+  } catch {
+    if (fieldPanelState.selection?.selectionId === selectionId) {
+      setPanelStatus(panelErrorStatus("rules"), "error");
+    }
+    return { error: panelErrorStatus("rules"), ok: false, rules: [] };
+  }
+}
+
+function normalizeSchemaItems(payload) {
+  if (!isRecord(payload) || !Array.isArray(payload.items)) {
+    return {
+      items: [],
+      nextCursor: null,
+    };
+  }
+  const items = [];
+  const seen = new Set();
+
+  for (const item of payload.items) {
+    if (
+      !isRecord(item) ||
+      typeof item.pointer !== "string" ||
+      !item.pointer ||
+      !["string", "number", "boolean", "null"].includes(item.type)
+    ) {
+      continue;
+    }
+    if (seen.has(item.pointer)) {
+      continue;
+    }
+    seen.add(item.pointer);
+    items.push({
+      pointer: item.pointer,
+      type: item.type,
+    });
+    if (items.length >= MAX_SCHEMA_PAGE_ITEMS) {
+      break;
+    }
+  }
+
+  return {
+    items,
+    nextCursor:
+      typeof payload.nextCursor === "string" && payload.nextCursor
+        ? payload.nextCursor
+        : null,
+  };
+}
+
+function schemaPath(query, cursor) {
+  const params = [];
+  if (query) {
+    params.push(`q=${encodeURIComponent(query)}`);
+  }
+  if (cursor) {
+    params.push(`cursor=${encodeURIComponent(cursor)}`);
+  }
+  const path = fieldRulesPath("schema");
+  return params.length ? `${path}?${params.join("&")}` : path;
+}
+
+async function loadSchemaPage(reset = true) {
+  const selectionId = fieldPanelState.selection?.selectionId;
+  const requestSequence = ++schemaRequestSequence;
+  if (!selectionId || !fieldPanelState.selection?.controlKey) {
+    return { error: "ยังไม่ได้เลือกฟิลด์", items: [], ok: false };
+  }
+  if (
+    !reset &&
+    (!fieldPanelState.schemaCursor ||
+      fieldPanelState.schemaPageCount >= MAX_SCHEMA_PAGES)
+  ) {
+    return {
+      error: "ไม่มีหน้าถัดไป",
+      items: fieldPanelState.schemaItems,
+      ok: false,
+    };
+  }
+
+  const query = fieldPanelState.schemaQuery.slice(0, MAX_SCHEMA_QUERY_LENGTH);
+  const cursor = reset ? null : fieldPanelState.schemaCursor;
+  try {
+    const payload = await requestFieldApi(schemaPath(query, cursor), {
+      method: "GET",
+    });
+    if (
+      fieldPanelState.selection?.selectionId !== selectionId ||
+      requestSequence !== schemaRequestSequence
+    ) {
+      return { ignored: true, items: [], ok: false };
+    }
+
+    const page = normalizeSchemaItems(payload);
+    if (reset) {
+      fieldPanelState.schemaItems = page.items;
+      fieldPanelState.schemaPageCount = 1;
+    } else {
+      const existing = new Set(
+        fieldPanelState.schemaItems.map((item) => item.pointer)
+      );
+      fieldPanelState.schemaItems = fieldPanelState.schemaItems.concat(
+        page.items.filter((item) => !existing.has(item.pointer))
+      );
+      fieldPanelState.schemaPageCount += 1;
+    }
+    fieldPanelState.schemaCursor = page.nextCursor;
+    updateFieldPanel();
+    setPanelStatus(
+      page.items.length ? "โหลดตัวชี้ข้อมูลแล้ว" : "ไม่พบตัวชี้ข้อมูล",
+      "success"
+    );
+    return {
+      items: page.items,
+      nextCursor: page.nextCursor,
+      ok: true,
+    };
+  } catch {
+    if (fieldPanelState.selection?.selectionId === selectionId) {
+      setPanelStatus(panelErrorStatus("schema"), "error");
+    }
+    return { error: panelErrorStatus("schema"), items: [], ok: false };
+  }
+}
+
+function setSchemaQuery(value) {
+  schemaRequestSequence += 1;
+  fieldPanelState.schemaQuery =
+    typeof value === "string" ? value.slice(0, MAX_SCHEMA_QUERY_LENGTH) : "";
+}
+
+function selectSchemaPointer(pointer) {
+  if (
+    !fieldPanelState.selection?.controlKey ||
+    typeof pointer !== "string" ||
+    !pointer
+  ) {
+    return { ok: false };
+  }
+
+  fieldPanelState.selectedPointer = pointer;
+  fieldPanelState.currentPointer = pointer;
+  updateFieldPanel();
+  setPanelStatus("เลือกตัวชี้ข้อมูลแล้ว", "info");
+  return { ok: true, pointer };
+}
+
+async function copySchemaPointer(pointer) {
+  if (!fieldPanelState.selection?.controlKey || typeof pointer !== "string") {
+    return { error: "ยังไม่ได้เลือกฟิลด์", ok: false };
+  }
+
+  try {
+    let copied = false;
+    if (
+      typeof navigator !== "undefined" &&
+      navigator.clipboard &&
+      typeof navigator.clipboard.writeText === "function"
+    ) {
+      try {
+        await navigator.clipboard.writeText(pointer);
+        copied = true;
+      } catch {
+        // Fall through to the synchronous browser copy path.
+      }
+    }
+    if (
+      !copied &&
+      typeof document !== "undefined" &&
+      typeof document.execCommand === "function" &&
+      typeof document.createElement === "function"
+    ) {
+      const input = document.createElement("textarea");
+      input.value = pointer;
+      input.setAttribute("readonly", "true");
+      input.style.position = "fixed";
+      input.style.opacity = "0";
+      appendPanelChild(document.body, input);
+      input.select?.();
+      copied = document.execCommand("copy");
+      input.remove?.();
+    }
+    if (!copied) {
+      throw new Error("Clipboard copy was rejected");
+    }
+    setPanelStatus("คัดลอกตัวชี้ข้อมูลแล้ว", "success");
+    return { ok: true, pointer };
+  } catch {
+    setPanelStatus(panelErrorStatus("clipboard"), "error");
+    return { error: panelErrorStatus("clipboard"), ok: false };
+  }
+}
+
+async function applySchemaPointer(pointer) {
+  if (!fieldPanelState.selection?.controlKey) {
+    return { error: "ยังไม่ได้เลือกฟิลด์", ok: false };
+  }
+  if (typeof pointer !== "string" || !pointer) {
+    return { error: panelErrorStatus("tag"), ok: false };
+  }
+
+  const selection = fieldPanelState.selection;
+  const scope = window.Asc.scope || (window.Asc.scope = {});
+  scope.formBridgeSelectionId = selection.internalId || "";
+  scope.formBridgeSelectionTag = pointer;
+  try {
+    const result = parseCommandResult(
+      await callCommandResult(setCurrentContentControlTagCommand)
+    );
+    if (result.ok !== true) {
+      throw new Error("Tag update was rejected");
+    }
+    if (fieldPanelState.selection?.selectionId !== selection.selectionId) {
+      return { ignored: true, ok: false };
+    }
+    fieldPanelState.selectedPointer = pointer;
+    fieldPanelState.currentPointer = pointer;
+    fieldPanelState.selection.tag = pointer;
+    updateFieldPanel();
+    publishFieldSelection(fieldPanelState.selection);
+    setPanelStatus("ใช้ตัวชี้เป็นแท็กแล้ว", "success");
+    return { ok: true, tag: pointer };
+  } catch {
+    setPanelStatus(panelErrorStatus("tag"), "error");
+    return { error: panelErrorStatus("tag"), ok: false };
+  } finally {
+    if (scope.formBridgeSelectionTag === pointer) {
+      delete scope.formBridgeSelectionTag;
+    }
+    if (scope.formBridgeSelectionId === (selection.internalId || "")) {
+      delete scope.formBridgeSelectionId;
+    }
+  }
+}
+
+async function saveFieldRule(overrides) {
+  const selection = fieldPanelState.selection;
+  if (!selection?.controlKey || !selection.tag) {
+    return { error: "ยังไม่ได้เลือกฟิลด์", ok: false };
+  }
+
+  const body = {
+    documentKey: requireOption(runtimeOptions.documentKey, "documentKey"),
+    previousTag: selection.previousTag || null,
+    prefillPointer:
+      overrides?.prefillPointer !== undefined
+        ? overrides.prefillPointer
+        : fieldPanelState.currentPointer,
+    prefillPolicy: overrides?.prefillPolicy || fieldPanelState.prefillPolicy,
+    required:
+      overrides?.required === undefined
+        ? fieldPanelState.required
+        : Boolean(overrides.required),
+    tag: selection.tag,
+  };
+  if (
+    (body.prefillPointer !== null && typeof body.prefillPointer !== "string") ||
+    !FIELD_RULE_POLICIES.includes(body.prefillPolicy)
+  ) {
+    setPanelStatus(panelErrorStatus("save"), "error");
+    return { error: panelErrorStatus("save"), ok: false };
+  }
+
+  const selectionId = selection.selectionId;
+  const originalDocumentTag = selection.documentTag;
+  const tagChanged = body.tag !== originalDocumentTag;
+
+  fieldPanelState.saving = true;
+  updateFieldPanel();
+  try {
+    const payload = await requestFieldApi(fieldRulesPath("field-rules"), {
+      body: JSON.stringify(body),
+      method: "PATCH",
+    });
+    const rule = normalizeFieldRule(payload?.rule);
+    if (!rule) {
+      throw new Error("Invalid field rule response");
+    }
+    if (fieldPanelState.selection?.selectionId !== selectionId) {
+      return { ignored: true, ok: false };
+    }
+    fieldPanelState.rules = fieldPanelState.rules
+      .filter((candidate) => candidate.tag !== body.previousTag)
+      .filter((candidate) => candidate.tag !== rule.tag)
+      .concat(rule);
+    fieldPanelState.currentPointer = rule.prefillPointer;
+    fieldPanelState.prefillPolicy = rule.prefillPolicy;
+    fieldPanelState.required = rule.required;
+    fieldPanelState.selection.previousTag = rule.tag;
+    fieldPanelState.selection.documentTag = rule.tag;
+    setPanelStatus("บันทึกนโยบายฟิลด์แล้ว", "success");
+    return { ok: true, rule };
+  } catch {
+    if (
+      tagChanged &&
+      originalDocumentTag &&
+      fieldPanelState.selection?.selectionId === selectionId
+    ) {
+      await applySchemaPointer(originalDocumentTag);
+    }
+    setPanelStatus(panelErrorStatus("save"), "error");
+    return { error: panelErrorStatus("save"), ok: false };
+  } finally {
+    fieldPanelState.saving = false;
+    updateFieldPanel();
+  }
+}
+
+function getPanelState() {
+  const selection = fieldPanelState.selection;
+  return {
+    currentPointer: fieldPanelState.currentPointer,
+    prefillPolicy: fieldPanelState.prefillPolicy,
+    required: fieldPanelState.required,
+    rules: fieldPanelState.rules.map((rule) => ({ ...rule })),
+    schemaCursor: fieldPanelState.schemaCursor,
+    schemaItems: fieldPanelState.schemaItems.map((item) => ({ ...item })),
+    schemaPageCount: fieldPanelState.schemaPageCount,
+    schemaQuery: fieldPanelState.schemaQuery,
+    selectedPointer: fieldPanelState.selectedPointer,
+    selection: selection
+      ? {
+          controlType: selection.controlType,
+          selected: Boolean(selection.controlKey),
+          selectionId: selection.selectionId,
+          tag: selection.tag,
+        }
+      : null,
+  };
+}
+
+function bindPanelEvent(element, eventName, listener) {
+  if (element && typeof element.addEventListener === "function") {
+    element.addEventListener(eventName, listener);
+    return true;
+  }
+
+  return false;
+}
+
+function bindFieldPanelEvents() {
+  if (panelEventsAttached) {
+    return;
+  }
+  panelEventsAttached = true;
+
+  bindPanelEvent(panelElements.policyForm, "submit", (event) => {
+    event.preventDefault?.();
+    void saveFieldRule();
+  });
+  bindPanelEvent(panelElements.required, "change", (event) => {
+    fieldPanelState.required = Boolean(event.target?.checked);
+  });
+  bindPanelEvent(panelElements.policySelect, "change", (event) => {
+    const value = event.target?.value;
+    if (FIELD_RULE_POLICIES.includes(value)) {
+      fieldPanelState.prefillPolicy = value;
+    }
+  });
+  bindPanelEvent(panelElements.query, "input", (event) => {
+    setSchemaQuery(event.target?.value);
+    fieldPanelState.schemaCursor = null;
+    fieldPanelState.schemaPageCount = 0;
+    fieldPanelState.schemaItems = [];
+    updateFieldPanel();
+  });
+  bindPanelEvent(panelElements.query, "keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault?.();
+      void loadSchemaPage(true);
+    }
+  });
+  bindPanelEvent(panelElements.search, "click", () => {
+    void loadSchemaPage(true);
+  });
+  bindPanelEvent(panelElements.nextPage, "click", () => {
+    void loadSchemaPage(false);
+  });
+  bindPanelEvent(panelElements.applyPointer, "click", () => {
+    void applySchemaPointer(fieldPanelState.selectedPointer);
+  });
+}
+
+function attachFieldSelectionEvents() {
+  const plugin = window.Asc?.plugin;
+  if (
+    panelSelectionEventAttached ||
+    !plugin ||
+    typeof plugin.attachEditorEvent !== "function"
+  ) {
+    return;
+  }
+
+  panelSelectionEventAttached = true;
+  try {
+    plugin.attachEditorEvent("onDocumentContentReady", () => {
+      void refreshSelection();
+    });
+    plugin.attachEditorEvent("onTargetPositionChanged", () => {
+      void refreshSelection();
+    });
+    plugin.attachEditorEvent("onFocusContentControl", (control) => {
+      void refreshSelection(control);
+    });
+    plugin.attachEditorEvent("onBlurContentControl", () => {
+      void refreshSelection();
+    });
+  } catch {
+    setPanelStatus(panelErrorStatus("selection"), "error");
+  }
+}
+
+function hideFieldPanel() {
+  const panel = panelElements.panel || panelElement(PANEL_IDS.panel);
+  if (!panel) {
+    return;
+  }
+  panel.hidden = true;
+  panel.setAttribute?.("aria-hidden", "true");
+}
+
+function setupFieldPanel() {
+  panelElements = {
+    applyPointer: panelElement(PANEL_IDS.applyPointer),
+    list: panelElement(PANEL_IDS.list),
+    nextPage: panelElement(PANEL_IDS.nextPage),
+    panel: panelElement(PANEL_IDS.panel),
+    policyForm: panelElement(PANEL_IDS.policyForm),
+    policySelect: panelElement(PANEL_IDS.policySelect),
+    query: panelElement(PANEL_IDS.query),
+    required: panelElement(PANEL_IDS.required),
+    save: panelElement(PANEL_IDS.save),
+    search: panelElement(PANEL_IDS.search),
+    selectionTag: panelElement(PANEL_IDS.selectionTag),
+    selectionType: panelElement(PANEL_IDS.selectionType),
+    status: panelElement(PANEL_IDS.status),
+  };
+  const panel = panelElements.panel;
+  if (!panel) {
+    return;
+  }
+
+  panel.hidden = false;
+  panel.setAttribute?.("aria-hidden", "false");
+  bindFieldPanelEvents();
+  updateFieldPanel();
+  attachFieldSelectionEvents();
+  void refreshSelection();
+}
+
 function getStatusElement() {
   const existing = document.querySelector("#form-bridge-status");
 
@@ -811,9 +2161,24 @@ function handleParentMessage(event) {
   ) {
     return;
   }
-
   if (message.type === BRIDGE_ACK_TYPE) {
     bridgeAcknowledged = true;
+    if (pendingFieldSelection) {
+      const pending = pendingFieldSelection;
+      pendingFieldSelection = undefined;
+      try {
+        postBridgeMessage(pending);
+      } catch {
+        setPanelStatus("ไม่สามารถแจ้งการเลือกฟิลด์ได้", "error");
+      }
+    }
+    if (
+      runtimeOptions.action === ACTIONS.TEMPLATE_EDIT &&
+      fieldPanelState.selection?.controlKey &&
+      !fieldPanelState.selection.rulesLoaded
+    ) {
+      void loadFieldRules();
+    }
     return;
   }
 
@@ -942,12 +2307,14 @@ function normalizeRuntimeOptions() {
     apiBase: firstString(options.apiBase)?.replace(/\/+$/, ""),
     bridgeId: firstString(options.bridgeId),
     documentKey: firstString(options.documentKey),
+    formId: firstString(options.formId),
     operationCapability: firstString(options.operationCapability),
     operationId: firstString(options.operationId),
     parentOrigin: firstString(options.parentOrigin),
     prefill: normalizePrefill(options),
     publicId: firstString(options.publicId),
     responseId: firstString(options.responseId),
+    targetId: firstString(options.targetId),
   };
 }
 
@@ -1462,6 +2829,12 @@ function initializePlugin() {
   runtimeOptions = normalizeRuntimeOptions();
   startBridge();
 
+  if (runtimeOptions.action === ACTIONS.TEMPLATE_EDIT) {
+    setupFieldPanel();
+  } else {
+    hideFieldPanel();
+  }
+
   const actions = toolbarActionsForMode(runtimeOptions.action);
   if (actions.length) {
     addToolbarMenuItems(actions);
@@ -1475,13 +2848,21 @@ function initializePlugin() {
 
 window.FormBridge = Object.assign(window.FormBridge || {}, {
   applyPrefill,
+  applySchemaPointer,
+  copySchemaPointer,
   extractFormData,
+  getFieldRules: loadFieldRules,
+  getPanelState,
   getRuntimeOptions: () => runtimeOptions,
+  loadSchemaPage,
   pollOperation,
+  refreshSelection,
   runAction,
+  saveFieldRule,
+  selectSchemaPointer,
+  setSchemaQuery,
   submitForm,
 });
-
 /**
  * ONLYOFFICE plugin entry point.
  *

@@ -115,6 +115,9 @@ const FillRoute = () => {
   }, [activeResponseId, authLoading, editorConfigUrl, form, publicId, user]);
 
   const handleBridgeMessage = async (message: EditorBridgeMessage) => {
+    if (message.type !== "operation") {
+      return;
+    }
     const { status } = message;
     setOperation(
       message.operationId

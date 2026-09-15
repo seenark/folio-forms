@@ -294,7 +294,10 @@ const FormEditorRoute = () => {
   };
 
   const handleEditorBridgeMessage = async (message: EditorBridgeMessage) => {
-    if (message.action !== "save-template" && message.action !== "publish") {
+    if (
+      message.type !== "operation" ||
+      (message.action !== "save-template" && message.action !== "publish")
+    ) {
       return;
     }
     setOperationStatus(
