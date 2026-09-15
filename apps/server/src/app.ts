@@ -3020,6 +3020,21 @@ async function findTemplateSource(): Promise<string | null> {
   const fallbackSource = Bun.file(fallbackTemplatePath);
   return (await fallbackSource.exists()) ? fallbackTemplatePath : null;
 }
+async function readinessStatus(): Promise<boolean> {
+  try {
+    const rustfsReady = await fetch(
+      new URL("/health/ready", env.RUSTFS_ENDPOINT),
+      { signal: AbortSignal.timeout(2000) }
+    );
+    const [templateSource] = await Promise.all([
+      findTemplateSource(),
+      prisma.$queryRaw`SELECT 1`,
+    ]);
+    return rustfsReady.ok && templateSource !== null;
+  } catch {
+    return false;
+  }
+}
 export function resolveCallbackDocumentUrl(
   value: unknown,
   allowedOrigins: ReadonlySet<string> = callbackOrigins,
@@ -7919,6 +7934,13 @@ export function createApp(options: AppOptions = {}) {
       )
     )
     .get("/health", () => ({ ok: true }))
+    .get("/ready", async ({ set }) => {
+      if (!(await readinessStatus())) {
+        set.status = 503;
+        return { ok: false };
+      }
+      return { ok: true };
+    })
     .get("/api/admin/forms", async ({ request }) => {
       const identity = await requireIdentity(request);
       requireAdmin(identity);

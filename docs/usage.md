@@ -1,4 +1,4 @@
-# Folio Forms — คู่มือใช้งาน Local Development
+# Folio Forms — คู่มือใช้งานและ Deploy
 
 Folio Forms เป็นระบบสร้างและกรอกแบบฟอร์ม DOCX โดยใช้ ONLYOFFICE เป็น Document Editor
 
@@ -12,104 +12,43 @@ Folio Forms เป็นระบบสร้างและกรอกแบ�
 
 เอกสารนี้อธิบายการรันระบบ MMVP, การใช้ Share Link, การจัดการ Form และตำแหน่งข้อมูลสำคัญ
 
-## 1. การรัน Development Mode
+## Production single-host Compose
 
-โหมดที่แนะนำคือให้ PostgreSQL, RustFS และ ONLYOFFICE อยู่ใน Docker แต่ให้ API และ Web รันบนเครื่องด้วย Bun
+Production uses the canonical `compose.yaml` with Caddy as the only public entry point. The Forms host serves the React app and API; the Office host serves ONLYOFFICE. PostgreSQL, RustFS, and the application containers stay on the private Compose network with no published host ports.
 
-### 1.1 เตรียม Environment ครั้งแรก
+Create an uncommitted deployment environment file with independent values for `DATABASE_URL`, `BETTER_AUTH_SECRET`, `EDITOR_CAPABILITY_SECRET`, `PREFILL_HANDOFF_SECRET`, `ONLYOFFICE_JWT_SECRET`, `RUSTFS_ACCESS_KEY_ID`, `RUSTFS_SECRET_ACCESS_KEY`, `RUSTFS_BUCKET`, `FORMS_HOST`, `OFFICE_HOST`, `CADDY_EMAIL`, and `PREFILL_RETURN_URL`. Set `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` consistently with `DATABASE_URL`. Bootstrap variables are needed only on the first empty database and may be removed after the first Admin replaces the temporary password.
 
-ถ้ายังไม่มีไฟล์ `apps/server/.env` ให้สร้างจากไฟล์ตัวอย่าง:
+Start the stack:
+
+```bash
+docker compose --env-file .env.production -f compose.yaml up -d --build
+docker compose --env-file .env.production -f compose.yaml ps
+curl -f https://forms.example.test/ready
+```
+
+The server applies checked-in Prisma migrations before listening, creates only the configured first Admin, and runs recovery reconciliation before serving readiness. Restart recovery expires stale Handoffs, Editor Leases, Operations, and callback claims, then retries only durable cleanup intents. Volumes preserve PostgreSQL, RustFS, ONLYOFFICE, and Caddy state.
+
+The stack has no application or off-host backup. Loss of the attached disk, ransomware, or regional failure is unrecoverable. The supported operating ceiling remains roughly 100 accounts, 100 Forms, and 20 concurrent editors; no queue, distributed lock, or horizontal scaling layer is included.
+
+The deterministic external connector is never enabled by default. For explicit verification only:
+
+```bash
+docker compose --env-file .env.production -f compose.yaml --profile verification up prefill-mock
+```
+
+
+## 1. Development Mode
+
+สำหรับการพัฒนาเร็ว ให้รัน API และ Web ด้วย Bun โดยชี้ `apps/server/.env` ไปยัง PostgreSQL, RustFS และ ONLYOFFICE ที่เตรียมไว้สำหรับ development. ใช้ `apps/server/.env.example` เป็นรูปแบบ และใช้ credential local เฉพาะเครื่องเท่านั้น.
 
 ```bash
 cp apps/server/.env.example apps/server/.env
-```
-
-จากนั้นเปลี่ยนค่า `BETTER_AUTH_SECRET`, `EDITOR_CAPABILITY_SECRET` และ `ONLYOFFICE_JWT_SECRET` เป็นค่าสุ่มคนละค่าที่มีความยาวอย่างน้อย 32 ตัวอักษร ห้ามแชร์ค่าเหล่านี้ โดยค่าแรกใช้กับ Browser Session, ค่าที่สองใช้กับ Editor capability อายุ 5 นาที และค่าที่สามใช้เฉพาะกับ ONLYOFFICE Document Server
-
-ค่า `RUSTFS_ENDPOINT`, `RUSTFS_ACCESS_KEY_ID`, `RUSTFS_SECRET_ACCESS_KEY`, `RUSTFS_BUCKET` และ `RUSTFS_REGION` ในไฟล์ตัวอย่างตรงกับ Compose local เท่านั้น Bucket ต้องเป็น private และไม่ควรใช้ credential ชุดนี้นอกเครื่องพัฒนา
-
-ไฟล์ที่เกี่ยวข้อง:
-
-```text
-apps/server/.env          ค่าที่ใช้จริงในเครื่อง และไม่ควร commit
-apps/server/.env.example  ตัวอย่างค่าที่ต้องใช้
-```
-
-### 1.2 เริ่ม PostgreSQL, RustFS และ ONLYOFFICE
-
-ถ้า Container ทำงานอยู่แล้ว ให้ข้ามคำสั่งนี้ได้:
-
-```bash
-docker compose --env-file apps/server/.env -f compose.yaml up -d postgres rustfs rustfs-init onlyoffice
-```
-
-ใช้ `compose.yaml` โดยระบุ `--env-file apps/server/.env -f compose.yaml` เสมอ เพื่อส่ง secret ที่บังคับใช้และหลีกเลี่ยง `docker-compose.yml` รุ่นเก่าที่มีเฉพาะ Server
-
-### 1.3 Apply Prisma migration
-
-เปิด Terminal B:
-
-```bash
 bun run --cwd packages/db db:generate
 bun run --cwd apps/server db:migrate
-```
-
-Migration เริ่มต้นรองรับ PostgreSQL ว่างและสร้าง schema ที่ระบบต้องใช้ ไม่มีการ seed บัญชีหรือข้อมูล demo
-
-### 1.4 รัน API และ Web
-
-```bash
 bun run dev
 ```
 
-คำสั่งนี้ใช้ Turborepo เปิดทั้ง:
-
-```text
-API: http://localhost:3000
-Web: http://localhost:5173
-```
-
-ตรวจ API ได้ด้วย:
-
-```bash
-curl http://localhost:3000/health
-```
-
-ผลลัพธ์ที่ถูกต้อง:
-
-```json
-{ "ok": true }
-```
-
-จากนั้นเปิดเว็บ:
-
-```text
-http://localhost:5173
-```
-
-หยุด Development server ด้วย:
-
-```text
-Ctrl+C
-```
-
-ไม่ต้องหยุด PostgreSQL, RustFS หรือ ONLYOFFICE หากยังต้องการใช้ต่อ
-
-### 1.5 ห้ามรัน API สองโหมดพร้อมกัน
-
-ห้ามรันคำสั่งเหล่านี้พร้อมกัน:
-
-```bash
-bun run dev
-```
-
-และ:
-
-```bash
-docker compose --env-file apps/server/.env -f compose.yaml up -d --build server
-```
-
-ทั้งสองแบบใช้ port `3000` เหมือนกัน ให้เลือกเพียงแบบใดแบบหนึ่ง
+Host API (`3000`) กับ Compose `server` ห้ามเปิดพร้อมกัน. Production ให้ใช้ขั้นตอนในหัวข้อ **Production single-host Compose** แทน; production Compose ไม่ publish port ของ PostgreSQL, RustFS, ONLYOFFICE หรือ Server.
 
 ## 2. Accounts
 
@@ -414,6 +353,8 @@ onlyoffice-data     ข้อมูล ONLYOFFICE
 onlyoffice-logs     Log ของ ONLYOFFICE
 onlyoffice-cache    Cache ของ ONLYOFFICE
 rustfs-data         Private DOCX objects
+caddy-data          Caddy certificates and state
+caddy-config        Caddy runtime configuration
 ```
 
 อย่าใช้ `docker compose down -v` หากไม่ได้ตั้งใจลบข้อมูลใน Database และ Docker volumes ทั้งหมด
@@ -423,24 +364,17 @@ rustfs-data         Private DOCX objects
 ### API ไม่ตอบ
 
 ```bash
-curl http://localhost:3000/health
-docker compose --env-file apps/server/.env -f compose.yaml ps
+docker compose --env-file .env.production -f compose.yaml ps
+docker compose --env-file .env.production -f compose.yaml logs --tail=100 server
+curl -f https://forms.example.test/health
+curl -f https://forms.example.test/ready
 ```
 
-ถ้า port `3000` ถูกใช้งานอยู่ ให้ตรวจว่าไม่ได้เปิด Compose `server` พร้อมกับ Host API
+`/health` เป็น liveness เท่านั้น. `/ready` จะคืน `503` จนกว่า PostgreSQL, RustFS health endpoint และ template ที่ bundle ใน Server image จะพร้อม. ตรวจว่ามี stack production เพียงชุดเดียวที่ใช้ port `80/443`.
 
 ### Editor บอกว่า Document ใช้งานไม่ได้
 
-ตรวจว่า:
-
-1. PostgreSQL ทำงานอยู่
-2. RustFS และ `rustfs-init` พร้อมใช้งาน
-3. ONLYOFFICE เปิดที่ `http://localhost:8080`
-4. API ตอบที่ `http://localhost:3000`
-5. `apps/server/.env` มี `ONLYOFFICE_DOCUMENT_BASE_URL=http://host.docker.internal:3000`
-6. Host API ใช้ `RUSTFS_ENDPOINT=http://localhost:9000`; Compose API ใช้ `http://rustfs:9000`
-7. `RUSTFS_BUCKET` มีอยู่และ credential สามารถอ่านเขียนได้
-8. ใช้ Host API mode หรือ Compose API mode เพียงแบบเดียว
+ตรวจว่า PostgreSQL, RustFS, `rustfs-init`, ONLYOFFICE และ Server เป็น `healthy`, `TEMPLATE_PATH` มีอยู่, `ONLYOFFICE_DOCUMENT_BASE_URL` ให้ ONLYOFFICE เรียก Server ได้ และ DNS ของ Forms/Office host ชี้มายัง Caddy.
 
 ### ไม่เห็นปุ่ม Save Draft หรือ Submit
 
@@ -454,22 +388,28 @@ docker compose --env-file apps/server/.env -f compose.yaml ps
 
 สร้างและ Publish Form ผ่านหน้า Admin ก่อนเปิด Share Link
 
-## 9. โหมด Compose API ทางเลือก
+## 9. Production Compose operation
 
-ถ้าต้องการให้ API รันใน Docker ทั้งหมด ให้หยุด Host API ก่อน แล้วใช้:
+ใช้ `compose.yaml` เป็น topology เดียวสำหรับ production:
 
 ```bash
-docker compose --env-file apps/server/.env -f compose.yaml up -d --build postgres rustfs rustfs-init onlyoffice server
-bun run --cwd apps/web dev
+docker compose --env-file .env.production -f compose.yaml config --quiet
+docker compose --env-file .env.production -f compose.yaml up -d --build
+docker compose --env-file .env.production -f compose.yaml ps
+docker compose --env-file .env.production -f compose.yaml logs --tail=100 server
 ```
 
-ในโหมดนี้ Container `server` จะทำสิ่งต่อไปนี้เอง:
+มีเพียง Caddy ที่เปิด port `80/443` ภายนอก ส่วน Forms host route ไปยัง Web/API และ Office host route ไปยัง ONLYOFFICE PostgreSQL กับ RustFS ไม่มี public host port. `GET /health` เป็น liveness แบบตื้น และ `GET /ready` จะคืน `503` จนกว่า database, RustFS และไฟล์เตรียม Editor จะพร้อม.
 
-1. Run migration
-2. Connect ไปยัง private RustFS bucket ที่ `rustfs-init` สร้างไว้
-3. Start API ที่ port `3000`
+ก่อนเริ่มระบบ Server จะรัน migration, bootstrap Admin แบบ create-only และ reconcile Handoff, pending claim, Editor Lease, Operation, callback claim และ cleanup intent ที่ค้างอยู่ การ restart ไม่ลบ Form, Draft, Submission, Prefill หรือ Audit Event ที่ commit แล้ว.
 
-อย่าใช้โหมดนี้พร้อมกับ `bun run dev` เพราะจะชน port `3000`
+Mock ภายนอกไม่เริ่มใน production. หากต้องการ verification ให้เปิด profile `verification` เท่านั้น:
+
+```bash
+docker compose --env-file .env.production -f compose.yaml --profile verification up prefill-mock
+```
+
+Stack นี้ไม่มี application/off-host backup; disk, ransomware หรือ regional loss กู้คืนไม่ได้ และไม่ควรขยายเกินประมาณ 100 account, 100 Form และ editor พร้อมกัน 20 รายโดยไม่ตัดสินใจเรื่อง backup/scale ใหม่.
 
 ## 10. Source Reference
 
@@ -485,3 +425,6 @@ bun run --cwd apps/web dev
 - `packages/db/prisma/schema.prisma`
 - `packages/env/src/server.ts`
 - `compose.yaml`
+- `Caddyfile`
+- `apps/server/Dockerfile`
+- `apps/web/Dockerfile`

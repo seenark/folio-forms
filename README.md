@@ -14,6 +14,18 @@ The application provides:
 
 The accepted deployment target is one private single-host Docker Compose stack.
 
+The production Compose topology is defined by `compose.yaml`: Caddy publishes only the Forms and Office HTTPS hosts, while PostgreSQL, RustFS, the API, and the web container remain private. Every production credential is injected through an uncommitted environment file; no database, RustFS, bootstrap, auth, editor, Handoff, or ONLYOFFICE JWT value is committed.
+
+```bash
+docker compose --env-file .env.production -f compose.yaml up -d --build
+curl -f https://forms.example.test/ready
+```
+
+Startup applies Prisma migrations before serving traffic, bootstraps only the configured first Admin, and reconciles stale Handoffs, Leases, Operations, callback claims, and object cleanup intents before readiness. The verification-only `prefill-mock` service is gated behind `--profile verification`.
+
+This is a single-host, single-disk deployment with no application or off-host backup. Disk loss, ransomware, and regional loss are unrecoverable. The intended ceiling is about 100 accounts, 100 Forms, and 20 concurrent editors; queues, distributed locks, and horizontal scaling are intentionally absent.
+
+
 ## Contents
 
 - [Stack and ports](#stack-and-ports)
@@ -33,19 +45,18 @@ The accepted deployment target is one private single-host Docker Compose stack.
 
 ## Stack and ports
 
-| Component | Technology | Local address |
+| Component | Technology | Production exposure |
 | --- | --- | --- |
-| Web app | React, Vite, TanStack Router, Tailwind CSS, shadcn-compatible primitives | `http://localhost:5173` |
-| API | Bun, Elysia, TypeScript | `http://localhost:3000` |
-| Document editor | ONLYOFFICE Docs Community Edition 9.4.0.1 | `http://localhost:8080` |
-| Database | PostgreSQL 18 | `localhost:5432` |
-| ORM and migrations | Prisma | `packages/db` |
-| Authentication | Better Auth opaque bearer sessions | Explicit sign-in, sign-out, Session, and password routes |
-| Object storage | RustFS 1.0.0-rc.6, private S3 bucket | `localhost:9000` |
+| Forms web/API | React, Vite, Bun, Elysia | `https://FORMS_HOST` |
+| Document editor | ONLYOFFICE Docs Community Edition 9.4.0.1 | `https://OFFICE_HOST` |
+| Database | PostgreSQL 18 | Private Compose network only |
+| ORM and migrations | Prisma | Applied by the server before readiness |
+| Authentication | Better Auth opaque bearer sessions | Forms host only |
+| Object storage | RustFS 1.0.0-rc.6, private S3 bucket | Private Compose network only |
 
 ## Quick start
 
-Use this mode when the API runs as a host Bun process and PostgreSQL, RustFS, and ONLYOFFICE run in Docker.
+This is the private single-host production stack. It requires Docker Compose, a DNS record for the Forms and Office hosts, and an uncommitted `.env.production` containing independent deployment values.
 
 ### 1. Install dependencies
 
@@ -53,44 +64,36 @@ Use this mode when the API runs as a host Bun process and PostgreSQL, RustFS, an
 bun install
 ```
 
-### 2. Configure API
+### 2. Configure deployment
+
+Set `DATABASE_URL`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `BETTER_AUTH_SECRET`, `EDITOR_CAPABILITY_SECRET`, `PREFILL_HANDOFF_SECRET`, `ONLYOFFICE_JWT_SECRET`, `RUSTFS_ACCESS_KEY_ID`, `RUSTFS_SECRET_ACCESS_KEY`, `RUSTFS_BUCKET`, `FORMS_HOST`, `OFFICE_HOST`, `CADDY_EMAIL`, and `PREFILL_RETURN_URL` in `.env.production`. Set bootstrap values for the first empty database only. Never commit this file.
+
+### 3. Start the stack
 
 ```bash
-cp apps/server/.env.example apps/server/.env
+docker compose --env-file .env.production -f compose.yaml up -d --build
+docker compose --env-file .env.production -f compose.yaml ps
+curl -f https://forms.example.test/ready
 ```
 
-Replace `BETTER_AUTH_SECRET`, `EDITOR_CAPABILITY_SECRET`, and `ONLYOFFICE_JWT_SECRET` with three different random values of at least 32 characters. The first signs browser Sessions, the second signs five-minute editor action capabilities, and the third is shared only with ONLYOFFICE Document Server. Compose RustFS credentials are for isolated local setup only.
+Prisma migrations run before the API listens. The configured bootstrap values create the first Admin only; after the first sign-in replaces its password, remove those three values from the deployment environment. No demo seed runs.
 
-For the first startup when no Admin exists, set all three `BOOTSTRAP_ADMIN_NAME`, `BOOTSTRAP_ADMIN_EMAIL`, and `BOOTSTRAP_ADMIN_PASSWORD` values in `apps/server/.env`. Together they create the first `Admin` only; the password must be 12–128 characters. The bootstrapped credential forces a password replacement on first successful entry. Remove all three variables after that entry. Do not commit `.env` or put a usable password in `.env.example`.
-
-There is no public registration or direct signup. Later accounts are provisioned by authenticated Admins, and later startups never mutate an existing Admin. Admins manage accounts at `/admin/users`. Creation and reset disclose a server-generated temporary password once; the account must replace it at the next sign-in. Disabling an account, changing its email or role, and resetting its password revoke every active Session.
-
-Canonical Template and Response DOCX objects live in the private RustFS bucket. Database rows store opaque object keys; browsers and ONLYOFFICE read them only through short-lived API authorization.
-
-### 3. Start PostgreSQL, RustFS, and ONLYOFFICE
+### 4. Verify restart recovery
 
 ```bash
-docker compose --env-file apps/server/.env -f compose.yaml up -d postgres rustfs rustfs-init onlyoffice
+docker compose --env-file .env.production -f compose.yaml restart server
+docker compose --env-file .env.production -f compose.yaml ps
 ```
 
-### 4. Apply the checked-in Prisma migration
+The server reconciles stale Handoffs, pending claims, Editor Leases, Operations, callback claims, and object cleanup intents before readiness. PostgreSQL and RustFS data, immutable forms/responses/audit events, and Caddy certificates persist in named volumes.
+
+The deterministic external mock is disabled unless explicitly requested:
 
 ```bash
-bun run --cwd packages/db db:generate
-bun run --cwd apps/server db:migrate
+docker compose --env-file .env.production -f compose.yaml --profile verification up prefill-mock
 ```
 
-The initial migration creates the accepted MMVP schema on an empty PostgreSQL database. Prototype data and demo accounts are intentionally not migrated or seeded.
-
-### 5. Start the web app and host API
-
-```bash
-bun run dev
-```
-
-This runs the API and web app through Turborepo. Open `http://localhost:5173`.
-
-Do not run the Compose `server` service at the same time as the host API; both use port `3000`.
+This topology has no application or off-host backup. Disk, ransomware, or regional loss is unrecoverable.
 
 ## Open the application
 
@@ -115,41 +118,16 @@ Main screens:
 
 ## Run modes
 
-Choose exactly one API mode.
+The production run mode is the private Compose topology described above. Do not run a second host API on port `3000` beside it.
 
-### Host API mode
-
-PostgreSQL, RustFS, and ONLYOFFICE run in Docker. The API and web app run under Bun:
+Check service state and English startup diagnostics with:
 
 ```bash
-docker compose --env-file apps/server/.env -f compose.yaml up -d postgres rustfs rustfs-init onlyoffice
-bun run --cwd apps/server db:migrate
-bun run dev
+docker compose --env-file .env.production -f compose.yaml ps
+docker compose --env-file .env.production -f compose.yaml logs --tail=100 server
 ```
 
-### Compose API mode
-
-PostgreSQL, RustFS, ONLYOFFICE, and the API run in Docker. The web app remains a host process:
-
-```bash
-docker compose --env-file apps/server/.env -f compose.yaml up -d --build postgres rustfs rustfs-init onlyoffice server
-bun run --cwd apps/web dev
-```
-
-The Compose server:
-
-1. Applies checked-in Prisma migrations with `prisma migrate deploy`.
-2. Connects to the initialized private RustFS bucket.
-3. Starts the compiled API on port `3000`.
-
-Check service state with:
-
-```bash
-docker compose --env-file apps/server/.env -f compose.yaml ps
-docker compose --env-file apps/server/.env -f compose.yaml logs --tail=100 server
-```
-
-The Compose file intentionally uses local development credentials and networking. See [Production hardening](#production-hardening).
+The liveness endpoint `/health` is shallow. The readiness endpoint `/ready` stays unavailable until PostgreSQL, RustFS, and the bundled editor preparation are available.
 
 ## Roles and workflow
 
@@ -305,6 +283,7 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 | `POST` | `/api/editor-leases/:id/renew` | Renew the current Session's active editor lease |
 | `DELETE` | `/api/editor-leases/:id` | Release the current Session's editor lease |
 | `GET` | `/health` | API health check |
+| `GET` | `/ready` | Readiness check for PostgreSQL, RustFS, and editor preparation |
 
 ### Authenticated user form operations
 
@@ -369,6 +348,7 @@ X-Editor-Capability: <signed-action-or-operation-capability>
 | `/login` | Public | Sign in and preserve a safe return path |
 | `/dashboard` | User | View and resume responses |
 | `/admin` | Admin | View lifecycle state and Draft/Submission counts; remove eligible Draft forms |
+| `/admin/audit` | Admin | Read-only cursor-filtered immutable audit events |
 | `/admin/forms/new` | Admin | Create from the starter or upload a validated DOCX |
 | `/admin/forms/:formId` | Admin | Edit under an exclusive lease, save, publish, and share a template |
 | `/admin/forms/:formId/submissions` | Admin | Review form submissions |
@@ -393,6 +373,8 @@ apps/
     src/routes/            TanStack Router screens
     src/components/        App shell, editor wrapper, UI primitives
     src/lib/               API client and auth provider
+    Dockerfile             Production static web image
+    nginx.conf             SPA fallback configuration
 packages/
   auth/                    Better Auth configuration and bearer plugin
   db/                      Prisma schema, generated client, and checked-in migration
@@ -400,7 +382,8 @@ packages/
   config/                  Shared TypeScript/project configuration
 onlyoffice-templates/
   template.docx            Tracked tagged template
-compose.yaml               PostgreSQL, RustFS, ONLYOFFICE, and API services
+compose.yaml               Canonical private single-host Compose topology
+Caddyfile                  HTTPS host routing
 CONTEXT.md                 Canonical domain glossary
 ```
 
@@ -439,12 +422,11 @@ bun run build
 Docker:
 
 ```bash
-docker compose --env-file apps/server/.env -f compose.yaml config --quiet
-docker compose --env-file apps/server/.env -f compose.yaml build server
-docker compose --env-file apps/server/.env -f compose.yaml up -d --build postgres rustfs rustfs-init onlyoffice server
-docker compose --env-file apps/server/.env -f compose.yaml ps
-docker compose --env-file apps/server/.env -f compose.yaml logs --tail=100 server
-docker compose --env-file apps/server/.env -f compose.yaml down
+docker compose --env-file .env.production -f compose.yaml config --quiet
+docker compose --env-file .env.production -f compose.yaml up -d --build
+docker compose --env-file .env.production -f compose.yaml ps
+docker compose --env-file .env.production -f compose.yaml logs --tail=100 server
+docker compose --env-file .env.production -f compose.yaml down
 ```
 
 Run `bun run --cwd apps/server test:http` and `bun run --cwd apps/server test:storage` against an isolated PostgreSQL database and disposable private RustFS bucket.
@@ -453,60 +435,40 @@ Run `bun run --cwd apps/server test:http` and `bun run --cwd apps/server test:st
 
 ### API does not start
 
-Check the services and API health:
+Check ordering, migration output, and readiness:
 
 ```bash
-docker compose --env-file apps/server/.env -f compose.yaml ps
-curl http://localhost:3000/health
+docker compose --env-file .env.production -f compose.yaml ps
+docker compose --env-file .env.production -f compose.yaml logs --tail=100 server
+curl -f https://forms.example.test/health
+curl -f https://forms.example.test/ready
 ```
 
-If port `3000` is already occupied, stop the other API mode before starting the selected one.
+`/health` is liveness only. `/ready` returns `503` until the database, RustFS health endpoint, and bundled template are available.
 
-### PostgreSQL does not start
+### PostgreSQL or RustFS does not start
 
-Inspect the database logs:
+Inspect the private service logs:
 
 ```bash
-docker compose --env-file apps/server/.env -f compose.yaml logs --tail=100 postgres
+docker compose --env-file .env.production -f compose.yaml logs --tail=100 postgres rustfs rustfs-init
 ```
 
-PostgreSQL 18 uses the `/var/lib/postgresql` volume mount in `compose.yaml`. Do not reuse an incompatible older PostgreSQL data volume without migrating it.
+Do not publish database or RustFS ports. Confirm the injected `DATABASE_URL`, `RUSTFS_ENDPOINT`, bucket, and credentials match the Compose services.
 
 ### The editor says that a document is unavailable
 
-Confirm that:
-
-1. PostgreSQL, RustFS, and ONLYOFFICE are healthy.
-2. The API can reach the configured ONLYOFFICE and `RUSTFS_ENDPOINT` URLs.
-3. The configured template exists at `TEMPLATE_PATH`.
-4. `RUSTFS_BUCKET` exists and the configured access key can read and write it.
-5. Host API mode uses `http://localhost:9000`; Compose API mode uses `http://rustfs:9000`.
+Confirm that PostgreSQL, RustFS, ONLYOFFICE, and the server are healthy; `TEMPLATE_PATH` exists in the server image; `ONLYOFFICE_DOCUMENT_BASE_URL` is reachable from the ONLYOFFICE container; and the Office host resolves to the Caddy endpoint.
 
 ### Form actions are missing
 
-Open the document's **Form** tab inside ONLYOFFICE. The custom actions are registered by the Form Bridge plugin. Then check:
+Open the document's **Form** tab inside ONLYOFFICE. The custom actions are served through the Forms host by the Form Bridge plugin. The plugin receives only action-scoped editor capabilities and never receives the browser Session bearer token.
 
-```bash
-curl http://localhost:3000/onlyoffice-plugin/config.json
-curl http://localhost:3000/onlyoffice-plugin/plugin.js
-```
+## Operational ceiling
 
-The plugin receives only action-scoped editor capabilities. It never receives or reads the browser Session bearer token.
+The stack intentionally has one API, one web container, one ONLYOFFICE instance, one PostgreSQL instance, and one RustFS volume set. It adds no queue, distributed lock, horizontal scaling, or high-availability machinery. Plan capacity around 100 accounts, 100 Forms, and 20 concurrent editors.
 
-## Production hardening
-
-Before exposing this system outside an isolated local workstation:
-
-1. Keep ONLYOFFICE JWT inbox/outbox authentication enabled and provision the same dedicated `ONLYOFFICE_JWT_SECRET` to the API and Document Server.
-2. Remove hardcoded local database and RustFS credentials from `compose.yaml`.
-3. Use HTTPS behind a reverse proxy with strict host and origin allowlists.
-4. Replace localStorage bearer tokens with an httpOnly, secure session strategy where appropriate.
-5. Restrict PostgreSQL and ONLYOFFICE network exposure; do not publish them directly.
-6. Keep RustFS private, rotate its credentials, and monitor object durability.
-7. Add request rate limits, audit logging, observability, backup, and retention policies.
-8. Add automated integration tests for callback correlation, operation races, artifact completeness, authorization, and publish invalidation.
-9. Keep the callback URL allowlist narrow and review outbound network access.
-10. Rotate all local development credentials before deployment.
+The stack has no application or off-host backup. Attached-disk loss, ransomware, and regional loss are unrecoverable. Add an explicit backup/restore decision before operating beyond this MMVP.
 
 ## Related documentation
 

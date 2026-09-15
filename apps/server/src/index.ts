@@ -2,6 +2,9 @@ import { ensureBootstrapAdmin } from "@onlyoffice/auth";
 
 import { createApp, reconcileRecoverableState } from "./app";
 
+console.warn(
+  "Single-host MMVP has no application or off-host backup; disk, ransomware, or regional loss is unrecoverable."
+);
 await ensureBootstrapAdmin();
 await reconcileRecoverableState();
 

@@ -1,18 +1,15 @@
-name: onlyoffice
+name: folio-forms
 
 services:
   postgres:
-    image: postgres:18
-    container_name: onlyoffice-postgres
+    image: postgres:18.0@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c
     restart: unless-stopped
     environment:
-      POSTGRES_DB: onlyoffice
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - "5432:5432"
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d onlyoffice"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -21,18 +18,16 @@ services:
 
   rustfs:
     image: rustfs/rustfs:1.0.0-rc.6@sha256:97171b3d72cd47dc81000f92ea84de25608bfc35a94c965501afaeb5d99f6035
-    container_name: onlyoffice-rustfs
     restart: unless-stopped
     command: ["/data"]
     environment:
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY_ID:-folioforms-local}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_ACCESS_KEY:-folioforms-local-secret-change-me}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY_ID:?set RUSTFS_ACCESS_KEY_ID}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_ACCESS_KEY:?set RUSTFS_SECRET_ACCESS_KEY}
       RUSTFS_ADDRESS: ":9000"
       RUSTFS_CONSOLE_ADDRESS: ":9001"
       RUSTFS_CONSOLE_ENABLE: "true"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+    expose:
+      - "9000"
     healthcheck:
       test:
         [
@@ -55,23 +50,22 @@ services:
         condition: service_healthy
     restart: "no"
     environment:
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY_ID:-folioforms-local}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_ACCESS_KEY:-folioforms-local-secret-change-me}
-      RUSTFS_BUCKET: ${RUSTFS_BUCKET:-folio-forms}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY_ID:?set RUSTFS_ACCESS_KEY_ID}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_ACCESS_KEY:?set RUSTFS_SECRET_ACCESS_KEY}
+      RUSTFS_BUCKET: ${RUSTFS_BUCKET:?set RUSTFS_BUCKET}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-
-        rc alias set local http://rustfs:9000 "$$RUSTFS_ACCESS_KEY" "$$RUSTFS_SECRET_KEY" && rc bucket create "local/$$RUSTFS_BUCKET" --ignore-existing
+        rc alias set local http://rustfs:9000 "$$RUSTFS_ACCESS_KEY" "$$RUSTFS_SECRET_KEY" &&
+        rc bucket create "local/$$RUSTFS_BUCKET" --ignore-existing &&
+        rc anonymous set private "local/$$RUSTFS_BUCKET"
 
   onlyoffice:
-    image: onlyoffice/documentserver:9.4.0.1
-    container_name: onlyoffice
+    image: onlyoffice/documentserver:9.4.0.1@sha256:3ab6ebc7c605e5a32b7ae3ff19daed4925090245acc8100ce2230bd766c88212
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
-    ports:
-      - "8080:80"
     environment:
       JWT_ENABLED: "true"
       JWT_SECRET: ${ONLYOFFICE_JWT_SECRET:?set ONLYOFFICE_JWT_SECRET}
@@ -79,6 +73,13 @@ services:
       JWT_IN_BODY: "false"
       ALLOW_PRIVATE_IP_ADDRESS: "true"
       ALLOW_META_IP_ADDRESS: "true"
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost/healthcheck"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
     volumes:
       - onlyoffice-data:/var/www/onlyoffice/Data
       - onlyoffice-logs:/var/log/onlyoffice
@@ -88,42 +89,108 @@ services:
     build:
       context: .
       dockerfile: apps/server/Dockerfile
-    container_name: onlyoffice-server
-    init: true
     restart: unless-stopped
+    init: true
     depends_on:
       postgres:
         condition: service_healthy
       onlyoffice:
-        condition: service_started
+        condition: service_healthy
       rustfs-init:
         condition: service_completed_successfully
-    ports:
-      - "3000:3000"
+    expose:
+      - "3000"
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/onlyoffice
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET}
       EDITOR_CAPABILITY_SECRET: ${EDITOR_CAPABILITY_SECRET:?set EDITOR_CAPABILITY_SECRET}
+      PREFILL_HANDOFF_SECRET: ${PREFILL_HANDOFF_SECRET:?set PREFILL_HANDOFF_SECRET}
       ONLYOFFICE_JWT_SECRET: ${ONLYOFFICE_JWT_SECRET:?set ONLYOFFICE_JWT_SECRET}
       BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-}
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
-      BETTER_AUTH_URL: http://localhost:3000
-      CORS_ORIGIN: http://localhost:5173
-      SERVER_ORIGIN: http://localhost:3000
-      API_BASE: http://localhost:3000
-      ONLYOFFICE_URL: http://localhost:8080
-      ONLYOFFICE_API_BASE: http://localhost:8080
+      BETTER_AUTH_URL: https://${FORMS_HOST:?set FORMS_HOST}
+      CORS_ORIGIN: https://${FORMS_HOST}
+      SERVER_ORIGIN: https://${FORMS_HOST}
+      API_BASE: https://${FORMS_HOST}
+      ONLYOFFICE_URL: https://${OFFICE_HOST:?set OFFICE_HOST}
+      ONLYOFFICE_API_BASE: https://${OFFICE_HOST}
       ONLYOFFICE_INTERNAL_URL: http://onlyoffice
-      ONLYOFFICE_DOCUMENT_BASE_URL: http://host.docker.internal:3000
+      ONLYOFFICE_DOCUMENT_BASE_URL: http://server:3000
+      PREFILL_RETURN_URL: ${PREFILL_RETURN_URL:?set PREFILL_RETURN_URL}
       RUSTFS_ENDPOINT: http://rustfs:9000
-      RUSTFS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY_ID:-folioforms-local}
-      RUSTFS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_ACCESS_KEY:-folioforms-local-secret-change-me}
-      RUSTFS_BUCKET: ${RUSTFS_BUCKET:-folio-forms}
-      RUSTFS_REGION: us-east-1
+      RUSTFS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY_ID:?set RUSTFS_ACCESS_KEY_ID}
+      RUSTFS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_ACCESS_KEY:?set RUSTFS_SECRET_ACCESS_KEY}
+      RUSTFS_BUCKET: ${RUSTFS_BUCKET:?set RUSTFS_BUCKET}
+      RUSTFS_REGION: ${RUSTFS_REGION:-us-east-1}
       TEMPLATE_PATH: /app/onlyoffice-templates/template.docx
-    command: ["sh", "-c", "bun run db:migrate && bun dist/index.mjs"]
+    command:
+      ["sh", "-c", "cd /app && bun run --cwd packages/db db:migrate && cd /app/apps/server && bun dist/index.mjs"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://localhost:3000/ready').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  caddy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+      onlyoffice:
+        condition: service_healthy
+    environment:
+      CADDY_EMAIL: ${CADDY_EMAIL:?set CADDY_EMAIL}
+      FORMS_HOST: ${FORMS_HOST:?set FORMS_HOST}
+      OFFICE_HOST: ${OFFICE_HOST:?set OFFICE_HOST}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  prefill-mock:
+    image: oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4
+    profiles: [verification]
+    depends_on:
+      server:
+        condition: service_healthy
+    working_dir: /workspace
+    command: ["bun", "run", "apps/prefill-mock/src/index.ts"]
+    environment:
+      FOLIO_ORIGIN: ${FOLIO_ORIGIN:?set FOLIO_ORIGIN}
+      PREFILL_HANDOFF_SECRET: ${PREFILL_HANDOFF_SECRET:?set PREFILL_HANDOFF_SECRET}
+      PREFILL_MOCK_PORT: "3010"
+    ports:
+      - "3010:3010"
+    volumes:
+      - .:/workspace:ro
 
 volumes:
   postgres-data-v18:
@@ -131,3 +198,5 @@ volumes:
   onlyoffice-logs:
   onlyoffice-cache:
   rustfs-data:
+  caddy-data:
+  caddy-config:

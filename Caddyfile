@@ -1,0 +1,25 @@
+{
+  email {$CADDY_EMAIL}
+}
+
+{$FORMS_HOST} {
+  encode gzip
+
+  @api path /api/*
+  handle @api {
+    reverse_proxy server:3000
+  }
+
+  @server path /health /ready /onlyoffice* /prefill*
+  handle @server {
+    reverse_proxy server:3000
+  }
+
+  handle {
+    reverse_proxy web:80
+  }
+}
+
+{$OFFICE_HOST} {
+  reverse_proxy onlyoffice:80
+}
