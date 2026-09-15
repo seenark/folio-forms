@@ -83,7 +83,6 @@ export type FormDetail = FormSummary & {
 export interface Submission {
   id: string;
   responseId?: string;
-  formId?: string;
   formPublicId?: string;
   formTitle?: string;
   userEmail?: string;

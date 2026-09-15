@@ -175,15 +175,12 @@ The Admin Form list shows lifecycle state plus active Draft and Submission count
 
 Publishing:
 
-- Validates that the DOCX is readable.
-- Requires at least one tagged content control.
-- Requires every content control to have a tag.
-- Rejects duplicate tags.
-- Replaces the current published template.
-- Invalidates active unsubmitted drafts for the form.
-- Leaves completed submissions unchanged.
-
-The admin editor also warns before publishing when saved drafts will be invalidated.
+- Validates the DOCX package and requires at least one tagged scalar content control.
+- Records each supported control's tag, type, dropdown/combo options, required state, and Prefill policy in an immutable Field Manifest.
+- Rejects blank or duplicate tags, malformed controls/options, unknown or unsupported control types, and invalid Prefill policies.
+- Creates one immutable Published Template and opaque generated share ID. Save and Publish cannot replace that structural or policy contract in place.
+- Failed publication leaves the prior Template Draft editable and exposes no shareable Published Form.
+- Structural or policy changes require a new Form and share ID; existing Responses remain reproducible.
 
 ### User workflow
 

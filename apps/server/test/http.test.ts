@@ -80,6 +80,11 @@ const docxFixture = (label: string, paddingBytes = 0): Uint8Array =>
     document: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>${label}</w:t></w:r></w:p><w:sectPr/></w:body></w:document>`,
     paddingBytes,
   });
+const contentControlDocument = (controls: string): string =>
+  `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:word="http://purl.oclc.org/ooxml/wordprocessingml/main"><w:body>${controls}<w:sectPr/></w:body></w:document>`;
+
+const contentControl = ({ tag, type }: { tag: string; type: string }): string =>
+  `<w:sdt><w:sdtPr><w:tag w:val="${tag}"/>${type}</w:sdtPr><w:sdtContent><w:r><w:t>fixture</w:t></w:r></w:sdtContent></w:sdt>`;
 
 const strictDocxFixture = (label: string): Uint8Array =>
   docxXmlFixture({
@@ -845,6 +850,29 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(await incompleteDocxResponse.json()).toMatchObject({
     error: "invalid_template",
   });
+  const externalRelationshipResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: docxXmlFixture({
+          additionalParts: {
+            "word/_rels/document.xml.rels": strToU8(
+              '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="external" Target="http://127.0.0.1:80/" TargetMode="External" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"/></Relationships>'
+            ),
+          },
+          document:
+            '<?xml version="1.0"?><word:document xmlns:word="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><word:body/></word:document>',
+        }),
+        name: "external-relationship.docx",
+      },
+      title: "Ticket 10 external relationship upload",
+    })
+  );
+  expect(externalRelationshipResponse.status).toBe(422);
+  expect(await externalRelationshipResponse.json()).toMatchObject({
+    error: "invalid_template",
+  });
   const malformedXmlResponse = await app.handle(
     formCreationRequest({
       authorization: adminBearer,
@@ -1127,7 +1155,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   );
   expect(schemaFirstResponse.status).toBe(200);
   const schemaFirst = (await schemaFirstResponse.json()) as {
-    items: Array<{ pointer: string; type: string }>;
+    items: { pointer: string; type: string }[];
     nextCursor: string | null;
   };
   expect(schemaFirst.items).toHaveLength(5);
@@ -1152,7 +1180,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   );
   expect(schemaSecondResponse.status).toBe(200);
   const schemaSecond = (await schemaSecondResponse.json()) as {
-    items: Array<{ pointer: string; type: string }>;
+    items: { pointer: string; type: string }[];
     nextCursor: string | null;
   };
   expect(schemaSecond.items.length).toBeGreaterThan(0);
@@ -1167,7 +1195,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   );
   expect(schemaFilteredResponse.status).toBe(200);
   const schemaFiltered = (await schemaFilteredResponse.json()) as {
-    items: Array<{ pointer: string; type: string }>;
+    items: { pointer: string; type: string }[];
     nextCursor: string | null;
   };
   expect(schemaFiltered.items.length).toBeGreaterThan(0);
@@ -1216,9 +1244,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       {
         body: JSON.stringify({
           documentKey: templateDocumentKey,
-          previousTag: null,
           prefillPointer: selectedPointer,
           prefillPolicy: "lock-when-available",
+          previousTag: null,
           required: true,
           tag: "ticket-09-field",
         }),
@@ -1242,9 +1270,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       {
         body: JSON.stringify({
           documentKey: templateDocumentKey,
-          previousTag: null,
           prefillPointer: selectedPointer,
           prefillPolicy: "editable",
+          previousTag: null,
           required: false,
           tag: "ticket-09-conflict",
         }),
@@ -1263,9 +1291,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       {
         body: JSON.stringify({
           documentKey: templateDocumentKey,
-          previousTag: "ticket-09-field",
           prefillPointer: selectedPointer,
           prefillPolicy: "editable",
+          previousTag: "ticket-09-field",
           required: false,
           tag: "ticket-09-renamed",
         }),
@@ -1307,9 +1335,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       {
         body: JSON.stringify({
           documentKey: templateDocumentKey,
-          previousTag: "ticket-09-renamed",
           prefillPointer: null,
           prefillPolicy: "lock-when-available",
+          previousTag: "ticket-09-renamed",
           required: false,
           tag: "ticket-09-renamed",
         }),
@@ -1328,9 +1356,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       {
         body: JSON.stringify({
           documentKey: "template-stale",
-          previousTag: "ticket-09-renamed",
           prefillPointer: selectedPointer,
           prefillPolicy: "editable",
+          previousTag: "ticket-09-renamed",
           required: false,
           tag: "ticket-09-renamed",
         }),
@@ -1342,6 +1370,32 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(staleDocumentResponse.status).toBe(409);
   expect(await staleDocumentResponse.json()).toMatchObject({
     error: "stale_document",
+  });
+  const restoredRuleResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/field-rules`,
+      {
+        body: JSON.stringify({
+          documentKey: templateDocumentKey,
+          prefillPointer: selectedPointer,
+          prefillPolicy: "editable",
+          previousTag: "ticket-09-renamed",
+          required: false,
+          tag: "full_name",
+        }),
+        headers: configureHeaders,
+        method: "PATCH",
+      }
+    )
+  );
+  expect(restoredRuleResponse.status).toBe(200);
+  expect(await restoredRuleResponse.json()).toEqual({
+    rule: {
+      prefillPointer: selectedPointer,
+      prefillPolicy: "editable",
+      required: false,
+      tag: "full_name",
+    },
   });
 
   expect(
@@ -1835,6 +1889,359 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(
     publishedList.forms?.find((form) => form.publicId === formPublicId)
   ).toMatchObject({ status: "published", version: 1 });
+  const publishedManifestRecord = await prisma.publishedTemplate.findUnique({
+    include: {
+      manifest: { include: { fields: { orderBy: { tag: "asc" } } } },
+      prefillConfiguration: { include: { fields: true } },
+    },
+    where: { formId },
+  });
+  if (!publishedManifestRecord?.manifest) {
+    throw new Error("The published manifest was not persisted");
+  }
+  const publishedBytes = await readObject(publishedManifestRecord.objectKey);
+  const expectedPublishedHash = createHash("sha256")
+    .update(publishedBytes)
+    .digest("hex");
+  expect(publishedManifestRecord).toMatchObject({
+    contentHash: expectedPublishedHash,
+    version: 1,
+  });
+  expect(publishedManifestRecord.manifest).toMatchObject({
+    configurationHash: expectedPublishedHash,
+  });
+  expect(publishedManifestRecord.manifest.fields).toEqual([
+    {
+      id: expect.any(String),
+      manifestId: expect.any(String),
+      options: null,
+      pictureMaxBytes: null,
+      pictureMaxHeight: null,
+      pictureMaxWidth: null,
+      prefillPolicy: "editable",
+      required: false,
+      tag: "accept_terms",
+      type: "checkbox",
+    },
+    {
+      id: expect.any(String),
+      manifestId: expect.any(String),
+      options: [
+        { displayText: "Choose an item", value: "" },
+        { displayText: "Engineering", value: "engineering" },
+        { displayText: "Human Resources", value: "hr" },
+        { displayText: "Finance", value: "finance" },
+      ],
+      pictureMaxBytes: null,
+      pictureMaxHeight: null,
+      pictureMaxWidth: null,
+      prefillPolicy: "editable",
+      required: false,
+      tag: "department",
+      type: "dropdown",
+    },
+    {
+      id: expect.any(String),
+      manifestId: expect.any(String),
+      options: null,
+      pictureMaxBytes: null,
+      pictureMaxHeight: null,
+      pictureMaxWidth: null,
+      prefillPolicy: "editable",
+      required: false,
+      tag: "description_1",
+      type: "text",
+    },
+    {
+      id: expect.any(String),
+      manifestId: expect.any(String),
+      options: null,
+      pictureMaxBytes: null,
+      pictureMaxHeight: null,
+      pictureMaxWidth: null,
+      prefillPolicy: "editable",
+      required: false,
+      tag: "description_2",
+      type: "text",
+    },
+    {
+      id: expect.any(String),
+      manifestId: expect.any(String),
+      options: null,
+      pictureMaxBytes: null,
+      pictureMaxHeight: null,
+      pictureMaxWidth: null,
+      prefillPolicy: "editable",
+      required: false,
+      tag: "full_name",
+      type: "text",
+    },
+    {
+      id: expect.any(String),
+      manifestId: expect.any(String),
+      options: null,
+      pictureMaxBytes: null,
+      pictureMaxHeight: null,
+      pictureMaxWidth: null,
+      prefillPolicy: "editable",
+      required: false,
+      tag: "start_date",
+      type: "date",
+    },
+  ]);
+  expect(publishedManifestRecord.prefillConfiguration?.fields).toEqual([
+    {
+      configurationId: expect.any(String),
+      id: expect.any(String),
+      pointer: selectedPointer,
+      policy: "editable",
+      tag: "full_name",
+    },
+  ]);
+  expect(publishedManifestRecord.prefillConfiguration).toMatchObject({
+    configurationHash: expectedPublishedHash,
+    publishedTemplateId: publishedManifestRecord.id,
+  });
+  const publishFixture = async (label: string, bytes: Uint8Array) => {
+    const createFixtureResponse = await app.handle(
+      formCreationRequest({
+        authorization: adminBearer,
+        source: "upload",
+        template: { bytes, name: `${label}.docx` },
+        title: `Ticket 10 ${label}`,
+      })
+    );
+    expect(createFixtureResponse.status).toBe(200);
+    const fixtureBody = (await createFixtureResponse.json()) as {
+      form?: { publicId?: string };
+    };
+    const fixturePublicId = fixtureBody.form?.publicId;
+    if (!fixturePublicId) {
+      throw new Error(`The ${label} fixture did not receive a public ID`);
+    }
+    const fixtureEditorResponse = await app.handle(
+      new Request(
+        `http://test.local/api/admin/forms/${fixturePublicId}/editor-config`,
+        { headers: { Authorization: `Bearer ${adminBearer}` } }
+      )
+    );
+    expect(fixtureEditorResponse.status).toBe(200);
+    const fixtureEditor =
+      (await fixtureEditorResponse.json()) as EditorConfigBody;
+    const fixturePublishCapability = fixtureEditor.bridge.capabilities.publish;
+    if (!fixturePublishCapability) {
+      throw new Error(
+        `The ${label} fixture publish capability was not returned`
+      );
+    }
+    const response = await app.handle(
+      new Request(
+        `http://test.local/api/admin/forms/${fixturePublicId}/publish`,
+        {
+          body: JSON.stringify({
+            documentKey: fixtureEditor.config.document.key,
+          }),
+          headers: capabilityHeaders(fixturePublishCapability),
+          method: "POST",
+        }
+      )
+    );
+    expect(response.status).toBe(202);
+    const body = (await response.json()) as {
+      operationCapability?: string;
+      operationId?: string;
+    };
+    if (!body.operationCapability || !body.operationId) {
+      throw new Error(`The ${label} fixture operation was not created`);
+    }
+    const operation = await waitForOperation(body.operationId, {
+      "X-Editor-Capability": body.operationCapability,
+    });
+    return { operation, publicId: fixturePublicId };
+  };
+  const validExtendedFixture = docxXmlFixture({
+    document: contentControlDocument(
+      contentControl({ tag: "/person/name", type: "<w:text/>" }) +
+        contentControl({
+          tag: "department_choice",
+          type: `<w:comboBox><w:listItem w:displayText="Engineering" w:value="engineering"/><w:listItem w:displayText="Finance" w:value="finance"/></w:comboBox>`,
+        }) +
+        contentControl({ tag: "photo", type: "<w:picture/>" })
+    ),
+  });
+  const validExtendedResult = await publishFixture(
+    "combo-and-picture",
+    validExtendedFixture
+  );
+  expect(validExtendedResult.operation.status).toBe("completed");
+  const validExtendedForm = await prisma.form.findUniqueOrThrow({
+    select: { id: true },
+    where: { publicId: validExtendedResult.publicId },
+  });
+  const validExtendedPublished =
+    await prisma.publishedTemplate.findUniqueOrThrow({
+      include: { manifest: { include: { fields: true } } },
+      where: { formId: validExtendedForm.id },
+    });
+  if (!validExtendedPublished.manifest) {
+    throw new Error("The extended fixture manifest was not persisted");
+  }
+  const validExtendedFields = validExtendedPublished.manifest.fields;
+  expect(validExtendedFields).toHaveLength(3);
+  expect(
+    validExtendedFields.find((field) => field.tag === "/person/name")
+  ).toMatchObject({
+    options: null,
+    pictureMaxBytes: null,
+    pictureMaxHeight: null,
+    pictureMaxWidth: null,
+    tag: "/person/name",
+    type: "text",
+  });
+  expect(
+    validExtendedFields.find((field) => field.tag === "department_choice")
+  ).toMatchObject({
+    options: [
+      { displayText: "Engineering", value: "engineering" },
+      { displayText: "Finance", value: "finance" },
+    ],
+    type: "combo",
+  });
+  expect(
+    validExtendedFields.find((field) => field.tag === "photo")
+  ).toMatchObject({
+    options: null,
+    pictureMaxBytes: 10 * 1024 * 1024,
+    pictureMaxHeight: 4096,
+    pictureMaxWidth: 4096,
+    type: "picture",
+  });
+  const invalidFixtureCases = [
+    {
+      bytes: docxFixture("no-controls"),
+      label: "no-controls",
+    },
+    {
+      bytes: docxXmlFixture({
+        document: contentControlDocument(
+          contentControl({ tag: "duplicate", type: "<w:text/>" }) +
+            contentControl({ tag: "duplicate", type: "<w:text/>" })
+        ),
+      }),
+      label: "duplicate-tags",
+    },
+    {
+      bytes: docxXmlFixture({
+        document: contentControlDocument(
+          contentControl({
+            tag: "malformed-options",
+            type: `<w:comboBox><w:listItem w:displayText="Missing value"/></w:comboBox>`,
+          })
+        ),
+      }),
+      label: "malformed-options",
+    },
+    {
+      bytes: docxXmlFixture({
+        document: contentControlDocument(
+          contentControl({ tag: "", type: "<w:text/>" })
+        ),
+      }),
+      label: "blank-tag",
+    },
+    {
+      bytes: docxXmlFixture({
+        document: contentControlDocument(
+          contentControl({
+            tag: "duplicate-options",
+            type: `<w:comboBox><w:listItem w:displayText="One" w:value="same"/><w:listItem w:displayText="Two" w:value="same"/></w:comboBox>`,
+          })
+        ),
+      }),
+      label: "duplicate-options",
+    },
+    {
+      bytes: docxXmlFixture({
+        document: contentControlDocument(
+          contentControl({ tag: "unsupported", type: "<w:group/>" })
+        ),
+      }),
+      label: "unsupported-group",
+    },
+    {
+      bytes: docxXmlFixture({
+        document: contentControlDocument(
+          `<w:sdt><w:sdtPr><w:tag w:val="nested-marker"/><w:placeholder><w:text/></w:placeholder></w:sdtPr><w:sdtContent><w:r><w:t>fixture</w:t></w:r></w:sdtContent></w:sdt>`
+        ),
+      }),
+      label: "nested-marker",
+    },
+    {
+      bytes: docxXmlFixture({
+        document: contentControlDocument(
+          `<w:sdt><w:sdtPr><w:tag w:val="nested-option"/><w:comboBox/><w:placeholder><w:listItem w:displayText="Wrong parent" w:value="wrong"/></w:placeholder></w:sdtPr><w:sdtContent><w:r><w:t>fixture</w:t></w:r></w:sdtContent></w:sdt>`
+        ),
+      }),
+      label: "nested-option",
+    },
+    {
+      bytes: docxXmlFixture({
+        document: contentControlDocument(
+          `<w:sdt><w:sdtPr><w:tag w:val="nested-option-child"/><w:comboBox><w:listItem w:displayText="One" w:value="one"><w:bogus/></w:listItem></w:comboBox></w:sdtPr><w:sdtContent><w:r><w:t>fixture</w:t></w:r></w:sdtContent></w:sdt>`
+        ),
+      }),
+      label: "nested-option-child",
+    },
+    {
+      bytes: docxXmlFixture({
+        additionalParts: {
+          "word/header1.xml": strToU8(
+            `<?xml version="1.0"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">${contentControl({ tag: "orphan-header", type: "<w:text/>" })}</w:hdr>`
+          ),
+        },
+        document:
+          '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p/></w:body></w:document>',
+      }),
+      label: "orphan-header-control",
+    },
+    {
+      bytes: docxXmlFixture({
+        document: contentControlDocument(
+          contentControl({ tag: "unknown", type: "<w:unknown/>" })
+        ),
+      }),
+      label: "unknown-control",
+    },
+    {
+      bytes: docxXmlFixture({
+        document: contentControlDocument(
+          contentControl({ tag: "wrong-namespace", type: "<w14:picture/>" })
+        ),
+      }),
+      label: "wrong-namespace",
+    },
+    {
+      bytes: docxXmlFixture({
+        document: contentControlDocument(
+          `<w:sdt><w:sdtPr><w:tag word:val="forged"/><w:text/></w:sdtPr><w:sdtContent><w:r><w:t>fixture</w:t></w:r></w:sdtContent></w:sdt>`
+        ),
+      }),
+      label: "wrong-attribute-namespace",
+    },
+  ];
+  for (const fixture of invalidFixtureCases) {
+    const result = await publishFixture(fixture.label, fixture.bytes);
+    expect(result.operation.status).toBe("failed");
+    const fixtureForm = await prisma.form.findUniqueOrThrow({
+      select: { id: true },
+      where: { publicId: result.publicId },
+    });
+    expect(
+      await prisma.publishedTemplate.findUnique({
+        where: { formId: fixtureForm.id },
+      })
+    ).toBeNull();
+  }
   const publishedDeleteResponse = await app.handle(
     new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
       headers: { Authorization: `Bearer ${adminBearer}` },
@@ -1849,117 +2256,33 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     await prisma.form.findUnique({ where: { publicId: formPublicId } })
   ).not.toBeNull();
 
-  const concurrentSaveCapability =
+  const immutableSaveCapability =
     refreshedAdminEditor.bridge.capabilities["save-template"];
-  if (!concurrentSaveCapability) {
-    throw new Error("The concurrency editor capability was not returned");
+  if (!immutableSaveCapability) {
+    throw new Error("The immutable save capability was not returned");
   }
-  const stableTemplateBeforeConcurrency = await prisma.templateDraft.findUnique(
-    {
-      select: { documentKey: true, objectKey: true },
-      where: { formId },
-    }
-  );
-  if (!stableTemplateBeforeConcurrency) {
-    throw new Error("The stable template was not found");
-  }
-  const stableTemplateBytes = await readObject(
-    stableTemplateBeforeConcurrency.objectKey
-  );
-  const { promise: forceSaveGate, resolve: releaseForceSave } =
-    Promise.withResolvers<undefined>();
-  const deterministicApp = createApp({
-    onlyOffice: {
-      convertDocxToPdf: () =>
-        Promise.resolve(new TextEncoder().encode("%PDF-test")),
-      forceSave: async () => {
-        await forceSaveGate;
-        throw new Error("deterministic force-save failure");
-      },
-    },
-    requestIp: (request) => request.headers.get("x-test-ip"),
-  });
-  const concurrentSaveResponses = await Promise.all([
-    deterministicApp.handle(
-      new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
-        body: JSON.stringify({ documentKey: activeTemplateDocumentKey }),
-        headers: capabilityHeaders(concurrentSaveCapability),
-        method: "POST",
-      })
-    ),
-    deterministicApp.handle(
-      new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
-        body: JSON.stringify({ documentKey: activeTemplateDocumentKey }),
-        headers: capabilityHeaders(concurrentSaveCapability),
-        method: "POST",
-      })
-    ),
-  ]);
-  expect(
-    concurrentSaveResponses
-      .map((response) => response.status)
-      .toSorted((left, right) => left - right)
-  ).toEqual([202, 409]);
-  const rejectedConcurrentSaveResponse = concurrentSaveResponses.find(
-    (response) => response.status === 409
-  );
-  if (!rejectedConcurrentSaveResponse) {
-    throw new Error("The competing template save was not rejected");
-  }
-  const rejectedConcurrentSaveBody =
-    (await rejectedConcurrentSaveResponse.json()) as { error?: string };
-  expect(rejectedConcurrentSaveBody.error).toBe("operation_in_progress");
-  const acceptedConcurrentSaveResponse = concurrentSaveResponses.find(
-    (response) => response.status === 202
-  );
-  if (!acceptedConcurrentSaveResponse) {
-    throw new Error("The winning template save was not accepted");
-  }
-  const acceptedConcurrentSaveBody =
-    (await acceptedConcurrentSaveResponse.json()) as {
-      operationCapability?: string;
-      operationId?: string;
-    };
-  if (
-    !acceptedConcurrentSaveBody.operationCapability ||
-    !acceptedConcurrentSaveBody.operationId
-  ) {
-    throw new Error("The winning template save operation was not created");
-  }
-  releaseForceSave();
-  const failedConcurrentOperation = await waitForOperation(
-    acceptedConcurrentSaveBody.operationId,
-    { "X-Editor-Capability": acceptedConcurrentSaveBody.operationCapability }
-  );
-  expect(failedConcurrentOperation.status).toBe("failed");
-  expect(
-    await prisma.templateDraft.findUnique({
-      select: { documentKey: true, objectKey: true },
-      where: { formId },
-    })
-  ).toEqual(stableTemplateBeforeConcurrency);
-  expect(await readObject(stableTemplateBeforeConcurrency.objectKey)).toEqual(
-    stableTemplateBytes
-  );
-  const retrySaveResponse = await app.handle(
+  const immutableSaveResponse = await app.handle(
     new Request(`http://test.local/api/admin/forms/${formPublicId}/save`, {
       body: JSON.stringify({ documentKey: activeTemplateDocumentKey }),
-      headers: capabilityHeaders(concurrentSaveCapability),
+      headers: capabilityHeaders(immutableSaveCapability),
       method: "POST",
     })
   );
-  expect(retrySaveResponse.status).toBe(202);
-  const retrySaveBody = (await retrySaveResponse.json()) as {
-    operationCapability?: string;
-    operationId?: string;
-  };
-  if (!retrySaveBody.operationCapability || !retrySaveBody.operationId) {
-    throw new Error("The retry template save operation was not created");
-  }
-  const retryOperation = await waitForOperation(retrySaveBody.operationId, {
-    "X-Editor-Capability": retrySaveBody.operationCapability,
+  expect(immutableSaveResponse.status).toBe(409);
+  expect(await immutableSaveResponse.json()).toMatchObject({
+    error: "published_immutable",
   });
-  expect(retryOperation.status).toBe("completed");
+  const immutablePublishResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/publish`, {
+      body: JSON.stringify({ documentKey: activeTemplateDocumentKey }),
+      headers: capabilityHeaders(activePublishCapability),
+      method: "POST",
+    })
+  );
+  expect(immutablePublishResponse.status).toBe(409);
+  expect(await immutablePublishResponse.json()).toMatchObject({
+    error: "published_immutable",
+  });
 
   const user = await createCredentialFixture({
     email: userEmail,
@@ -1976,6 +2299,44 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   if (!formRecord) {
     throw new Error("The published test form was not found");
   }
+  const draftMetadataCreateResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      description: "Ticket 10 draft metadata secret",
+      source: "upload",
+      template: {
+        bytes: docxFixture("draft-metadata"),
+        name: "draft-metadata.docx",
+      },
+      title: "Ticket 10 draft metadata secret",
+    })
+  );
+  expect(draftMetadataCreateResponse.status).toBe(200);
+  const draftMetadataCreateBody =
+    (await draftMetadataCreateResponse.json()) as {
+      form?: { publicId?: string };
+    };
+  const draftMetadataPublicId = draftMetadataCreateBody.form?.publicId;
+  if (!draftMetadataPublicId) {
+    throw new Error("The draft metadata fixture was not created");
+  }
+  const draftMetadataResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${draftMetadataPublicId}`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(draftMetadataResponse.status).toBe(404);
+  const draftMetadataBody = await draftMetadataResponse.json();
+  expect(JSON.stringify(draftMetadataBody)).not.toContain(
+    "Ticket 10 draft metadata secret"
+  );
+  const draftMetadataDeleteResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${draftMetadataPublicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(draftMetadataDeleteResponse.status).toBe(200);
   const unauthenticatedMetadataResponse = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}`)
   );
@@ -2698,13 +3059,62 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       }
     )
   );
-  expect(reclaimedAfterReconcileResponse.status).toBe(200);
-  const reclaimedAfterReconcile =
-    (await reclaimedAfterReconcileResponse.json()) as EditorConfigBody;
-  expect(reclaimedAfterReconcile.bridge.lease.id).toBeTruthy();
+  expect(reclaimedAfterReconcileResponse.status).toBe(409);
+  expect(await reclaimedAfterReconcileResponse.json()).toMatchObject({
+    error: "published_immutable",
+  });
+
+  const callbackFormId = crypto.randomUUID();
+  const callbackFormPublicId = crypto.randomUUID().replaceAll("-", "");
+  const callbackTemplateDocumentKey = `callback-template-${crypto.randomUUID()}`;
+  const callbackTemplateObjectKey = objectKey(
+    "forms",
+    callbackFormId,
+    "template-draft",
+    "callback.docx"
+  );
+  await putObject(callbackTemplateObjectKey, sourceDocument, DOCX_CONTENT_TYPE);
+  await prisma.form.create({
+    data: {
+      createdBy: adminId,
+      description: "Callback operation test form",
+      id: callbackFormId,
+      publicId: callbackFormPublicId,
+      templateDraft: {
+        create: {
+          contentHash: createHash("sha256")
+            .update(sourceDocument)
+            .digest("hex"),
+          documentKey: callbackTemplateDocumentKey,
+          id: crypto.randomUUID(),
+          objectKey: callbackTemplateObjectKey,
+        },
+      },
+      title: "Callback operation test form",
+    },
+  });
+  const callbackTemplateDraft = await prisma.templateDraft.findUnique({
+    where: { formId: callbackFormId },
+  });
+  if (!callbackTemplateDraft) {
+    throw new Error("The callback template draft was not created");
+  }
 
   const callbackDocument = docxFixture(
     `ticket-08-callback-${crypto.randomUUID()}`
+  );
+  const externalCallbackDocument = docxXmlFixture({
+    additionalParts: {
+      "word/_rels/document.xml.rels": strToU8(
+        '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="external" Target="http://127.0.0.1:80/" TargetMode="External" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"/></Relationships>'
+      ),
+    },
+    document:
+      '<?xml version="1.0"?><word:document xmlns:word="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><word:body/></word:document>',
+  });
+  const callbackMaximumBytes = Math.max(
+    callbackDocument.byteLength,
+    externalCallbackDocument.byteLength
   );
   const callbackDownloadPaths = new Set<string>();
   const callbackDocumentServer = Bun.serve({
@@ -2725,10 +3135,15 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         });
       }
       if (url.pathname === "/large.docx") {
-        return new Response(new Uint8Array(callbackDocument.byteLength + 1));
+        return new Response(new Uint8Array(callbackMaximumBytes + 1));
       }
       if (url.pathname === "/malformed.docx") {
         return new Response("not a DOCX package");
+      }
+      if (url.pathname === "/external-relationship.docx") {
+        return new Response(externalCallbackDocument, {
+          headers: { "Content-Type": DOCX_CONTENT_TYPE },
+        });
       }
       return new Response(callbackDocument, {
         headers: { "Content-Type": DOCX_CONTENT_TYPE },
@@ -2744,7 +3159,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
           Promise.resolve(new TextEncoder().encode("%PDF-test")),
         forceSave: () => Promise.resolve(false),
       },
-      onlyOfficeCallbackMaxBytes: callbackDocument.byteLength,
+      onlyOfficeCallbackMaxBytes: callbackMaximumBytes,
       onlyOfficeCallbackOrigins: [callbackOrigin],
     });
     const callbackAppReplica = createApp({
@@ -2753,7 +3168,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
           Promise.resolve(new TextEncoder().encode("%PDF-test")),
         forceSave: () => Promise.resolve(false),
       },
-      onlyOfficeCallbackMaxBytes: callbackDocument.byteLength,
+      onlyOfficeCallbackMaxBytes: callbackMaximumBytes,
       onlyOfficeCallbackOrigins: [callbackOrigin],
     });
     const createCallbackOperation =
@@ -2770,21 +3185,21 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
           "callback-final.docx"
         );
         const userdata = createCallbackUserdata({
-          documentKey: templateDraft.documentKey,
+          documentKey: callbackTemplateDraft.documentKey,
           operationId: id,
           operationType: "save_template_draft",
         });
         await prisma.operation.create({
           data: {
             actorId: adminId,
-            documentKey: templateDraft.documentKey,
+            documentKey: callbackTemplateDraft.documentKey,
             errorCode: null,
-            formId,
+            formId: callbackFormId,
             id,
             metadata: {
               action: "save-template",
               finalObjectKey,
-              formId,
+              formId: callbackFormId,
               stagedObjectKey,
             },
             ownerUserId: adminId,
@@ -2797,7 +3212,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         });
         await persistCallbackClaim({ operationId: id, userdata });
         return {
-          documentKey: templateDraft.documentKey,
+          documentKey: callbackTemplateDraft.documentKey,
           finalObjectKey,
           id,
           userdata,
@@ -2956,7 +3371,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     ).toEqual({ status: "failed" });
     const templateBeforeMalformedSave = await prisma.templateDraft.findUnique({
       select: { documentKey: true, objectKey: true },
-      where: { formId },
+      where: { formId: callbackFormId },
     });
     if (!templateBeforeMalformedSave) {
       throw new Error("The Template Draft rollback baseline was not found");
@@ -2981,12 +3396,132 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     expect(
       await prisma.templateDraft.findUnique({
         select: { documentKey: true, objectKey: true },
-        where: { formId },
+        where: { formId: callbackFormId },
       })
     ).toEqual(templateBeforeMalformedSave);
     expect(await readObject(templateBeforeMalformedSave.objectKey)).toEqual(
       templateBytesBeforeMalformedSave
     );
+    const externalResponseId = crypto.randomUUID();
+    const externalResponseDocumentKey = `external-response-${crypto.randomUUID()}`;
+    const externalResponseObjectKey = objectKey(
+      "responses",
+      externalResponseId,
+      "draft",
+      "baseline.docx"
+    );
+    await putObject(
+      externalResponseObjectKey,
+      callbackDocument,
+      DOCX_CONTENT_TYPE
+    );
+    await prisma.response.create({
+      data: {
+        draftData: {},
+        draftDocumentKey: externalResponseDocumentKey,
+        draftObjectKey: externalResponseObjectKey,
+        formId,
+        id: externalResponseId,
+        publishedTemplateId: publishedManifestRecord.id,
+        publishedVersion: publishedManifestRecord.version,
+        status: "draft",
+        userId: adminId,
+      },
+    });
+    const externalResponseOperationId = crypto.randomUUID();
+    const externalResponseStagedObjectKey = objectKey(
+      "operations",
+      externalResponseOperationId,
+      "external-response-staged.docx"
+    );
+    const externalResponseFinalObjectKey = objectKey(
+      "operations",
+      externalResponseOperationId,
+      "external-response-final.docx"
+    );
+    const externalResponseUserdata = createCallbackUserdata({
+      documentKey: externalResponseDocumentKey,
+      operationId: externalResponseOperationId,
+      operationType: "save_draft",
+    });
+    await prisma.operation.create({
+      data: {
+        actorId: adminId,
+        documentKey: externalResponseDocumentKey,
+        errorCode: null,
+        formId,
+        id: externalResponseOperationId,
+        metadata: {
+          action: "save-draft",
+          data: {},
+          finalObjectKey: externalResponseFinalObjectKey,
+          formId,
+          publicId: formPublicId,
+          responseId: externalResponseId,
+          stagedObjectKey: externalResponseStagedObjectKey,
+        },
+        ownerUserId: adminId,
+        responseId: externalResponseId,
+        stagingObjectKey: externalResponseStagedObjectKey,
+        status: "processing",
+        targetId: externalResponseId,
+        targetType: "response",
+        type: "save_draft",
+      },
+    });
+    await persistCallbackClaim({
+      operationId: externalResponseOperationId,
+      userdata: externalResponseUserdata,
+    });
+    const externalResponseOperation: CallbackOperationFixture = {
+      documentKey: externalResponseDocumentKey,
+      finalObjectKey: externalResponseFinalObjectKey,
+      id: externalResponseOperationId,
+      userdata: externalResponseUserdata,
+    };
+    const externalResponseBefore = await prisma.response.findUnique({
+      select: {
+        draftData: true,
+        draftDocumentKey: true,
+        draftObjectKey: true,
+        status: true,
+      },
+      where: { id: externalResponseId },
+    });
+    const externalResponseCallback = await postCallback(
+      callbackPayload(
+        externalResponseOperation,
+        `${callbackOrigin}/external-relationship.docx`
+      )
+    );
+    expect(await externalResponseCallback.json()).toEqual({ error: 1 });
+    expect(
+      await prisma.operation.findUnique({
+        select: { errorCode: true, status: true },
+        where: { id: externalResponseOperationId },
+      })
+    ).toEqual({
+      errorCode: "invalid_template",
+      status: "failed",
+    });
+    expect(
+      await prisma.response.findUnique({
+        select: {
+          draftData: true,
+          draftDocumentKey: true,
+          draftObjectKey: true,
+          status: true,
+        },
+        where: { id: externalResponseId },
+      })
+    ).toEqual(externalResponseBefore);
+    expect(await objectExists(externalResponseObjectKey)).toBe(true);
+    expect(await objectExists(externalResponseStagedObjectKey)).toBe(false);
+    expect(await objectExists(externalResponseFinalObjectKey)).toBe(false);
+    await prisma.operation.delete({
+      where: { id: externalResponseOperationId },
+    });
+    await prisma.response.delete({ where: { id: externalResponseId } });
 
     const validCallbackResponse = await postCallback(trustedPayload);
     expect(await validCallbackResponse.json()).toEqual({ error: 0 });
@@ -3005,14 +3540,14 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     expect(consumedTrustClaim?.consumedAt).not.toBeNull();
     const changedEditorResponse = await callbackApp.handle(
       new Request(
-        `http://test.local/api/admin/forms/${formPublicId}/editor-config`,
+        `http://test.local/api/admin/forms/${callbackFormPublicId}/editor-config`,
         { headers: { Authorization: `Bearer ${adminBearer}` } }
       )
     );
     expect(changedEditorResponse.status).toBe(200);
     const changedEditor =
       (await changedEditorResponse.json()) as EditorConfigBody;
-    expect(JSON.stringify(changedEditor)).not.toContain(formId);
+    expect(JSON.stringify(changedEditor)).not.toContain(callbackFormId);
     const changedDocumentUrl = changedEditor.config.document.url;
     const changedDocumentResponse = await callbackApp.handle(
       new Request(changedDocumentUrl, {
@@ -3068,7 +3603,13 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     ).toEqual(concurrentCallbackState);
 
     expect(callbackDownloadPaths).toEqual(
-      new Set(["/large.docx", "/malformed.docx", "/ok.docx", "/redirect.docx"])
+      new Set([
+        "/external-relationship.docx",
+        "/large.docx",
+        "/malformed.docx",
+        "/ok.docx",
+        "/redirect.docx",
+      ])
     );
   } finally {
     callbackDocumentServer.stop(true);
@@ -3916,6 +4457,16 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     },
     {
       action: "save_template_draft",
+      outcome: "failure",
+      targetId: formPublicId,
+    },
+    {
+      action: "publish_form",
+      outcome: "success",
+      targetId: formPublicId,
+    },
+    {
+      action: "publish_form",
       outcome: "failure",
       targetId: formPublicId,
     },

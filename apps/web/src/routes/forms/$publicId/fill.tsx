@@ -66,7 +66,12 @@ const FillRoute = () => {
         }
       } catch (caughtError) {
         if (!cancelled) {
-          setError(formRequestError(caughtError, "This form is unavailable."));
+          setError(
+            formRequestError(
+              caughtError,
+              "ไม่พบแบบฟอร์มนี้ หรือแบบฟอร์มยังไม่พร้อมใช้งาน"
+            )
+          );
         }
       } finally {
         if (!cancelled) {
@@ -102,7 +107,7 @@ const FillRoute = () => {
       } catch (caughtError) {
         if (!cancelled) {
           setError(
-            formRequestError(caughtError, "Could not start this response.")
+            formRequestError(caughtError, "ไม่สามารถเริ่มคำตอบนี้ได้ กรุณาลองใหม่")
           );
         }
       }
@@ -130,7 +135,7 @@ const FillRoute = () => {
     );
     if (status === "failed") {
       setOperationError(
-        message.error ?? "The document operation failed. Try again."
+        message.error ?? "การดำเนินการกับเอกสารไม่สำเร็จ กรุณาลองใหม่"
       );
       setSuccess(null);
       return;
@@ -155,8 +160,8 @@ const FillRoute = () => {
     setOperationError(null);
     setSuccess(
       message.action === "save-draft"
-        ? "Draft saved."
-        : "Template action completed."
+        ? "บันทึกฉบับร่างคำตอบแล้ว"
+        : "ดำเนินการกับเอกสารเรียบร้อยแล้ว"
     );
   };
 
@@ -183,7 +188,9 @@ const FillRoute = () => {
   if (error || !form) {
     return (
       <div className="mx-auto max-w-xl px-5 py-16">
-        <Notice tone="danger">{error ?? "This form is unavailable."}</Notice>
+        <Notice tone="danger">
+          {error ?? "ไม่พบแบบฟอร์มนี้ หรือแบบฟอร์มยังไม่พร้อมใช้งาน"}
+        </Notice>
       </div>
     );
   }
@@ -200,7 +207,7 @@ const FillRoute = () => {
         <div className="mx-auto flex max-w-[1240px] items-center justify-between px-5 py-4 lg:px-8">
           <Button variant="ghost" size="sm" onClick={handleExit}>
             <ArrowLeft />
-            Exit
+            ออกจากแบบฟอร์ม
           </Button>
           <div className="flex items-center gap-2 text-sm font-semibold">
             <span className="grid size-7 place-items-center rounded-lg bg-[var(--ink)] text-[var(--accent)]">
@@ -219,12 +226,12 @@ const FillRoute = () => {
             </h1>
             <p className="mt-2 max-w-2xl text-[var(--ink-soft)]">
               {form.description ??
-                "Complete the fields below. Save or submit from the Form tab inside the document editor."}
+                "กรอกข้อมูลด้านล่าง แล้วเลือกบันทึกฉบับร่างหรือส่งคำตอบจากแท็บ Form ในตัวแก้ไขเอกสาร"}
             </p>
           </div>
           <div className="flex items-center gap-2 text-sm text-[var(--ink-soft)]">
             <Monitor />
-            Desktop editor recommended
+            แนะนำให้ใช้ตัวแก้ไขบนคอมพิวเตอร์
           </div>
         </div>
         {error ? (
@@ -235,7 +242,7 @@ const FillRoute = () => {
         {operationError ? (
           <div className="mb-4">
             <Notice tone="danger">
-              {operationError} The editor is still open; you can retry.
+              {operationError} ตัวแก้ไขยังเปิดอยู่ คุณสามารถลองใหม่ได้
             </Notice>
           </div>
         ) : null}
@@ -255,21 +262,21 @@ const FillRoute = () => {
               <span className="inline-flex items-center gap-2">
                 <Spinner />
                 {operation?.status === "processing"
-                  ? "Preparing your files…"
-                  : "Saving your response…"}
+                  ? "กำลังเตรียมไฟล์…"
+                  : "กำลังบันทึกคำตอบ…"}
               </span>
             </Notice>
           </div>
         ) : null}
         <div className="mb-4 rounded-[10px] border border-[var(--accent)]/35 bg-[var(--accent-soft)] px-4 py-3 text-sm text-[var(--ink)]">
-          <strong>Use the Form tab inside the document editor</strong> to apply
-          Save Draft or Submit. The editor reports operation progress here.
+          <strong>ใช้แท็บ Form ในตัวแก้ไขเอกสาร</strong> เพื่อเลือกบันทึกฉบับร่างหรือส่งคำตอบ
+          ระบบจะแสดงความคืบหน้าที่นี่
         </div>
         <div className="overflow-hidden rounded-[var(--radius)] border border-[var(--line-strong)] bg-[var(--muted)] shadow-inner">
           <OnlyOfficeEditor
             configUrl={editorConfigUrl ?? undefined}
             onBridgeMessage={handleBridgeMessage}
-            title={`Fill ${form.title}`}
+            title={`กรอกแบบฟอร์ม ${form.title}`}
           />
         </div>
       </main>

@@ -230,7 +230,7 @@ Editor หนึ่งรายการมี Admin แก้ไขได้ค
 
 การค้นหา Schema ใช้ External Mock เดียวของระบบและแบ่งผลลัพธ์ด้วย Cursor ผลลัพธ์มีเฉพาะ Leaf ที่เป็น scalar พร้อม RFC 6901 JSON Pointer เช่น `/person/name` และไม่แสดง Object, Array, User record หรือค่าจริงของ record กด **คัดลอกคีย์** เพื่อคัดลอก Pointer ที่ตรงตัว หรือกด **ใช้เป็น Tag** เพื่อใส่ Pointer นั้นใน Content Control ที่เลือก จากนั้นกด **บันทึกการตั้งค่า Field** การเปลี่ยน Tag จะล้างนโยบายของ Tag เดิมแบบ atomic เพื่อไม่ให้เหลือกฎขัดแย้ง
 
-รองรับ Content Control สำหรับ Text, Checkbox, Date, Dropdown, Combo box และ Picture การ Save Template จะเก็บเอกสารล่าสุดและกฎ Field เพื่อเปิดกลับมาได้เหมือนเดิม ส่วนการตรวจชนิดและตัวเลือกขั้นสุดท้ายเกิดตอน Publish
+รองรับ Content Control แบบ scalar สำหรับ Text, Checkbox, Date, Dropdown, Combo box และ Picture การ Save Template จะเก็บเอกสารล่าสุดและกฎ Field เพื่อเปิดกลับมาได้เหมือนเดิม แต่ Publish จะตรวจชนิด ตัวเลือก Tag และนโยบายอีกครั้ง แล้วบันทึก Field Manifest ที่เป็น authoritative contract
 
 เมื่อแก้ไข Template เสร็จ:
 
@@ -238,25 +238,30 @@ Editor หนึ่งรายการมี Admin แก้ไขได้ค
 2. กด **บันทึก Template** อย่างชัดเจน
 3. รอให้ Operation เสร็จ ระบบจะเปิดครั้งถัดไปจาก DOCX ชุดเดียวกับการบันทึกล่าสุด
 4. ถ้าการบันทึกล้มเหลว Template Draft ชุดก่อนหน้ายังอยู่และกด **ลองใหม่** ได้
-5. กด **Publish** เมื่อ Template พร้อม
-6. กด **คัดลอกลิงก์** เพื่อส่งให้ User
+5. ตรวจให้แน่ใจว่า Tag ไม่ว่าง ไม่ซ้ำ และใช้เฉพาะ Content Control แบบ scalar ที่รองรับ
+6. กด **Publish** เมื่อ Template พร้อม
+7. กด **คัดลอกลิงก์** เพื่อส่งให้ User
+
+การ Publish สำเร็จจะสร้าง Published Template, Field Manifest และ Prefill Configuration เพียงชุดเดียวต่อ Form พร้อม Public ID แบบ opaque ที่ระบบสร้างให้เอง เอกสารและสัญญา Field/Prefill จะ immutable: Save และ Publish ไม่สามารถแทนที่หรือแก้โครงสร้างเดิมใน Form เดิมได้ หากต้องเปลี่ยนโครงสร้างหรือ policy ให้สร้าง Form ใหม่และใช้ Share Link ใหม่
 
 Form ที่ยังเป็น `Draft`, ไม่เคย Publish และไม่มี Response เท่านั้นที่ลบแบบถาวรได้ การลบจะล้าง Template Draft และ Object ที่เกี่ยวข้อง แต่ Form สถานะอื่นใช้เส้นทางนี้ไม่ได้
 
 หน้า Admin ยังมีปุ่มด้านบนด้วย:
 
-- **บันทึก Template** — สร้าง Operation และบันทึก Template Draft โดยยังไม่เปลี่ยนเอกสาร Published
-- **Publish** — ทำให้ Template นี้เป็น Published Template สำหรับ Response ใหม่
+- **บันทึก Template** — สร้าง Operation และบันทึก Template Draft ก่อน Publish
+- **Publish** — ตรวจ DOCX และสร้าง Published Template แบบ immutable ครั้งเดียว
 
 ### 4.2 ผลของการ Publish
 
-การ Publish Template เวอร์ชันใหม่จะ:
+การ Publish Template จะ:
 
-- เปลี่ยนเอกสารที่ใช้เริ่ม Response ใหม่
-- ทำให้ Draft ที่ยังไม่ Submit ของ Form นั้นใช้ต่อไม่ได้
-- ไม่เปลี่ยน Submission ที่เสร็จแล้ว
+- เปลี่ยนสถานะ Form เป็น `Published` และใช้ Manifest เดียวกันสำหรับ Response ใหม่
+- ปกป้อง share link ด้วย Public ID แบบ opaque ไม่ใช้ Database ID หรือ slug ที่ผู้ใช้กำหนด
+- ไม่เปิดเผย metadata ของ Form ให้ผู้ที่ยังไม่ Login; ผู้ใช้ที่ Login แล้วจึงได้รับ metadata ที่อนุญาต
+- บันทึก Audit Event แบบไม่เก็บ secret
+- ถ้าล้มเหลวจะไม่สร้าง Published Template หรือ share link และ Template Draft เดิมยังแก้ไขต่อได้
 
-ถ้ามี Draft ค้างอยู่ ระบบจะแสดงคำเตือนก่อน Publish
+การเปลี่ยนโครงสร้าง, Tag, required state หรือ Prefill policy ใน Form ที่ Publish แล้วทำไม่ได้ในที่เดิม ให้สร้าง Form ใหม่
 
 ### 4.3 ดู Submission
 

@@ -97,6 +97,17 @@ const passwordMinimumLength = 12;
 const passwordMaximumLength = 128;
 const maxResponseDataBytes = 256 * 1024;
 const fieldRuleBodyMaximumBytes = 8 * 1024;
+const dateFieldPattern = /^\d{4}-\d{2}-\d{2}$/u;
+const isValidDateFieldValue = (value: string): boolean => {
+  if (!dateFieldPattern.test(value)) {
+    return false;
+  }
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return (
+    !Number.isNaN(parsed.getTime()) &&
+    parsed.toISOString().slice(0, 10) === value
+  );
+};
 const fieldTagMaximumLength = 512;
 const fieldPointerMaximumLength = 2048;
 const schemaPageSize = 5;
@@ -191,42 +202,42 @@ interface ExternalSchemaItem {
 
 const externalMockSchema = {
   account: {
-    id: "",
     active: true,
-    loginCount: 0,
-    score: 0,
-    "display/name": "",
-    "tilde~key": "",
+    address: {
+      city: "",
+      country: "",
+      postalCode: "",
+    },
+    consent: {
+      privacy: true,
+      terms: true,
+    },
     contact: {
       email: "",
       phone: "",
     },
-    address: {
-      city: "",
-      postalCode: "",
-      country: "",
-    },
-    consent: {
-      terms: true,
-      privacy: true,
-    },
+    contacts: [{ name: "" }],
+    "display/name": "",
+    id: "",
+    loginCount: 0,
+    score: 0,
     settings: {
       language: "",
       timezone: "",
     },
-    contacts: [{ name: "" }],
-  },
-  person: {
-    name: "",
-    birthDate: "",
-    "contact/details": {
-      "line~1": "",
-    },
+    "tilde~key": "",
   },
   ignoredObject: {
     nested: {
       value: null,
     },
+  },
+  person: {
+    birthDate: "",
+    "contact/details": {
+      "line~1": "",
+    },
+    name: "",
   },
 } as const;
 
@@ -375,14 +386,16 @@ type OperationErrorCode =
   | "callback_key_mismatch"
   | "callback_processing_failed"
   | "force_save_failed"
+  | "invalid_template"
   | "onlyoffice_document_error"
   | "operation_timeout";
 type FormSource = "blank" | "upload";
 type FormAuditAction =
   | "configure_field_rule"
   | "create_form"
-  | "save_template_draft"
-  | "delete_form";
+  | "delete_form"
+  | "publish_form"
+  | "save_template_draft";
 type FormAuditErrorCode =
   | "callback_claim_invalid"
   | "blank_template_unavailable"
@@ -407,6 +420,7 @@ type FormAuditErrorCode =
   | "operation_in_progress"
   | "operation_timeout"
   | "payload_too_large"
+  | "published_immutable"
   | "stale_document"
   | "stale_operation";
 interface FormAuditMetadata {
@@ -1669,6 +1683,7 @@ const formAuditErrorCodes: Record<string, true> = {
   operation_in_progress: true,
   operation_timeout: true,
   payload_too_large: true,
+  published_immutable: true,
   stale_document: true,
   stale_operation: true,
 };
@@ -1769,7 +1784,6 @@ function responseSummary(
 ): JsonRecord {
   return {
     createdAt: response.createdAt,
-    formId: response.formId,
     formPublicId: extra.formPublicId,
     formTitle: extra.formTitle,
     hasDraft: Boolean(response.draftObjectKey && response.draftData),
@@ -1778,7 +1792,6 @@ function responseSummary(
     status: response.status,
     submissionId: extra.submissionId,
     updatedAt: response.updatedAt,
-    userId: response.userId,
   };
 }
 
@@ -1899,10 +1912,25 @@ const templateOfficeDocumentRelationships = new Set([
   "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument",
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
 ]);
+const templateWordMainNamespace =
+  "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const templateWordStrictNamespace =
+  "http://purl.oclc.org/ooxml/wordprocessingml/main";
+const templateCheckboxNamespace =
+  "http://schemas.microsoft.com/office/word/2010/wordml";
+const templateWord2012Namespace =
+  "http://schemas.microsoft.com/office/word/2012/wordml";
 const templateWordNamespaces = new Set([
-  "http://purl.oclc.org/ooxml/wordprocessingml/main",
-  "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+  templateWordStrictNamespace,
+  templateWordMainNamespace,
 ]);
+const templateControlNamespaces = new Set([
+  ...templateWordNamespaces,
+  templateCheckboxNamespace,
+  templateWord2012Namespace,
+]);
+const templateControlKey = (namespace: string, local: string): string =>
+  `${namespace}#${local}`;
 const templateDocumentContentType =
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
 
@@ -2051,6 +2079,55 @@ function templateArchiveText(
     fail(422, "invalid_template", "The DOCX package contains invalid XML");
   }
 }
+const externalRelationshipTargetPattern = /^[a-z][a-z\d+.-]*:/iu;
+
+function isExternalRelationshipTarget(target: string | undefined): boolean {
+  const normalized = target?.trim() ?? "";
+  return (
+    normalized.startsWith("//") ||
+    normalized.startsWith("\\\\") ||
+    externalRelationshipTargetPattern.test(normalized)
+  );
+}
+
+function validateOfficeRelationships(
+  archive: Record<string, Uint8Array>
+): void {
+  for (const archivePath of Object.keys(archive)) {
+    if (!archivePath.toLowerCase().endsWith(".rels")) {
+      continue;
+    }
+    parseTemplateXml(templateArchiveText(archive, archivePath), {
+      open: (element) => {
+        if (
+          element.local !== "Relationship" ||
+          element.uri !== templatePackageRelationshipNamespace
+        ) {
+          return;
+        }
+        const targetMode = templateAttribute(element, "TargetMode");
+        const target = templateAttribute(element, "Target");
+        if (
+          targetMode?.trim().toLowerCase() === "external" ||
+          isExternalRelationshipTarget(target)
+        ) {
+          fail(
+            422,
+            "invalid_template",
+            "External DOCX relationships are not allowed"
+          );
+        }
+      },
+    });
+  }
+}
+
+function validateOfficeRelationshipsBytes(bytes: Uint8Array): void {
+  const archive = readTemplateArchive(bytes, (archivePath) =>
+    archivePath.toLowerCase().endsWith(".rels")
+  );
+  validateOfficeRelationships(archive);
+}
 
 function isTemplateXmlContentType(contentType: string | undefined): boolean {
   const normalized = contentType?.split(";", 1)[0]?.trim().toLowerCase();
@@ -2059,6 +2136,101 @@ function isTemplateXmlContentType(contentType: string | undefined): boolean {
     normalized === "text/xml" ||
     normalized === "application/vnd.openxmlformats-officedocument.vmldrawing" ||
     normalized?.endsWith("+xml") === true
+  );
+}
+
+function templateRelationshipPartPath(partPath: string): string {
+  const separator = partPath.lastIndexOf("/");
+  const directory = separator !== -1 ? partPath.slice(0, separator + 1) : "";
+  const filename = partPath.slice(separator + 1);
+  return `${directory}_rels/${filename}.rels`;
+}
+
+function resolveTemplateRelationshipTarget(
+  sourcePath: string,
+  target: string | undefined
+): string | null {
+  const normalizedTarget = target?.trim().split("#", 1)[0] ?? "";
+  if (!normalizedTarget || isExternalRelationshipTarget(normalizedTarget)) {
+    return null;
+  }
+  const separator = sourcePath.lastIndexOf("/");
+  const directory = separator !== -1 ? sourcePath.slice(0, separator + 1) : "";
+  const segments =
+    `${normalizedTarget.startsWith("/") ? "" : directory}${normalizedTarget.replace(/^\/+/u, "")}`.split(
+      "/"
+    );
+  const normalizedSegments: string[] = [];
+  for (const segment of segments) {
+    if (!segment || segment === ".") {
+      continue;
+    }
+    if (segment === "..") {
+      if (normalizedSegments.length === 0) {
+        return null;
+      }
+      normalizedSegments.pop();
+      continue;
+    }
+    normalizedSegments.push(segment);
+  }
+  return normalizedSegments.join("/");
+}
+
+function reachableTemplateParts(
+  archive: Record<string, Uint8Array>,
+  startPath: string
+): Set<string> {
+  const reachable = new Set<string>([startPath]);
+  const queue = [startPath];
+  while (queue.length > 0) {
+    const sourcePath = queue.shift();
+    if (!sourcePath) {
+      continue;
+    }
+    const relationshipPath = templateRelationshipPartPath(sourcePath);
+    const relationshipBytes = archive[relationshipPath];
+    if (!relationshipBytes) {
+      continue;
+    }
+    parseTemplateXml(templateArchiveText(archive, relationshipPath), {
+      open: (element) => {
+        if (
+          element.local !== "Relationship" ||
+          element.uri !== templatePackageRelationshipNamespace ||
+          templateAttribute(element, "TargetMode") !== undefined
+        ) {
+          return;
+        }
+        const targetPath = resolveTemplateRelationshipTarget(
+          sourcePath,
+          templateAttribute(element, "Target")
+        );
+        if (
+          targetPath &&
+          Object.hasOwn(archive, targetPath) &&
+          !reachable.has(targetPath)
+        ) {
+          reachable.add(targetPath);
+          queue.push(targetPath);
+        }
+      },
+    });
+  }
+  return reachable;
+}
+
+function reachableTemplateControlParts(
+  archive: Record<string, Uint8Array>,
+  xmlPaths: Set<string>
+): Set<string> {
+  const reachable = reachableTemplateParts(archive, "word/document.xml");
+  return new Set(
+    [...xmlPaths].filter(
+      (archivePath) =>
+        reachable.has(archivePath) &&
+        templateControlPartPattern.test(archivePath)
+    )
   );
 }
 
@@ -2205,6 +2377,7 @@ function safeTemplateArchive(bytes: Uint8Array): {
   xmlPaths: Set<string>;
 } {
   const archive = readTemplateArchive(bytes, () => true);
+  validateOfficeRelationships(archive);
   return {
     archive,
     xmlPaths: validateTemplatePackageArchive(archive),
@@ -2215,85 +2388,384 @@ function validateTemplatePackage(bytes: Uint8Array): void {
   safeTemplateArchive(bytes);
 }
 
-function validateTemplateControls(bytes: Uint8Array): string[] {
-  const { archive, xmlPaths } = safeTemplateArchive(bytes);
-  const controls: string[] = [];
+interface ParsedTemplateField {
+  options: { displayText: string; value: string }[] | null;
+  pictureMaxBytes: number | null;
+  pictureMaxHeight: number | null;
+  pictureMaxWidth: number | null;
+  tag: string;
+  type: FieldType;
+}
 
-  for (const archivePath of xmlPaths) {
-    if (!archivePath.startsWith("word/")) {
-      continue;
-    }
-    const taggedPropertyStack: boolean[] = [];
+interface TemplateControlFrame {
+  inPropertiesDepth: number;
+  markers: Set<FieldType>;
+  options: { displayText: string; value: string }[];
+  propertyStack: string[];
+  duplicateMarker: boolean;
+  duplicateTag: boolean;
+  tag: string | null;
+  unsupported: string | null;
+}
+
+const templateControlTypeMarkers = new Map<string, FieldType>([
+  [templateControlKey(templateWordMainNamespace, "comboBox"), FieldType.combo],
+  [templateControlKey(templateWordMainNamespace, "date"), FieldType.date],
+  [
+    templateControlKey(templateWordMainNamespace, "dropDownList"),
+    FieldType.dropdown,
+  ],
+  [templateControlKey(templateWordMainNamespace, "picture"), FieldType.picture],
+  [templateControlKey(templateWordMainNamespace, "text"), FieldType.text],
+  [
+    templateControlKey(templateWordStrictNamespace, "comboBox"),
+    FieldType.combo,
+  ],
+  [templateControlKey(templateWordStrictNamespace, "date"), FieldType.date],
+  [
+    templateControlKey(templateWordStrictNamespace, "dropDownList"),
+    FieldType.dropdown,
+  ],
+  [
+    templateControlKey(templateWordStrictNamespace, "picture"),
+    FieldType.picture,
+  ],
+  [templateControlKey(templateWordStrictNamespace, "text"), FieldType.text],
+  [
+    templateControlKey(templateCheckboxNamespace, "checkbox"),
+    FieldType.checkbox,
+  ],
+]);
+const templateUnsupportedControlMarkers = new Set([
+  templateControlKey(templateWordMainNamespace, "citation"),
+  templateControlKey(templateWordMainNamespace, "docPartGallery"),
+  templateControlKey(templateWordMainNamespace, "docPartList"),
+  templateControlKey(templateWordMainNamespace, "docPartObj"),
+  templateControlKey(templateWordMainNamespace, "equation"),
+  templateControlKey(templateWordMainNamespace, "group"),
+  templateControlKey(templateWordMainNamespace, "richText"),
+  templateControlKey(templateWord2012Namespace, "repeatingSection"),
+  templateControlKey(templateWord2012Namespace, "repeatingSectionItem"),
+]);
+const templateControlTypeLocals = new Set([
+  "checkbox",
+  "comboBox",
+  "date",
+  "dropDownList",
+  "picture",
+  "text",
+]);
+const templateUnsupportedControlLocals = new Set([
+  "citation",
+  "docPartGallery",
+  "docPartList",
+  "docPartObj",
+  "equation",
+  "group",
+  "richText",
+  "repeatingSection",
+  "repeatingSectionItem",
+]);
+const templateControlPartPattern =
+  /^word\/(?:document|endnotes|footnotes|footer\d+|header\d+)\.xml$/u;
+const templateControlMetadataProperties = new Set([
+  "alias",
+  "appearance",
+  "calendar",
+  "checked",
+  "checkedState",
+  "color",
+  "dataBinding",
+  "dateFormat",
+  "id",
+  "lock",
+  "placeholder",
+  "rPr",
+  "showingPlcHdr",
+  "tag",
+  "temporary",
+  "uncheckedState",
+]);
+
+function templateControlAttribute(
+  element: TemplateXmlElement,
+  local: string
+): string | undefined {
+  return element.attributes.find(
+    (attribute) => attribute.local === local && attribute.uri === element.uri
+  )?.value;
+}
+
+function parsedTemplateField(frame: TemplateControlFrame): ParsedTemplateField {
+  if (!frame.tag?.trim()) {
+    fail(422, "invalid_template", "Every content control must have a tag");
+  }
+  if (frame.unsupported) {
+    fail(
+      422,
+      "invalid_template",
+      `Unsupported content control type: ${frame.unsupported}`
+    );
+  }
+  if (frame.duplicateTag) {
+    fail(
+      422,
+      "invalid_template",
+      "A content control cannot repeat its tag property"
+    );
+  }
+  if (frame.duplicateMarker) {
+    fail(
+      422,
+      "invalid_template",
+      "A content control cannot repeat a field type marker"
+    );
+  }
+  if (frame.markers.size > 1) {
+    fail(
+      422,
+      "invalid_template",
+      "A content control cannot declare multiple field types"
+    );
+  }
+  const type = frame.markers.values().next().value ?? FieldType.text;
+  if (
+    (type === FieldType.dropdown || type === FieldType.combo) &&
+    frame.options.length === 0
+  ) {
+    fail(
+      422,
+      "invalid_template",
+      "Dropdown and combo fields must define options"
+    );
+  }
+  if (
+    type !== FieldType.dropdown &&
+    type !== FieldType.combo &&
+    frame.options.length > 0
+  ) {
+    fail(
+      422,
+      "invalid_template",
+      "Only dropdown and combo fields may define options"
+    );
+  }
+  const uniqueOptionLabels = new Set(
+    frame.options.map((option) => option.displayText)
+  );
+  const uniqueOptionValues = new Set(
+    frame.options.map((option) => option.value)
+  );
+  if (
+    uniqueOptionLabels.size !== frame.options.length ||
+    uniqueOptionValues.size !== frame.options.length
+  ) {
+    fail(422, "invalid_template", "Dropdown and combo options must be unique");
+  }
+  const tag = frame.tag.trim();
+  return {
+    options: frame.options.length > 0 ? frame.options : null,
+    pictureMaxBytes: type === FieldType.picture ? 10 * 1024 * 1024 : null,
+    pictureMaxHeight: type === FieldType.picture ? 4096 : null,
+    pictureMaxWidth: type === FieldType.picture ? 4096 : null,
+    tag,
+    type,
+  };
+}
+
+function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
+  const { archive, xmlPaths } = safeTemplateArchive(bytes);
+  const fields: ParsedTemplateField[] = [];
+  const controlPaths = reachableTemplateControlParts(archive, xmlPaths);
+  for (const archivePath of controlPaths) {
+    const controls: TemplateControlFrame[] = [];
     parseTemplateXml(templateArchiveText(archive, archivePath), {
       close: (element) => {
-        if (
-          element.local === "sdtPr" &&
-          templateWordNamespaces.has(element.uri) &&
-          !taggedPropertyStack.pop()
-        ) {
-          fail(
-            422,
-            "invalid_template",
-            "Every content control must have a tag"
-          );
+        const frame = controls.at(-1);
+        if (!frame) {
+          return;
         }
-      },
-      open: (element) => {
         if (
           element.local === "sdtPr" &&
           templateWordNamespaces.has(element.uri)
         ) {
-          taggedPropertyStack.push(false);
+          frame.inPropertiesDepth = 0;
+          frame.propertyStack.length = 0;
+          return;
+        }
+        if (frame.inPropertiesDepth > 0) {
+          frame.propertyStack.pop();
+          frame.inPropertiesDepth -= 1;
+        }
+        if (
+          element.local === "sdt" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          controls.pop();
+          fields.push(parsedTemplateField(frame));
+        }
+      },
+      open: (element) => {
+        if (
+          element.local === "sdt" &&
+          templateWordNamespaces.has(element.uri)
+        ) {
+          controls.push({
+            duplicateMarker: false,
+            duplicateTag: false,
+            inPropertiesDepth: 0,
+            markers: new Set(),
+            options: [],
+            propertyStack: [],
+            tag: null,
+            unsupported: null,
+          });
+          return;
+        }
+        const frame = controls.at(-1);
+        if (!frame) {
           return;
         }
         if (
-          taggedPropertyStack.length === 0 ||
-          element.local !== "tag" ||
-          !templateWordNamespaces.has(element.uri)
+          element.local === "sdtPr" &&
+          templateWordNamespaces.has(element.uri)
         ) {
+          frame.inPropertiesDepth = 1;
           return;
         }
-        const tag = element.attributes.find(
-          (attribute) =>
-            attribute.local === "val" &&
-            templateWordNamespaces.has(attribute.uri)
-        )?.value;
-        if (!tag?.trim()) {
+        if (frame.inPropertiesDepth === 0) {
+          return;
+        }
+        const isControlElement = templateControlNamespaces.has(element.uri);
+        const isDirectProperty = frame.inPropertiesDepth === 1;
+        const parentProperty = frame.propertyStack.at(-1);
+        if (parentProperty === "listItem") {
+          fail(422, "invalid_template", "Field options are malformed");
+        }
+        const controlKey = templateControlKey(element.uri, element.local);
+        const marker = templateControlTypeMarkers.get(controlKey);
+        const isUnsupportedControl =
+          templateUnsupportedControlMarkers.has(controlKey);
+        const isTag =
+          templateWordNamespaces.has(element.uri) && element.local === "tag";
+        const isListItem =
+          templateWordNamespaces.has(element.uri) &&
+          element.local === "listItem";
+        const isAllowedMetadata =
+          (templateWordNamespaces.has(element.uri) &&
+            templateControlMetadataProperties.has(element.local)) ||
+          (element.uri === templateWord2012Namespace &&
+            element.local === "appearance");
+        const isWrongNamespaceSemantic =
+          (element.local === "tag" && !isTag) ||
+          (templateControlTypeLocals.has(element.local) &&
+            marker === undefined) ||
+          (templateUnsupportedControlLocals.has(element.local) &&
+            !isUnsupportedControl);
+        if (
+          (isTag ||
+            marker !== undefined ||
+            isUnsupportedControl ||
+            isWrongNamespaceSemantic) &&
+          !isDirectProperty
+        ) {
           fail(
             422,
             "invalid_template",
-            "Every content control must have a tag"
+            `Misplaced content control property: ${element.local}`
           );
         }
-        taggedPropertyStack[taggedPropertyStack.length - 1] = true;
-        controls.push(tag.trim());
+        if (isTag) {
+          if (frame.tag !== null) {
+            frame.duplicateTag = true;
+          }
+          frame.tag = templateControlAttribute(element, "val") ?? null;
+        }
+        if (marker !== undefined) {
+          if (frame.markers.has(marker)) {
+            frame.duplicateMarker = true;
+          }
+          frame.markers.add(marker);
+        }
+        if (isUnsupportedControl) {
+          frame.unsupported = element.local;
+        }
+        if (element.local === "listItem") {
+          if (
+            !isListItem ||
+            frame.inPropertiesDepth !== 2 ||
+            (parentProperty !== "comboBox" && parentProperty !== "dropDownList")
+          ) {
+            fail(422, "invalid_template", "Field options are malformed");
+          }
+          if (
+            !frame.markers.has(FieldType.dropdown) &&
+            !frame.markers.has(FieldType.combo)
+          ) {
+            fail(
+              422,
+              "invalid_template",
+              "Only dropdown and combo fields may define options"
+            );
+          }
+          const displayText = templateControlAttribute(element, "displayText");
+          const value = templateControlAttribute(element, "value");
+          if (!displayText?.trim() || value === undefined) {
+            fail(422, "invalid_template", "Field options are malformed");
+          }
+          frame.options.push({
+            displayText: displayText.trim(),
+            value,
+          });
+        }
+        if (
+          isDirectProperty &&
+          (!isControlElement ||
+            (marker === undefined &&
+              !isUnsupportedControl &&
+              !isAllowedMetadata))
+        ) {
+          fail(
+            422,
+            "invalid_template",
+            `Unknown content control type: ${element.local}`
+          );
+        }
+        frame.propertyStack.push(element.local);
+        frame.inPropertiesDepth += 1;
       },
     });
   }
 
-  if (controls.length === 0) {
+  if (fields.length === 0) {
     fail(
       422,
       "invalid_template",
       "The template must contain at least one tagged content control"
     );
   }
-  const duplicates = controls.filter(
-    (tag, index) => controls.indexOf(tag) !== index
+  const duplicates = fields.filter(
+    (field, index) =>
+      fields.findIndex((candidate) => candidate.tag === field.tag) !== index
   );
   if (duplicates.length > 0) {
     fail(
       422,
       "invalid_template",
-      `Content control tags must be unique: ${[...new Set(duplicates)].join(", ")}`
+      `Content control tags must be unique: ${[...new Set(duplicates.map((field) => field.tag))].join(", ")}`
     );
   }
-  return controls;
+  return fields;
+}
+
+function validateTemplateControls(bytes: Uint8Array): string[] {
+  return parseTemplateFields(bytes).map((field) => field.tag);
 }
 async function normalizeResponseData(
   form: FormWithDocuments,
   response: ResponseWithSnapshot,
-  inputData: unknown
+  inputData: unknown,
+  requireRequired = false
 ): Promise<JsonRecord> {
   const data = { ...jsonRecord(inputData) };
   const serialized = JSON.stringify(data);
@@ -2304,10 +2776,18 @@ async function normalizeResponseData(
   if (!publishedTemplate?.objectKey) {
     fail(409, "not_published", "This form has not been published");
   }
-  const templateBytes = await readObject(publishedTemplate.objectKey);
-  const controls = new Set(validateTemplateControls(templateBytes));
+  const manifest = await prisma.fieldManifest.findUnique({
+    include: { fields: { orderBy: { tag: "asc" } } },
+    where: { publishedTemplateId: publishedTemplate.id },
+  });
+  if (!manifest) {
+    fail(500, "internal_error", "The published Field Manifest is unavailable");
+  }
+  const fieldsByTag = new Map(
+    manifest.fields.map((field) => [field.tag, field])
+  );
   const unknownFields = Object.keys(data).filter(
-    (field) => !controls.has(field)
+    (field) => !fieldsByTag.has(field)
   );
   if (unknownFields.length > 0) {
     fail(
@@ -2316,25 +2796,75 @@ async function normalizeResponseData(
       `Unknown form field(s): ${unknownFields.join(", ")}`
     );
   }
-  for (const [field, value] of Object.entries(data)) {
-    if (
-      value !== null &&
-      typeof value !== "string" &&
-      typeof value !== "boolean" &&
-      typeof value !== "number"
-    ) {
-      fail(422, "invalid_response_data", `${field} must be a scalar value`);
+  for (const [fieldTag, value] of Object.entries(data)) {
+    const field = fieldsByTag.get(fieldTag);
+    if (!field || value === null) {
+      continue;
+    }
+    let valid = false;
+    if (field.type === FieldType.checkbox) {
+      valid = typeof value === "boolean";
+    } else if (field.type === FieldType.dropdown) {
+      const optionValues = new Set(
+        Array.isArray(field.options)
+          ? field.options.flatMap((option) => {
+              if (
+                !option ||
+                typeof option !== "object" ||
+                Array.isArray(option)
+              ) {
+                return [];
+              }
+              const optionValue = (option as Record<string, unknown>).value;
+              return typeof optionValue === "string" ? [optionValue] : [];
+            })
+          : []
+      );
+      valid = typeof value === "string" && optionValues.has(value);
+    } else if (field.type === FieldType.date) {
+      valid = typeof value === "string" && isValidDateFieldValue(value);
+    } else {
+      valid =
+        field.type === FieldType.combo ||
+        field.type === FieldType.picture ||
+        field.type === FieldType.text
+          ? typeof value === "string"
+          : false;
+    }
+    if (!valid) {
+      fail(
+        422,
+        "invalid_response_data",
+        `${fieldTag} does not match the published Field Manifest`
+      );
     }
   }
   const snapshot = response.prefillSnapshot;
-  if (!snapshot) {
-    return data;
+  if (snapshot) {
+    const snapshotData = jsonRecord(snapshot.values);
+    const lockedFields = jsonRecord(snapshot.lockedFields);
+    for (const [field, value] of Object.entries(snapshotData)) {
+      if (lockedFields[field] === true) {
+        data[field] = value;
+      }
+    }
   }
-  const snapshotData = jsonRecord(snapshot.values);
-  const lockedFields = jsonRecord(snapshot.lockedFields);
-  for (const [field, value] of Object.entries(snapshotData)) {
-    if (lockedFields[field] === true) {
-      data[field] = value;
+  if (requireRequired) {
+    for (const field of manifest.fields) {
+      const value = data[field.tag];
+      if (
+        field.required &&
+        (!Object.hasOwn(data, field.tag) ||
+          value === null ||
+          (typeof value === "string" && value.trim().length === 0) ||
+          (field.type === FieldType.checkbox && value !== true))
+      ) {
+        fail(
+          422,
+          "invalid_response_data",
+          `${field.tag} is required by the published Field Manifest`
+        );
+      }
     }
   }
   return data;
@@ -2485,7 +3015,7 @@ async function updateOperationFailed(
     if (failed.count !== 1) {
       return null;
     }
-    if (metadata.action === "save-template") {
+    if (metadata.action === "save-template" || metadata.action === "publish") {
       let targetId =
         typeof metadata.publicId === "string" &&
         publicIdPattern.test(metadata.publicId)
@@ -2499,7 +3029,10 @@ async function updateOperationFailed(
         targetId = targetForm?.publicId ?? null;
       }
       await createFormAudit(tx, {
-        action: "save_template_draft",
+        action:
+          metadata.action === "publish"
+            ? "publish_form"
+            : "save_template_draft",
         actorId: current.actorId,
         outcome: AuditOutcome.failure,
         safeMetadata: { errorCode },
@@ -2664,8 +3197,13 @@ function launchForceSave(
           allowedCallbackOrigins
         );
       }
-    } catch {
-      await updateOperationFailed(operation.id, "force_save_failed");
+    } catch (error) {
+      await updateOperationFailed(
+        operation.id,
+        error instanceof HttpError && error.code === "invalid_template"
+          ? "invalid_template"
+          : "force_save_failed"
+      );
     }
   })();
 }
@@ -2749,11 +3287,18 @@ async function completeTemplateOperation(
     fail(500, "invalid_operation", "Template operation has no document key");
   }
   const form = await prisma.form.findUnique({
-    include: { templateDraft: true },
+    include: { publishedTemplate: true, templateDraft: true },
     where: { id: metadata.formId },
   });
   if (!form) {
     fail(404, "not_found", "Form was not found");
+  }
+  if (form.status === FormStatus.published || form.publishedTemplate) {
+    fail(
+      409,
+      "published_immutable",
+      "Published forms cannot be structurally edited"
+    );
   }
   const templateDraft = form.templateDraft;
   if (!templateDraft || templateDraft.documentKey !== documentKey) {
@@ -2815,6 +3360,72 @@ async function completeTemplateOperation(
   return { cleanupObjectKeys };
 }
 
+function publishedContractFields(
+  controls: ParsedTemplateField[],
+  draftRules: DraftFieldRule[]
+): {
+  manifestFields: {
+    options?: Prisma.InputJsonValue;
+    pictureMaxBytes: number | null;
+    pictureMaxHeight: number | null;
+    pictureMaxWidth: number | null;
+    prefillPolicy: PrefillPolicy;
+    required: boolean;
+    tag: string;
+    type: FieldType;
+  }[];
+  prefillFields: {
+    pointer: string;
+    policy: PrefillPolicy;
+    tag: string;
+  }[];
+} {
+  const controlsByTag = new Map(controls.map((field) => [field.tag, field]));
+  const rulesByTag = new Map<string, DraftFieldRule>();
+  for (const rule of draftRules) {
+    if (rulesByTag.has(rule.tag) || !controlsByTag.has(rule.tag)) {
+      fail(
+        422,
+        "invalid_template",
+        `Field policy does not match a published content control: ${rule.tag}`
+      );
+    }
+    validateFieldRulePointer(rule.prefillPointer);
+    if (
+      rule.prefillPolicy === PrefillPolicy.lock_when_available &&
+      rule.prefillPointer === null
+    ) {
+      fail(
+        422,
+        "invalid_template",
+        `Locked Prefill policy requires a pointer: ${rule.tag}`
+      );
+    }
+    rulesByTag.set(rule.tag, rule);
+  }
+  return {
+    manifestFields: controls.map((field) => {
+      const rule = rulesByTag.get(field.tag);
+      return {
+        ...(field.options ? { options: jsonValue(field.options) } : {}),
+        pictureMaxBytes: field.pictureMaxBytes,
+        pictureMaxHeight: field.pictureMaxHeight,
+        pictureMaxWidth: field.pictureMaxWidth,
+        prefillPolicy: rule?.prefillPolicy ?? PrefillPolicy.editable,
+        required: rule?.required ?? false,
+        tag: field.tag,
+        type: field.type,
+      };
+    }),
+    prefillFields: draftRules
+      .filter((rule) => rule.prefillPointer !== null)
+      .map((rule) => ({
+        pointer: rule.prefillPointer as string,
+        policy: rule.prefillPolicy,
+        tag: rule.tag,
+      })),
+  };
+}
 async function completePublishOperation(
   operation: Operation,
   metadata: OperationMetadata,
@@ -2825,11 +3436,18 @@ async function completePublishOperation(
     fail(500, "invalid_operation", "Publish operation has no document key");
   }
   const form = await prisma.form.findUnique({
-    include: { templateDraft: true },
+    include: { publishedTemplate: true, templateDraft: true },
     where: { id: metadata.formId },
   });
   if (!form) {
     fail(404, "not_found", "Form was not found");
+  }
+  if (form.status === FormStatus.published || form.publishedTemplate) {
+    fail(
+      409,
+      "published_immutable",
+      "A Published Template already exists for this Form"
+    );
   }
   if (!form.templateDraft || form.templateDraft.documentKey !== documentKey) {
     fail(409, "stale_operation", "The template changed while publishing");
@@ -2841,45 +3459,92 @@ async function completePublishOperation(
   ) {
     fail(500, "invalid_operation", "Publish metadata is incomplete");
   }
-  const controls = validateTemplateControls(bytes);
-  const previousPublished = await prisma.publishedTemplate.findUnique({
-    select: { objectKey: true },
-    where: { formId: form.id },
-  });
+  const controls = parseTemplateFields(bytes);
   const hash = contentHash(bytes);
   const result = {
     documentKey: publishedKey,
     publicId: form.publicId,
     version: publishedVersion,
   };
-  const cleanupObjectKeys = [
-    metadata.stagedObjectKey,
-    ...(previousPublished ? [previousPublished.objectKey] : []),
-  ];
+  const cleanupObjectKeys = [metadata.stagedObjectKey];
   await prisma.$transaction(
     async (tx) => {
-      await tx.publishedTemplate.create({
+      const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
+        Prisma.sql`
+          SELECT "id"
+          FROM "forms"
+          WHERE "id" = ${form.id}::uuid
+          FOR UPDATE
+        `
+      );
+      if (!lockedForm) {
+        fail(404, "not_found", "Form was not found");
+      }
+      const currentForm = await tx.form.findUnique({
+        include: { publishedTemplate: true, templateDraft: true },
+        where: { id: form.id },
+      });
+      if (!currentForm) {
+        fail(404, "not_found", "Form was not found");
+      }
+      if (
+        currentForm.status === FormStatus.published ||
+        currentForm.publishedTemplate
+      ) {
+        fail(
+          409,
+          "published_immutable",
+          "A Published Template already exists for this Form"
+        );
+      }
+      if (
+        currentForm.version !== form.version ||
+        !currentForm.templateDraft ||
+        currentForm.templateDraft.documentKey !== documentKey
+      ) {
+        fail(409, "stale_operation", "The form changed while publishing");
+      }
+      const draftRules = await tx.draftFieldRule.findMany({
+        orderBy: { tag: "asc" },
+        where: { templateDraftId: currentForm.templateDraft.id },
+      });
+      const { manifestFields, prefillFields } = publishedContractFields(
+        controls,
+        draftRules
+      );
+      const publishedTemplate = await tx.publishedTemplate.create({
         data: {
           contentHash: hash,
           documentKey: publishedKey,
-          form: { connect: { id: form.id } },
+          form: { connect: { id: currentForm.id } },
           id: crypto.randomUUID(),
           manifest: {
             create: {
               configurationHash: hash,
-              fields: {
-                create: controls.map((tag) => ({
-                  prefillPolicy: PrefillPolicy.editable,
-                  required: false,
-                  tag,
-                  type: FieldType.text,
-                })),
-              },
+              fields: { create: manifestFields },
             },
           },
           objectKey: metadata.finalObjectKey,
           version: publishedVersion,
         },
+      });
+      const prefillConfiguration = await tx.prefillConfiguration.create({
+        data: {
+          configurationHash: hash,
+          formId: currentForm.id,
+        },
+      });
+      if (prefillFields.length > 0) {
+        await tx.prefillField.createMany({
+          data: prefillFields.map((field) => ({
+            ...field,
+            configurationId: prefillConfiguration.id,
+          })),
+        });
+      }
+      await tx.prefillConfiguration.update({
+        data: { publishedTemplateId: publishedTemplate.id },
+        where: { id: prefillConfiguration.id },
       });
       const updated = await tx.form.updateMany({
         data: {
@@ -2888,9 +3553,9 @@ async function completePublishOperation(
           version: publishedVersion,
         },
         where: {
-          id: form.id,
-          status: { in: [FormStatus.draft, FormStatus.published] },
-          version: form.version,
+          id: currentForm.id,
+          status: FormStatus.draft,
+          version: currentForm.version,
         },
       });
       if (updated.count !== 1) {
@@ -2903,10 +3568,69 @@ async function completePublishOperation(
         metadata,
         cleanupObjectKeys
       );
+      await createFormAudit(tx, {
+        action: "publish_form",
+        actorId: operation.actorId,
+        outcome: AuditOutcome.success,
+        safeMetadata: {},
+        targetId: currentForm.publicId,
+      });
     },
     { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
   );
   return { cleanupObjectKeys };
+}
+async function validateResponseDocument(
+  publishedTemplateId: string,
+  bytes: Uint8Array
+): Promise<void> {
+  const fields = parseTemplateFields(bytes);
+  const manifest = await prisma.fieldManifest.findUnique({
+    include: { fields: { orderBy: { tag: "asc" } } },
+    where: { publishedTemplateId },
+  });
+  if (!manifest || manifest.fields.length !== fields.length) {
+    fail(
+      422,
+      "invalid_template",
+      "The response document does not match the published manifest"
+    );
+  }
+  const fieldsByTag = new Map(fields.map((field) => [field.tag, field]));
+  for (const manifestField of manifest.fields) {
+    const field = fieldsByTag.get(manifestField.tag);
+    const fieldOptions = field?.options;
+    const manifestOptions = manifestField.options;
+    const optionsMatch =
+      (fieldOptions === null && manifestOptions === null) ||
+      (Array.isArray(fieldOptions) &&
+        Array.isArray(manifestOptions) &&
+        manifestOptions.length === fieldOptions.length &&
+        fieldOptions.every((option, index) => {
+          const manifestOption = manifestOptions[index];
+          return (
+            typeof manifestOption === "object" &&
+            manifestOption !== null &&
+            !Array.isArray(manifestOption) &&
+            manifestOption.displayText === option.displayText &&
+            manifestOption.value === option.value
+          );
+        }));
+    if (
+      !field ||
+      field.type !== manifestField.type ||
+      !optionsMatch ||
+      field.pictureMaxBytes !== manifestField.pictureMaxBytes ||
+      field.pictureMaxHeight !== manifestField.pictureMaxHeight ||
+      field.pictureMaxWidth !== manifestField.pictureMaxWidth
+    ) {
+      fail(
+        422,
+        "invalid_template",
+        "The response document does not match the published manifest"
+      );
+    }
+  }
 }
 
 async function completeDraftOperation(
@@ -2914,7 +3638,6 @@ async function completeDraftOperation(
   metadata: OperationMetadata,
   bytes: Uint8Array
 ): Promise<OperationCompletion> {
-  void bytes;
   const { documentKey } = operation;
   if (!documentKey) {
     fail(500, "invalid_operation", "Draft operation has no document key");
@@ -2932,6 +3655,7 @@ async function completeDraftOperation(
   ) {
     fail(409, "stale_operation", "The response is no longer editable");
   }
+  await validateResponseDocument(response.publishedTemplateId, bytes);
   const result = { publicId: metadata.publicId, responseId: response.id };
   const cleanupObjectKeys = [
     metadata.stagedObjectKey,
@@ -2972,7 +3696,6 @@ async function completeSubmitOperation(
   metadata: OperationMetadata,
   bytes: Uint8Array
 ): Promise<OperationCompletion> {
-  void bytes;
   const { documentKey } = operation;
   if (!documentKey) {
     fail(500, "invalid_operation", "Submit operation has no document key");
@@ -2995,6 +3718,7 @@ async function completeSubmitOperation(
       "The response is no longer pending submission"
     );
   }
+  await validateResponseDocument(response.publishedTemplateId, bytes);
 
   const submissionDocumentKey = metadata.submissionDocumentKey ?? documentKey;
   const result = {
@@ -3122,6 +3846,8 @@ async function finalizeCallback(
       validateTemplatePackage(bytes);
     } else if (metadata.action === "publish") {
       validateTemplateControls(bytes);
+    } else {
+      validateOfficeRelationshipsBytes(bytes);
     }
     await putObject(metadata.stagedObjectKey, bytes, DOCX_CONTENT_TYPE);
     await putObject(metadata.finalObjectKey, bytes, DOCX_CONTENT_TYPE);
@@ -3218,12 +3944,10 @@ function fieldRuleInput(input: JsonRecord): FieldRuleInput {
     fail(400, "invalid_field_config", "required must be a boolean");
   }
   const tag = fieldRuleTag(input.tag, "tag");
-  let previousTag: string | null;
-  if (input.previousTag === null) {
-    previousTag = null;
-  } else {
-    previousTag = fieldRuleTag(input.previousTag, "previousTag");
-  }
+  const previousTag =
+    input.previousTag === null
+      ? null
+      : fieldRuleTag(input.previousTag, "previousTag");
   let prefillPointer: string | null;
   if (input.prefillPointer === null) {
     prefillPointer = null;
@@ -3254,9 +3978,9 @@ function fieldRuleInput(input: JsonRecord): FieldRuleInput {
   }
   return {
     documentKey: input.documentKey,
-    previousTag,
     prefillPointer,
     prefillPolicy: input.prefillPolicy,
+    previousTag,
     required: input.required,
     tag,
   };
@@ -4011,9 +4735,15 @@ export function createApp(options: AppOptions = {}) {
               });
               if (failed.count === 1) {
                 const metadata = asRecord(operation.metadata);
-                if (metadata.action === "save-template") {
+                if (
+                  metadata.action === "save-template" ||
+                  metadata.action === "publish"
+                ) {
                   await createFormAudit(tx, {
-                    action: "save_template_draft",
+                    action:
+                      metadata.action === "publish"
+                        ? "publish_form"
+                        : "save_template_draft",
                     actorId: operation.actorId,
                     outcome: AuditOutcome.failure,
                     safeMetadata: { errorCode: "operation_timeout" },
@@ -4238,6 +4968,13 @@ export function createApp(options: AppOptions = {}) {
         const identity = await requireIdentity(request);
         requireAdmin(identity);
         const form = await findFormByPublicId(params.publicId);
+        if (form.status === FormStatus.published || form.publishedTemplate) {
+          fail(
+            409,
+            "published_immutable",
+            "Published forms cannot be structurally edited"
+          );
+        }
         const templateDraft = form.templateDraft;
         if (!templateDraft) {
           fail(
@@ -4303,6 +5040,13 @@ export function createApp(options: AppOptions = {}) {
         const { actor: identity } = authorization;
         requireAdmin(identity);
         const form = await findFormByPublicId(params.publicId);
+        if (form.status === FormStatus.published || form.publishedTemplate) {
+          fail(
+            409,
+            "published_immutable",
+            "Published forms cannot change Field rules"
+          );
+        }
         const templateDraft = requireTemplateDraft(form);
         const capabilityScope = fieldRuleCapabilityScope(form, templateDraft);
         requireEditorScope(authorization, {
@@ -4321,6 +5065,13 @@ export function createApp(options: AppOptions = {}) {
         const { actor: identity } = authorization;
         requireAdmin(identity);
         const form = await findFormByPublicId(params.publicId);
+        if (form.status === FormStatus.published || form.publishedTemplate) {
+          fail(
+            409,
+            "published_immutable",
+            "Published forms cannot change Field rules"
+          );
+        }
         const templateDraft = requireTemplateDraft(form);
         const capabilityScope = fieldRuleCapabilityScope(form, templateDraft);
         requireEditorScope(authorization, {
@@ -4348,6 +5099,13 @@ export function createApp(options: AppOptions = {}) {
         const { actor: identity } = authorization;
         requireAdmin(identity);
         const form = await findFormByPublicId(params.publicId);
+        if (form.status === FormStatus.published || form.publishedTemplate) {
+          fail(
+            409,
+            "published_immutable",
+            "Published forms cannot change Field rules"
+          );
+        }
         const templateDraft = requireTemplateDraft(form);
         const capabilityScope = fieldRuleCapabilityScope(form, templateDraft);
         requireEditorScope(authorization, {
@@ -4371,6 +5129,51 @@ export function createApp(options: AppOptions = {}) {
           rule = await prisma.$transaction(
             async (tx) => {
               await lockActiveEditorLease(tx, authorization, capabilityScope);
+              const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
+                Prisma.sql`
+                  SELECT "id"
+                  FROM "forms"
+                  WHERE "id" = ${form.id}::uuid
+                  FOR UPDATE
+                `
+              );
+              if (!lockedForm) {
+                fail(404, "not_found", "Form was not found");
+              }
+              const currentForm = await tx.form.findUnique({
+                select: {
+                  publishedTemplate: { select: { id: true } },
+                  status: true,
+                  templateDraft: {
+                    select: { documentKey: true, id: true },
+                  },
+                  version: true,
+                },
+                where: { id: form.id },
+              });
+              if (
+                !currentForm ||
+                currentForm.status === FormStatus.published ||
+                currentForm.publishedTemplate
+              ) {
+                fail(
+                  409,
+                  "published_immutable",
+                  "Published forms cannot change Field rules"
+                );
+              }
+              if (
+                currentForm.version !== form.version ||
+                currentForm.templateDraft?.id !== templateDraft.id ||
+                currentForm.templateDraft?.documentKey !==
+                  templateDraft.documentKey
+              ) {
+                fail(
+                  409,
+                  "stale_document",
+                  "The editor document is no longer current"
+                );
+              }
               const previousRule = input.previousTag
                 ? await tx.draftFieldRule.findUnique({
                     where: {
@@ -4487,6 +5290,13 @@ export function createApp(options: AppOptions = {}) {
         const publicId = params.publicId;
         try {
           const form = await findFormByPublicId(publicId);
+          if (form.status === FormStatus.published || form.publishedTemplate) {
+            fail(
+              409,
+              "published_immutable",
+              "Published forms cannot be structurally edited"
+            );
+          }
           const templateDraft = form.templateDraft;
           if (!templateDraft) {
             fail(409, "document_unavailable", "No template DOCX is configured");
@@ -4587,86 +5397,110 @@ export function createApp(options: AppOptions = {}) {
         const authorization = await requireActionEditorAuthorization(request);
         const { actor: identity } = authorization;
         requireAdmin(identity);
-        const form = await findFormByPublicId(params.publicId);
-        const templateDraft = form.templateDraft;
-        if (!templateDraft) {
-          fail(409, "document_unavailable", "No template DOCX is configured");
-        }
-        const capabilityScope = {
-          documentKey: templateDraft.documentKey,
-          formId: form.id,
-          targetId: templateDraft.id,
-          targetType: "template-draft",
-        } as const;
-        requireEditorScope(authorization, {
-          ...capabilityScope,
-          action: "publish",
-        });
-        await requireActiveEditorLease(authorization, capabilityScope);
-        const documentKey = await readDocumentKeyInput(request);
-        if (templateDraft.documentKey !== documentKey) {
-          fail(
-            409,
-            "stale_document",
-            "The editor document is no longer current"
-          );
-        }
-        if (await activeOperationForForm(form.id)) {
-          fail(
-            409,
-            "operation_in_progress",
-            "A publish operation is already in progress"
-          );
-        }
-        const operationId = crypto.randomUUID();
-        const version = form.version + 1;
-        const publishedKey = `published-${version}-${crypto.randomUUID()}`;
-        const stagedObjectKey = objectKey(
-          "operations",
-          operationId,
-          "published",
-          crypto.randomUUID(),
-          "docx"
-        );
-        const metadata: OperationMetadata = {
-          action: "publish",
-          finalObjectKey: objectKey(
-            "forms",
-            form.id,
+        try {
+          const form = await findFormByPublicId(params.publicId);
+          if (form.status === FormStatus.published || form.publishedTemplate) {
+            fail(
+              409,
+              "published_immutable",
+              "A Published Template already exists for this Form"
+            );
+          }
+          const templateDraft = form.templateDraft;
+          if (!templateDraft) {
+            fail(409, "document_unavailable", "No template DOCX is configured");
+          }
+          const capabilityScope = {
+            documentKey: templateDraft.documentKey,
+            formId: form.id,
+            targetId: templateDraft.id,
+            targetType: "template-draft",
+          } as const;
+          requireEditorScope(authorization, {
+            ...capabilityScope,
+            action: "publish",
+          });
+          await requireActiveEditorLease(authorization, capabilityScope);
+          const documentKey = await readDocumentKeyInput(request);
+          if (templateDraft.documentKey !== documentKey) {
+            fail(
+              409,
+              "stale_document",
+              "The editor document is no longer current"
+            );
+          }
+          if (await activeOperationForForm(form.id)) {
+            fail(
+              409,
+              "operation_in_progress",
+              "A publish operation is already in progress"
+            );
+          }
+          const operationId = crypto.randomUUID();
+          const version = form.version + 1;
+          const publishedKey = `published-${version}-${crypto.randomUUID()}`;
+          const stagedObjectKey = objectKey(
+            "operations",
+            operationId,
             "published",
-            String(version),
             crypto.randomUUID(),
             "docx"
-          ),
-          formId: form.id,
-          publishedKey,
-          publishedVersion: version,
-          stagedObjectKey,
-        };
-        const operation = await createOperation({
-          actorId: identity.id,
-          authorization,
-          capabilityScope,
-          documentKey,
-          formId: form.id,
-          metadata,
-          ownerUserId: identity.id,
-          stagingObjectKey: stagedObjectKey,
-          targetId: templateDraft.id,
-          targetType: OperationTargetType.template_draft,
-          type: operationTypeForAction.publish,
-        });
-        set.status = 202;
-        launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
-        return {
-          operationCapability: operationEditorCapability(
-            identity,
+          );
+          const metadata: OperationMetadata = {
+            action: "publish",
+            finalObjectKey: objectKey(
+              "forms",
+              form.id,
+              "published",
+              String(version),
+              crypto.randomUUID(),
+              "docx"
+            ),
+            formId: form.id,
+            publicId: form.publicId,
+            publishedKey,
+            publishedVersion: version,
+            stagedObjectKey,
+          };
+          const operation = await createOperation({
+            actorId: identity.id,
+            authorization,
             capabilityScope,
-            operation.id
-          ),
-          operationId: operation.id,
-          status: operation.status,
-        };
+            documentKey,
+            formId: form.id,
+            metadata,
+            ownerUserId: identity.id,
+            stagingObjectKey: stagedObjectKey,
+            targetId: templateDraft.id,
+            targetType: OperationTargetType.template_draft,
+            type: operationTypeForAction.publish,
+          });
+          set.status = 202;
+          launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
+          return {
+            operationCapability: operationEditorCapability(
+              identity,
+              capabilityScope,
+              operation.id
+            ),
+            operationId: operation.id,
+            status: operation.status,
+          };
+        } catch (error) {
+          try {
+            await createFormFailureAudit({
+              action: "publish_form",
+              actorId: identity.id,
+              error,
+              targetId: publicIdPattern.test(params.publicId)
+                ? params.publicId
+                : null,
+            });
+          } catch {
+            // Preserve the route error if the failure audit cannot be persisted.
+          }
+          throw error;
+        }
       },
       { parse: "none" }
     )
@@ -4695,6 +5529,13 @@ export function createApp(options: AppOptions = {}) {
     .get("/api/forms/:publicId", async ({ params, request }) => {
       await requireIdentity(request);
       const form = await findFormByPublicId(params.publicId);
+      if (
+        form.status !== FormStatus.published ||
+        !form.publishedTemplate?.objectKey ||
+        !form.publishedTemplate.documentKey
+      ) {
+        fail(404, "not_found", "Form was not found");
+      }
       return {
         form: {
           description: form.description ?? "",
@@ -5026,7 +5867,12 @@ export function createApp(options: AppOptions = {}) {
           action: "submit",
         });
         await requireActiveEditorLease(authorization, capabilityScope);
-        const data = await normalizeResponseData(form, response, input.data);
+        const data = await normalizeResponseData(
+          form,
+          response,
+          input.data,
+          true
+        );
         if (await activeOperationForResponse(response.id)) {
           fail(
             409,
@@ -5064,6 +5910,23 @@ export function createApp(options: AppOptions = {}) {
         const operation = await prisma.$transaction(
           async (tx) => {
             await lockActiveEditorLease(tx, authorization, capabilityScope);
+            const activeOperation = await tx.operation.findFirst({
+              where: {
+                responseId: response.id,
+                status: {
+                  in: [OperationStatus.pending, OperationStatus.processing],
+                },
+                targetId: response.id,
+                targetType: OperationTargetType.response,
+              },
+            });
+            if (activeOperation) {
+              fail(
+                409,
+                "operation_in_progress",
+                "Another response operation is already in progress"
+              );
+            }
             const claimed = await tx.response.updateMany({
               data: {
                 status: ResponseStatus.submitting,
@@ -5376,10 +6239,12 @@ export function createApp(options: AppOptions = {}) {
             callbackMaximumBytes
           );
           return { error: 0 };
-        } catch {
+        } catch (error) {
           await updateOperationFailed(
             operation.id,
-            "callback_processing_failed"
+            error instanceof HttpError && error.code === "invalid_template"
+              ? "invalid_template"
+              : "callback_processing_failed"
           );
           return { error: 1 };
         }

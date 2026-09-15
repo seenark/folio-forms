@@ -78,6 +78,9 @@ const detailErrorMessage = (caughtError: unknown, fallback: string): string => {
       case "password_change_required": {
         return "กรุณาเปลี่ยนรหัสผ่านก่อนแก้ไขแบบฟอร์ม";
       }
+      case "published_immutable": {
+        return "แบบฟอร์มนี้เผยแพร่แล้ว สัญญาเอกสารและการตั้งค่า Field ไม่สามารถแก้ไขในที่เดิมได้";
+      }
       default: {
         break;
       }
@@ -208,10 +211,12 @@ const FormEditorRoute = () => {
     );
   }
 
+  const canEditTemplate = loadedForm.status === "draft";
   const shareUrl = `${window.location.origin}/forms/${publicId}/fill`;
   const { activeDraftCount } = loadedForm;
   const { editorConfigUrl } = loadedForm;
   const canAct =
+    canEditTemplate &&
     editorState === "ready" &&
     !busy &&
     operationStatus !== "pending" &&
@@ -468,6 +473,12 @@ const FormEditorRoute = () => {
           ) : null}
         </div>
       ) : null}
+      {canEditTemplate ? null : (
+        <Notice>
+          แบบฟอร์มนี้เผยแพร่แล้ว สัญญาเอกสารและการตั้งค่า Field ไม่สามารถแก้ไขในที่เดิมได้
+          หากต้องการเปลี่ยนโครงสร้างให้สร้าง Form ใหม่
+        </Notice>
+      )}
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--line)] bg-[var(--paper)] p-4">
         <div className="flex min-w-0 items-center gap-3">
           <Globe2 className="shrink-0 text-[var(--success)]" size={18} />
@@ -478,7 +489,13 @@ const FormEditorRoute = () => {
             </p>
           </div>
         </div>
-        <Button variant="secondary" size="sm" type="button" onClick={copyLink}>
+        <Button
+          variant="secondary"
+          size="sm"
+          type="button"
+          onClick={copyLink}
+          disabled={loadedForm.status !== "published"}
+        >
           {copied ? <Check size={15} /> : <Copy size={15} />}
           {copied ? "คัดลอกแล้ว" : "คัดลอกลิงก์"}
         </Button>
@@ -488,16 +505,18 @@ const FormEditorRoute = () => {
         ตัวแก้ไขเอกสาร
         <span className="text-xs">· แนะนำให้ใช้คอมพิวเตอร์</span>
       </div>
-      <div className="overflow-hidden rounded-[var(--radius)] border border-[var(--line-strong)] bg-[var(--muted)] shadow-inner">
-        <OnlyOfficeEditor
-          key={publicId}
-          onBridgeMessage={handleEditorBridgeMessage}
-          onStateChange={setEditorState}
-          configUrl={editorConfigUrl}
-          revision={editorRevision}
-          title={`ตัวแก้ไขเอกสาร ${loadedForm.title}`}
-        />
-      </div>
+      {canEditTemplate ? (
+        <div className="overflow-hidden rounded-[var(--radius)] border border-[var(--line-strong)] bg-[var(--muted)] shadow-inner">
+          <OnlyOfficeEditor
+            key={publicId}
+            onBridgeMessage={handleEditorBridgeMessage}
+            onStateChange={setEditorState}
+            configUrl={editorConfigUrl}
+            revision={editorRevision}
+            title={`ตัวแก้ไขเอกสาร ${loadedForm.title}`}
+          />
+        </div>
+      ) : null}
     </div>
   );
 };

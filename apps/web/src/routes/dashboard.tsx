@@ -137,7 +137,7 @@ const DashboardRoute = () => {
                     <Link
                       to="/forms/$publicId/fill"
                       params={{
-                        publicId: row.formPublicId ?? row.formId ?? "",
+                        publicId: row.formPublicId ?? "",
                       }}
                       search={{ responseId: row.id }}
                       className="inline-flex items-center gap-1 text-sm font-semibold text-[var(--success)]"
