@@ -394,8 +394,10 @@ type FormAuditAction =
   | "configure_field_rule"
   | "create_form"
   | "delete_form"
+  | "duplicate_form"
   | "publish_form"
-  | "save_template_draft";
+  | "save_template_draft"
+  | "update_form_metadata";
 type FormAuditErrorCode =
   | "callback_claim_invalid"
   | "blank_template_unavailable"
@@ -426,6 +428,7 @@ type FormAuditErrorCode =
 interface FormAuditMetadata {
   errorCode?: FormAuditErrorCode;
   source?: FormSource;
+  sourcePublicId?: string;
 }
 type OperationMetadata = JsonRecord & {
   action: OperationAction;
@@ -672,7 +675,51 @@ async function readDocumentKeyInput(request: Request): Promise<string> {
   if (Object.keys(input).length !== 1 || !Object.hasOwn(input, "documentKey")) {
     fail(400, "invalid_request", "Only documentKey is accepted");
   }
+
   return requiredString(input, "documentKey");
+}
+interface FormMetadataInput {
+  description?: string | null;
+  title?: string;
+}
+
+async function readFormMetadataInput(
+  request: Request
+): Promise<FormMetadataInput> {
+  const input = await readJsonRecord(request, documentActionBodyMaximumBytes);
+  const keys = Object.keys(input);
+  if (
+    keys.length === 0 ||
+    keys.some((key) => key !== "description" && key !== "title")
+  ) {
+    fail(400, "invalid_request", "Only title and description are accepted");
+  }
+  const metadata: FormMetadataInput = {};
+  if (Object.hasOwn(input, "title")) {
+    if (typeof input.title !== "string" || input.title.trim().length === 0) {
+      fail(400, "invalid_request", "title must be a non-empty string");
+    }
+    if (input.title.trim().length > 200) {
+      fail(400, "invalid_request", "Title is too long");
+    }
+    metadata.title = input.title.trim();
+  }
+  if (Object.hasOwn(input, "description")) {
+    if (input.description !== null && typeof input.description !== "string") {
+      fail(400, "invalid_request", "description must be a string or null");
+    }
+    if (
+      typeof input.description === "string" &&
+      input.description.trim().length > 2000
+    ) {
+      fail(400, "invalid_request", "Description is too long");
+    }
+    metadata.description =
+      typeof input.description === "string"
+        ? input.description.trim() || null
+        : null;
+  }
+  return metadata;
 }
 
 function jsonRecord(
@@ -4628,6 +4675,209 @@ export function createApp(options: AppOptions = {}) {
       );
       return { forms };
     })
+    .patch("/api/admin/forms/:publicId", async ({ request, params }) => {
+      const identity = await requireIdentity(request);
+      requireAdmin(identity);
+      const auditTarget = publicIdPattern.test(params.publicId)
+        ? params.publicId
+        : null;
+      try {
+        const input = await readFormMetadataInput(request);
+        const updated = await prisma.$transaction(async (tx) => {
+          if (!publicIdPattern.test(params.publicId)) {
+            fail(404, "not_found", "Form was not found");
+          }
+          const current = await tx.form.findUnique({
+            include: { publishedTemplate: true, templateDraft: true },
+            where: { publicId: params.publicId },
+          });
+          if (!current) {
+            fail(404, "not_found", "Form was not found");
+          }
+          const form = await tx.form.update({
+            data: {
+              ...(input.title !== undefined ? { title: input.title } : {}),
+              ...(Object.hasOwn(input, "description")
+                ? { description: input.description }
+                : {}),
+            },
+            include: { publishedTemplate: true, templateDraft: true },
+            where: { id: current.id },
+          });
+          await createFormAudit(tx, {
+            action: "update_form_metadata",
+            actorId: identity.id,
+            outcome: AuditOutcome.success,
+            safeMetadata: {},
+            targetId: form.publicId,
+          });
+          return form;
+        });
+        const [activeDraftCount, submissionCount] = await Promise.all([
+          prisma.response.count({
+            where: { formId: updated.id, status: ResponseStatus.draft },
+          }),
+          prisma.submission.count({ where: { formId: updated.id } }),
+        ]);
+        return {
+          form: formDto(updated, { activeDraftCount, submissionCount }),
+        };
+      } catch (error) {
+        try {
+          await createFormFailureAudit({
+            action: "update_form_metadata",
+            actorId: identity.id,
+            error,
+            targetId: auditTarget,
+          });
+        } catch {
+          // Preserve the route error if the failure audit cannot be persisted.
+        }
+        throw error;
+      }
+    })
+    .post(
+      "/api/admin/forms/:publicId/duplicate",
+      async ({ request, params }) => {
+        const identity = await requireIdentity(request);
+        requireAdmin(identity);
+        const auditTarget = publicIdPattern.test(params.publicId)
+          ? params.publicId
+          : null;
+        let duplicateObjectKey: string | undefined;
+        try {
+          const input = await readJsonRecord(
+            request,
+            documentActionBodyMaximumBytes
+          );
+          if (Object.keys(input).length !== 0) {
+            fail(400, "invalid_request", "Duplicate requests must be empty");
+          }
+          if (!publicIdPattern.test(params.publicId)) {
+            fail(404, "not_found", "Form was not found");
+          }
+          const source = await prisma.form.findUnique({
+            include: {
+              publishedTemplate: {
+                include: {
+                  manifest: { include: { fields: true } },
+                  prefillConfiguration: { include: { fields: true } },
+                },
+              },
+              templateDraft: { include: { fieldRules: true } },
+            },
+            where: { publicId: params.publicId },
+          });
+          if (!source) {
+            fail(404, "not_found", "Form was not found");
+          }
+          const sourceDocument =
+            source.publishedTemplate ?? source.templateDraft;
+          if (!sourceDocument) {
+            fail(409, "document_unavailable", "The Form DOCX is unavailable");
+          }
+          if (!(await objectExists(sourceDocument.objectKey))) {
+            fail(409, "document_unavailable", "The Form DOCX is unavailable");
+          }
+          const sourceBytes = await readObject(sourceDocument.objectKey);
+          const duplicateId = crypto.randomUUID();
+          const duplicatePublicId = crypto.randomUUID().replaceAll("-", "");
+          duplicateObjectKey = objectKey(
+            "forms",
+            duplicateId,
+            "template-draft",
+            crypto.randomUUID(),
+            "docx"
+          );
+          const duplicateDocumentKey = `template-${crypto.randomUUID()}`;
+          const sourcePrefillFields =
+            source.publishedTemplate?.prefillConfiguration?.fields ?? [];
+          const sourceRules =
+            source.publishedTemplate?.manifest?.fields.map((field) => {
+              const prefill = sourcePrefillFields.find(
+                (candidate) => candidate.tag === field.tag
+              );
+              return {
+                prefillPointer: prefill?.pointer ?? null,
+                prefillPolicy: prefill?.policy ?? field.prefillPolicy,
+                required: field.required,
+                tag: field.tag,
+              };
+            }) ??
+            source.templateDraft?.fieldRules.map((field) => ({
+              prefillPointer: field.prefillPointer,
+              prefillPolicy: field.prefillPolicy,
+              required: field.required,
+              tag: field.tag,
+            })) ??
+            [];
+          await prisma.objectCleanupIntent.create({
+            data: {
+              cleanupAfter: new Date(Date.now() + objectCleanupIntentGraceMs),
+              objectKey: duplicateObjectKey,
+            },
+          });
+          await putObject(duplicateObjectKey, sourceBytes, DOCX_CONTENT_TYPE);
+          const duplicate = await prisma.$transaction(async (tx) => {
+            const created = await tx.form.create({
+              data: {
+                creator: { connect: { id: identity.id } },
+                description: source.description,
+                id: duplicateId,
+                publicId: duplicatePublicId,
+                templateDraft: {
+                  create: {
+                    contentHash:
+                      sourceDocument.contentHash ?? contentHash(sourceBytes),
+                    documentKey: duplicateDocumentKey,
+                    fieldRules: { create: sourceRules },
+                    objectKey: duplicateObjectKey as string,
+                  },
+                },
+                title: source.title,
+              },
+              include: { publishedTemplate: true, templateDraft: true },
+            });
+            await createFormAudit(tx, {
+              action: "duplicate_form",
+              actorId: identity.id,
+              outcome: AuditOutcome.success,
+              safeMetadata: { sourcePublicId: source.publicId },
+              targetId: duplicatePublicId,
+            });
+            await tx.objectCleanupIntent.delete({
+              where: { objectKey: duplicateObjectKey },
+            });
+            return created;
+          });
+          return {
+            form: formDto(duplicate, {
+              activeDraftCount: 0,
+              submissionCount: 0,
+            }),
+          };
+        } catch (error) {
+          if (duplicateObjectKey) {
+            await prisma.objectCleanupIntent.updateMany({
+              data: { cleanupAfter: new Date() },
+              where: { objectKey: duplicateObjectKey },
+            });
+            await drainObjectCleanupIntents([duplicateObjectKey]);
+          }
+          try {
+            await createFormFailureAudit({
+              action: "duplicate_form",
+              actorId: identity.id,
+              error,
+              targetId: auditTarget,
+            });
+          } catch {
+            // Preserve the route error if the failure audit cannot be persisted.
+          }
+          throw error;
+        }
+      }
+    )
     .delete("/api/admin/forms/:publicId", async ({ request, params }) => {
       const identity = await requireIdentity(request);
       requireAdmin(identity);

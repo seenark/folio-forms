@@ -16,6 +16,7 @@ import {
   Save,
   Send,
 } from "lucide-react";
+import type { FormEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 
 import type {
@@ -23,12 +24,29 @@ import type {
   OnlyOfficeEditorState,
 } from "@/components/onlyoffice-editor";
 import { OnlyOfficeEditor } from "@/components/onlyoffice-editor";
-import { Badge, Button, Notice, Spinner } from "@/components/ui";
-import { ApiError, apiGet, apiPost, waitForOperation } from "@/lib/api";
+import {
+  Badge,
+  Button,
+  Input,
+  Notice,
+  Spinner,
+  Textarea,
+} from "@/components/ui";
+import {
+  ApiError,
+  apiGet,
+  apiPatch,
+  apiPost,
+  waitForOperation,
+} from "@/lib/api";
 import type { FormDetail, FormSummary } from "@/lib/api";
 
 interface FormDetailResponse {
   editorConfigUrl: string;
+  form: FormSummary;
+}
+
+interface FormMutationResponse {
   form: FormSummary;
 }
 
@@ -58,7 +76,7 @@ const detailErrorMessage = (caughtError: unknown, fallback: string): string => {
         return "เอกสารนี้กำลังถูกแก้ไขโดยผู้ใช้รายอื่น กรุณารอแล้วลองใหม่";
       }
       case "document_unavailable": {
-        return "ยังไม่มีเอกสารต้นแบบสำหรับแก้ไข กรุณาตรวจสอบต้นแบบของแบบฟอร์ม";
+        return "ยังไม่มีเอกสารต้นแบบสำหรับดำเนินการ กรุณาตรวจสอบต้นแบบของแบบฟอร์ม";
       }
       case "stale_document": {
         return "เอกสารมีการเปลี่ยนแปลงแล้ว กรุณาลองใหม่เพื่อใช้เอกสารปัจจุบัน";
@@ -69,17 +87,26 @@ const detailErrorMessage = (caughtError: unknown, fallback: string): string => {
       case "operation_in_progress": {
         return "มีการดำเนินการกับเอกสารอยู่แล้ว กรุณารอแล้วลองใหม่";
       }
+      case "invalid_request": {
+        return "ข้อมูลชื่อหรือคำอธิบายไม่ถูกต้อง กรุณาตรวจสอบความยาวแล้วลองใหม่";
+      }
       case "not_found": {
         return "ไม่พบแบบฟอร์มนี้ อาจถูกลบไปแล้ว";
       }
       case "unauthorized": {
         return "เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่";
       }
+      case "forbidden": {
+        return "คุณไม่มีสิทธิ์ดำเนินการนี้";
+      }
       case "password_change_required": {
         return "กรุณาเปลี่ยนรหัสผ่านก่อนแก้ไขแบบฟอร์ม";
       }
       case "published_immutable": {
         return "แบบฟอร์มนี้เผยแพร่แล้ว สัญญาเอกสารและการตั้งค่า Field ไม่สามารถแก้ไขในที่เดิมได้";
+      }
+      case "internal_error": {
+        return "ระบบไม่สามารถดำเนินการได้ กรุณาลองใหม่อีกครั้ง";
       }
       default: {
         break;
@@ -109,6 +136,11 @@ const FormEditorRoute = () => {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState<"save" | "publish" | null>(null);
+  const [metadataBusy, setMetadataBusy] = useState<"save" | "duplicate" | null>(
+    null
+  );
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
   const [copied, setCopied] = useState(false);
   const [publishPrompt, setPublishPrompt] = useState(false);
   const [editorState, setEditorState] =
@@ -118,6 +150,7 @@ const FormEditorRoute = () => {
   const [editorRevision, setEditorRevision] = useState(0);
   const [reloadToken, setReloadToken] = useState(0);
   const busyGuardRef = useRef(false);
+  const metadataGuardRef = useRef(false);
   const feedbackRef = useRef<HTMLDivElement>(null);
   const restorePublishFocusRef = useRef(false);
   useEffect(() => {
@@ -149,9 +182,12 @@ const FormEditorRoute = () => {
     let cancelled = false;
     setLoading(true);
     setForm(null);
+    setTitle("");
+    setDescription("");
     setError(null);
     setNotice(null);
     setOperationStatus(null);
+    setMetadataBusy(null);
     setEditorState("loading");
 
     const loadForm = async () => {
@@ -159,6 +195,8 @@ const FormEditorRoute = () => {
         const payload = await loadFormDetail(publicId);
         if (!cancelled) {
           setForm(payload);
+          setTitle(payload.title);
+          setDescription(payload.description);
         }
       } catch (caughtError) {
         if (!cancelled) {
@@ -215,12 +253,17 @@ const FormEditorRoute = () => {
   const shareUrl = `${window.location.origin}/forms/${publicId}/fill`;
   const { activeDraftCount } = loadedForm;
   const { editorConfigUrl } = loadedForm;
+  const operationBusy =
+    operationStatus === "pending" || operationStatus === "processing";
   const canAct =
     canEditTemplate &&
     editorState === "ready" &&
     !busy &&
-    operationStatus !== "pending" &&
-    operationStatus !== "processing";
+    !metadataBusy &&
+    !operationBusy;
+  const metadataCanAct = !busy && !metadataBusy && !operationBusy;
+  const canDuplicate =
+    loadedForm.status === "draft" || loadedForm.status === "published";
 
   const perform = async (action: "save" | "publish") => {
     if (!canAct || busyGuardRef.current || !editorConfigUrl) {
@@ -298,6 +341,80 @@ const FormEditorRoute = () => {
     void perform(action);
   };
 
+  const updateMetadata = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!metadataCanAct || metadataGuardRef.current) {
+      return;
+    }
+    const nextTitle = title.trim();
+    if (!nextTitle) {
+      setError("กรุณากรอกชื่อแบบฟอร์ม");
+      setNotice(null);
+      return;
+    }
+    metadataGuardRef.current = true;
+    setMetadataBusy("save");
+    setError(null);
+    setNotice(null);
+    setOperationStatus(null);
+    try {
+      const payload = await apiPatch<FormMutationResponse>(
+        `/api/admin/forms/${publicId}`,
+        {
+          description: description.trim() || null,
+          title: nextTitle,
+        }
+      );
+      setForm((currentForm) =>
+        currentForm ? { ...currentForm, ...payload.form } : currentForm
+      );
+      setTitle(payload.form.title);
+      setDescription(payload.form.description);
+      setNotice("บันทึกข้อมูลแบบฟอร์มเรียบร้อยแล้ว");
+    } catch (caughtError) {
+      setError(
+        detailErrorMessage(
+          caughtError,
+          "บันทึกข้อมูลแบบฟอร์มไม่สำเร็จ กรุณาลองใหม่อีกครั้ง"
+        )
+      );
+    } finally {
+      setMetadataBusy(null);
+      metadataGuardRef.current = false;
+    }
+  };
+
+  const duplicateForm = async () => {
+    if (!canDuplicate || !metadataCanAct || metadataGuardRef.current) {
+      return;
+    }
+    metadataGuardRef.current = true;
+    setMetadataBusy("duplicate");
+    setError(null);
+    setNotice(null);
+    setOperationStatus(null);
+    try {
+      const payload = await apiPost<FormMutationResponse>(
+        `/api/admin/forms/${publicId}/duplicate`,
+        {}
+      );
+      navigate({
+        to: "/admin/forms/$formId",
+        params: { formId: payload.form.publicId },
+      });
+    } catch (caughtError) {
+      setError(
+        detailErrorMessage(
+          caughtError,
+          "สร้างสำเนาแบบฟอร์มไม่สำเร็จ กรุณาลองใหม่อีกครั้ง"
+        )
+      );
+    } finally {
+      setMetadataBusy(null);
+      metadataGuardRef.current = false;
+    }
+  };
+
   const handleEditorBridgeMessage = async (message: EditorBridgeMessage) => {
     if (
       message.type !== "operation" ||
@@ -357,8 +474,6 @@ const FormEditorRoute = () => {
   };
 
   const status = formStatusDetails[loadedForm.status];
-  const operationBusy =
-    operationStatus === "pending" || operationStatus === "processing";
 
   return (
     <div>
@@ -372,6 +487,16 @@ const FormEditorRoute = () => {
           กลับไปยังรายการแบบฟอร์ม
         </button>
         <div className="flex flex-wrap gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            type="button"
+            onClick={() => void duplicateForm()}
+            disabled={!canDuplicate || !metadataCanAct}
+          >
+            {metadataBusy === "duplicate" ? <Spinner /> : <Copy size={15} />}
+            {metadataBusy === "duplicate" ? "กำลังสร้างสำเนา…" : "สร้างสำเนา"}
+          </Button>
           <Button
             variant="secondary"
             size="sm"
@@ -479,6 +604,76 @@ const FormEditorRoute = () => {
           หากต้องการเปลี่ยนโครงสร้างให้สร้าง Form ใหม่
         </Notice>
       )}
+      <section
+        className="mb-4 rounded-[var(--radius)] border border-[var(--line)] bg-[var(--paper)] p-5"
+        aria-labelledby="metadata-title"
+      >
+        <div className="max-w-2xl">
+          <h2 id="metadata-title" className="text-lg font-semibold">
+            ข้อมูลแบบฟอร์ม
+          </h2>
+          <p className="mt-1 text-sm text-[var(--ink-soft)]">
+            แก้ไขชื่อและคำอธิบายได้ทั้งแบบร่างและแบบฟอร์มที่เผยแพร่แล้ว
+          </p>
+          <form
+            className="mt-4 space-y-4"
+            onSubmit={updateMetadata}
+            aria-busy={metadataBusy === "save"}
+          >
+            <div className="space-y-2">
+              <label className="text-sm font-semibold" htmlFor="form-title">
+                ชื่อแบบฟอร์ม
+              </label>
+              <Input
+                id="form-title"
+                name="title"
+                value={title}
+                onChange={(event) => setTitle(event.target.value)}
+                maxLength={200}
+                required
+                aria-describedby="form-title-help"
+                disabled={!metadataCanAct}
+              />
+              <p
+                id="form-title-help"
+                className="text-xs text-[var(--ink-soft)]"
+              >
+                ต้องระบุชื่อ ความยาวไม่เกิน 200 ตัวอักษร
+              </p>
+            </div>
+            <div className="space-y-2">
+              <label
+                className="text-sm font-semibold"
+                htmlFor="form-description"
+              >
+                คำอธิบาย
+              </label>
+              <Textarea
+                id="form-description"
+                name="description"
+                value={description}
+                onChange={(event) => setDescription(event.target.value)}
+                maxLength={2000}
+                rows={4}
+                aria-describedby="form-description-help"
+                disabled={!metadataCanAct}
+              />
+              <p
+                id="form-description-help"
+                className="text-xs text-[var(--ink-soft)]"
+              >
+                ใส่คำอธิบายเพิ่มเติมได้ไม่เกิน 2,000 ตัวอักษร
+              </p>
+            </div>
+            <div className="flex justify-end">
+              <Button type="submit" disabled={!metadataCanAct}>
+                {metadataBusy === "save" ? <Spinner /> : <Save size={15} />}
+                {metadataBusy === "save" ? "กำลังบันทึกข้อมูล…" : "บันทึกข้อมูลแบบฟอร์ม"}
+              </Button>
+            </div>
+          </form>
+        </div>
+      </section>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--line)] bg-[var(--paper)] p-4">
         <div className="flex min-w-0 items-center gap-3">
           <Globe2 className="shrink-0 text-[var(--success)]" size={18} />

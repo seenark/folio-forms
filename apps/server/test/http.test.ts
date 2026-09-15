@@ -2299,6 +2299,362 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   if (!formRecord) {
     throw new Error("The published test form was not found");
   }
+  const publishedContractBefore = await prisma.publishedTemplate.findUnique({
+    include: {
+      manifest: { include: { fields: { orderBy: { tag: "asc" } } } },
+      prefillConfiguration: {
+        include: { fields: { orderBy: { tag: "asc" } } },
+      },
+    },
+    where: { formId },
+  });
+  if (!publishedContractBefore?.manifest) {
+    throw new Error("The Ticket 11 published contract was not found");
+  }
+  const unauthorizedMetadataUpdate = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
+      body: JSON.stringify({
+        description: "must not change",
+        title: "must not change",
+      }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${userBearer}` },
+      method: "PATCH",
+    })
+  );
+  expect(unauthorizedMetadataUpdate.status).toBe(403);
+  const updatedTitle = `${secretFormTitle} metadata`;
+  const updatedDescription = `${secretFormDescription} metadata`;
+  const metadataUpdate = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
+      body: JSON.stringify({
+        description: updatedDescription,
+        title: updatedTitle,
+      }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "PATCH",
+    })
+  );
+  expect(metadataUpdate.status).toBe(200);
+  expect(await metadataUpdate.json()).toMatchObject({
+    form: {
+      description: updatedDescription,
+      publicId: formPublicId,
+      status: "published",
+      title: updatedTitle,
+      version: 1,
+    },
+  });
+  const publicMetadataAfterUpdate = await app.handle(
+    new Request(`http://test.local/api/forms/${formPublicId}`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(await publicMetadataAfterUpdate.json()).toMatchObject({
+    form: { description: updatedDescription, title: updatedTitle },
+  });
+  const publishedContractAfter = await prisma.publishedTemplate.findUnique({
+    include: {
+      manifest: { include: { fields: { orderBy: { tag: "asc" } } } },
+      prefillConfiguration: {
+        include: { fields: { orderBy: { tag: "asc" } } },
+      },
+    },
+    where: { formId },
+  });
+  if (!publishedContractAfter?.manifest) {
+    throw new Error("The Ticket 11 published contract was removed");
+  }
+  expect(publishedContractAfter).toMatchObject({
+    contentHash: publishedContractBefore.contentHash,
+    documentKey: publishedContractBefore.documentKey,
+    id: publishedContractBefore.id,
+    objectKey: publishedContractBefore.objectKey,
+    version: publishedContractBefore.version,
+  });
+  expect(publishedContractAfter.manifest).toMatchObject({
+    configurationHash: publishedContractBefore.manifest.configurationHash,
+    id: publishedContractBefore.manifest.id,
+  });
+  expect(publishedContractAfter.manifest.fields).toEqual(
+    publishedContractBefore.manifest.fields
+  );
+  expect(publishedContractAfter.prefillConfiguration).toEqual(
+    publishedContractBefore.prefillConfiguration
+  );
+  expect(
+    await prisma.auditEvent.findFirst({
+      orderBy: { createdAt: "desc" },
+      where: { action: "update_form_metadata", targetId: formPublicId },
+    })
+  ).toMatchObject({ outcome: "success", targetId: formPublicId });
+  const restoreMetadata = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
+      body: JSON.stringify({
+        description: secretFormDescription,
+        title: secretFormTitle,
+      }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "PATCH",
+    })
+  );
+  expect(restoreMetadata.status).toBe(200);
+
+  const unauthorizedDuplicate = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/duplicate`, {
+      body: "{}",
+      headers: { ...jsonHeaders, Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  expect(unauthorizedDuplicate.status).toBe(403);
+  const duplicatePublishedResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}/duplicate`, {
+      body: "{}",
+      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "POST",
+    })
+  );
+  expect(duplicatePublishedResponse.status).toBe(200);
+  const duplicatePublishedBody = (await duplicatePublishedResponse.json()) as {
+    form?: {
+      description?: string;
+      publicId?: string;
+      status?: string;
+      title?: string;
+      version?: number;
+    };
+  };
+  const duplicatePublishedPublicId = duplicatePublishedBody.form?.publicId;
+  if (!duplicatePublishedPublicId) {
+    throw new Error("The published Form duplicate was not created");
+  }
+  expect(duplicatePublishedBody.form).toMatchObject({
+    description: secretFormDescription,
+    status: "draft",
+    title: secretFormTitle,
+    version: 0,
+  });
+  expect(duplicatePublishedPublicId).not.toBe(formPublicId);
+  expect(duplicatePublishedPublicId).toMatch(/^[0-9a-f]{32}$/u);
+  const duplicatePublished = await prisma.form.findUnique({
+    include: {
+      prefillConfiguration: {
+        include: { fields: { orderBy: { tag: "asc" } } },
+      },
+      templateDraft: { include: { fieldRules: { orderBy: { tag: "asc" } } } },
+    },
+    where: { publicId: duplicatePublishedPublicId },
+  });
+  if (!duplicatePublished?.templateDraft) {
+    throw new Error("The published Form duplicate has no Template Draft");
+  }
+  expect(
+    Buffer.from(await readObject(duplicatePublished.templateDraft.objectKey))
+  ).toEqual(Buffer.from(publishedBytes));
+  const sourcePrefillByTag = new Map(
+    (publishedContractBefore.prefillConfiguration?.fields ?? []).map(
+      (field) => [field.tag, field]
+    )
+  );
+  expect(
+    duplicatePublished.templateDraft.fieldRules.map((field) => ({
+      prefillPointer: field.prefillPointer,
+      prefillPolicy: field.prefillPolicy,
+      required: field.required,
+      tag: field.tag,
+    }))
+  ).toEqual(
+    publishedContractBefore.manifest.fields
+      .map((field) => ({
+        prefillPointer: sourcePrefillByTag.get(field.tag)?.pointer ?? null,
+        prefillPolicy: field.prefillPolicy,
+        required: field.required,
+        tag: field.tag,
+      }))
+      .toSorted((left, right) => left.tag.localeCompare(right.tag))
+  );
+  expect(duplicatePublished.prefillConfiguration).toBeNull();
+  const [
+    duplicateResponseCount,
+    duplicateSubmissionCount,
+    duplicateOperationCount,
+    duplicateLeaseCount,
+    duplicateAuditEvents,
+  ] = await Promise.all([
+    prisma.response.count({ where: { formId: duplicatePublished.id } }),
+    prisma.submission.count({ where: { formId: duplicatePublished.id } }),
+    prisma.operation.count({ where: { formId: duplicatePublished.id } }),
+    prisma.editorLease.count({
+      where: {
+        targetId: duplicatePublished.templateDraft.id,
+        targetType: "template_draft",
+      },
+    }),
+    prisma.auditEvent.findMany({
+      orderBy: { createdAt: "asc" },
+      select: { action: true, outcome: true },
+      where: { targetId: duplicatePublishedPublicId },
+    }),
+  ]);
+  expect(duplicateResponseCount).toBe(0);
+  expect(duplicateSubmissionCount).toBe(0);
+  expect(duplicateOperationCount).toBe(0);
+  expect(duplicateLeaseCount).toBe(0);
+  expect(duplicateAuditEvents).toEqual([
+    { action: "duplicate_form", outcome: "success" },
+  ]);
+  const duplicateTitle = `${secretFormTitle} duplicate`;
+  const duplicateMetadataUpdate = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${duplicatePublishedPublicId}`,
+      {
+        body: JSON.stringify({
+          description: "Independent duplicate",
+          title: duplicateTitle,
+        }),
+        headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+        method: "PATCH",
+      }
+    )
+  );
+  expect(duplicateMetadataUpdate.status).toBe(200);
+  const sourceAfterDuplicate = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(await sourceAfterDuplicate.json()).toMatchObject({
+    form: { description: secretFormDescription, title: secretFormTitle },
+  });
+  const duplicatePublishedAfterUpdate = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${duplicatePublishedPublicId}`,
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      }
+    )
+  );
+  expect(await duplicatePublishedAfterUpdate.json()).toMatchObject({
+    form: {
+      description: "Independent duplicate",
+      publicId: duplicatePublishedPublicId,
+      status: "draft",
+      title: duplicateTitle,
+    },
+  });
+  const duplicatePublishedObjectKey =
+    duplicatePublished.templateDraft.objectKey;
+  const deletePublishedDuplicate = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${duplicatePublishedPublicId}`,
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+        method: "DELETE",
+      }
+    )
+  );
+  expect(deletePublishedDuplicate.status).toBe(200);
+  expect(await objectExists(duplicatePublishedObjectKey)).toBe(false);
+  expect(await objectExists(publishedContractBefore.objectKey)).toBe(true);
+  expect(
+    (
+      await app.handle(
+        new Request(
+          `http://test.local/api/admin/forms/${duplicatePublishedPublicId}`,
+          {
+            headers: { Authorization: `Bearer ${adminBearer}` },
+          }
+        )
+      )
+    ).status
+  ).toBe(404);
+
+  const draftDuplicateSourceResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      description: "Ticket 11 draft source",
+      source: "blank",
+      title: "Ticket 11 draft source",
+    })
+  );
+  expect(draftDuplicateSourceResponse.status).toBe(200);
+  const draftDuplicateSourceBody =
+    (await draftDuplicateSourceResponse.json()) as {
+      form?: { publicId?: string };
+    };
+  const draftDuplicateSourcePublicId = draftDuplicateSourceBody.form?.publicId;
+  if (!draftDuplicateSourcePublicId) {
+    throw new Error("The draft duplicate source was not created");
+  }
+  const draftDuplicateSource = await prisma.form.findUniqueOrThrow({
+    include: { templateDraft: true },
+    where: { publicId: draftDuplicateSourcePublicId },
+  });
+  if (!draftDuplicateSource.templateDraft) {
+    throw new Error("The draft duplicate source has no Template Draft");
+  }
+  const draftDuplicateResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${draftDuplicateSourcePublicId}/duplicate`,
+      {
+        body: "{}",
+        headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+        method: "POST",
+      }
+    )
+  );
+  expect(draftDuplicateResponse.status).toBe(200);
+  const draftDuplicateBody = (await draftDuplicateResponse.json()) as {
+    form?: { publicId?: string; status?: string; title?: string };
+  };
+  const draftDuplicatePublicId = draftDuplicateBody.form?.publicId;
+  if (!draftDuplicatePublicId) {
+    throw new Error("The draft Form duplicate was not created");
+  }
+  expect(draftDuplicateBody.form).toMatchObject({
+    status: "draft",
+    title: "Ticket 11 draft source",
+  });
+  const draftDuplicate = await prisma.form.findUniqueOrThrow({
+    include: { templateDraft: true },
+    where: { publicId: draftDuplicatePublicId },
+  });
+  if (!draftDuplicate.templateDraft) {
+    throw new Error("The draft Form duplicate has no Template Draft");
+  }
+  expect(
+    Buffer.from(await readObject(draftDuplicate.templateDraft.objectKey))
+  ).toEqual(
+    Buffer.from(await readObject(draftDuplicateSource.templateDraft.objectKey))
+  );
+  const draftDuplicateObjectKey = draftDuplicate.templateDraft.objectKey;
+  expect(
+    (
+      await app.handle(
+        new Request(
+          `http://test.local/api/admin/forms/${draftDuplicatePublicId}`,
+          {
+            headers: { Authorization: `Bearer ${adminBearer}` },
+            method: "DELETE",
+          }
+        )
+      )
+    ).status
+  ).toBe(200);
+  expect(await objectExists(draftDuplicateObjectKey)).toBe(false);
+  expect(
+    (
+      await app.handle(
+        new Request(
+          `http://test.local/api/admin/forms/${draftDuplicateSourcePublicId}`,
+          {
+            headers: { Authorization: `Bearer ${adminBearer}` },
+            method: "DELETE",
+          }
+        )
+      )
+    ).status
+  ).toBe(200);
   const draftMetadataCreateResponse = await app.handle(
     formCreationRequest({
       authorization: adminBearer,
@@ -4425,7 +4781,8 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         : null;
     expect(
       Object.keys(metadata ?? {}).every(
-        (key) => key === "errorCode" || key === "source"
+        (key) =>
+          key === "errorCode" || key === "source" || key === "sourcePublicId"
       )
     ).toBe(true);
   }

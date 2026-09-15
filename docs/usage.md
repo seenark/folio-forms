@@ -242,7 +242,7 @@ Editor หนึ่งรายการมี Admin แก้ไขได้ค
 6. กด **Publish** เมื่อ Template พร้อม
 7. กด **คัดลอกลิงก์** เพื่อส่งให้ User
 
-การ Publish สำเร็จจะสร้าง Published Template, Field Manifest และ Prefill Configuration เพียงชุดเดียวต่อ Form พร้อม Public ID แบบ opaque ที่ระบบสร้างให้เอง เอกสารและสัญญา Field/Prefill จะ immutable: Save และ Publish ไม่สามารถแทนที่หรือแก้โครงสร้างเดิมใน Form เดิมได้ หากต้องเปลี่ยนโครงสร้างหรือ policy ให้สร้าง Form ใหม่และใช้ Share Link ใหม่
+การ Publish สำเร็จจะสร้าง Published Template, Field Manifest และ Prefill Configuration เพียงชุดเดียวต่อ Form พร้อม Public ID แบบ opaque ที่ระบบสร้างให้เอง เอกสารและสัญญา Field/Prefill จะ immutable: Save และ Publish ไม่สามารถแทนที่หรือแก้โครงสร้างเดิมใน Form เดิมได้ หากต้องเปลี่ยนโครงสร้างหรือ policy ให้สร้าง Form ใหม่และใช้ Share Link ใหม่ หลัง Publish Admin ยังแก้เฉพาะชื่อและคำอธิบายได้ โดย Public ID, Published DOCX, Field Manifest และ Prefill Configuration เดิมจะไม่เปลี่ยน หากต้องแก้โครงสร้างหรือ Required/Prefill policy ให้กด **Duplicate Form** เพื่อสร้าง Draft ใหม่พร้อม DOCX และกฎที่เป็นอิสระ ใช้ Public ID ใหม่ และไม่คัดลอก Response, Submission, Operation, Lease หรือประวัติ Audit จากต้นฉบับ แบบฟอร์มที่ Publish แล้วลบถาวรหรือเปลี่ยนกลับเป็น Draft ไม่ได้
 
 Form ที่ยังเป็น `Draft`, ไม่เคย Publish และไม่มี Response เท่านั้นที่ลบแบบถาวรได้ การลบจะล้าง Template Draft และ Object ที่เกี่ยวข้อง แต่ Form สถานะอื่นใช้เส้นทางนี้ไม่ได้
 

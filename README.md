@@ -171,7 +171,7 @@ Each privileged account attempt appends an immutable Audit Event with its actor,
 8. Copy the generated share link.
 9. Review submitted responses from the form's **View submissions** page.
 
-The Admin Form list shows lifecycle state plus active Draft and Submission counts without exposing database IDs or RustFS object keys. Only a never-published Draft with no Response data can be hard-deleted; deletion removes its Template Draft objects. Create, save, and delete outcomes append attributable, secret-free Form Audit Events.
+The Admin Form list shows lifecycle state plus active Draft and Submission counts without exposing database IDs or RustFS object keys. Only a never-published Draft with no Response data can be hard-deleted; deletion removes its Template Draft objects. Create, save, and delete outcomes append attributable, secret-free Form Audit Events. Published Forms keep the same opaque share ID, Published Template, Field Manifest, and Prefill Configuration when an Admin changes only the title or description. Structural or policy changes use **Duplicate Form** instead: the source DOCX and rules are copied into a new editable Draft with a new share ID, while Responses, Submissions, Operations, Leases, and source Audit Events remain with the source. The duplicate can be edited or deleted independently; a Published Form cannot be hard-deleted or returned to Draft.
 
 Publishing:
 
