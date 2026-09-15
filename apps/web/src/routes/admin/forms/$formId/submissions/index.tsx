@@ -122,6 +122,6 @@ const SubmissionsRoute = () => {
   );
 };
 
-export const Route = createFileRoute(
-  "/admin/forms/$formId/submissions/"
-)({ component: SubmissionsRoute });
+export const Route = createFileRoute("/admin/forms/$formId/submissions/")({
+  component: SubmissionsRoute,
+});

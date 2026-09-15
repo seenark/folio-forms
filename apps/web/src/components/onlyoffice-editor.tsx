@@ -576,6 +576,7 @@ export const OnlyOfficeEditor = ({
       }
     };
 
+    // oxlint-disable-next-line complexity -- Dispatches the trusted bridge protocol and capability renewal in one handler.
     const handleBridgeMessage = (event: MessageEvent<unknown>) => {
       if (event.origin !== pluginOrigin) {
         return;

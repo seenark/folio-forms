@@ -642,8 +642,8 @@ const FormEditorRoute = () => {
           </p>
         </div>
         <Link
-          to="/admin/forms/$formId/submissions"
-          params={{ formId: publicId }}
+          to="/admin/results"
+          search={{ form: publicId }}
           className="inline-flex items-center gap-2 text-sm font-semibold underline underline-offset-4"
         >
           ดูคำตอบ <ExternalLink size={15} />

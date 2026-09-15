@@ -1,4 +1,4 @@
-// oxlint-disable func-style sort-keys no-implicit-globals no-unused-vars consistent-function-scoping complexity prefer-named-capture-group require-unicode-regexp avoid-new prefer-await-to-callbacks no-empty-function no-useless-return logical-assignment-operators no-useless-spread no-await-in-loop prefer-await-to-then
+// oxlint-disable func-style sort-keys no-implicit-globals no-unused-vars consistent-function-scoping complexity prefer-named-capture-group require-unicode-regexp avoid-new prefer-await-to-callbacks no-empty-function no-useless-return logical-assignment-operators no-useless-spread no-await-in-loop prefer-await-to-then prefer-dom-node-remove no-plusplus prefer-spread -- Plugin runs inside the constrained ONLYOFFICE host runtime.
 const ACTIONS = Object.freeze({
   CONFIGURE_FIELDS: "configure-fields",
   DRAFT: "draft",

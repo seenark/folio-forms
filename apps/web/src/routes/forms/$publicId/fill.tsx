@@ -81,6 +81,7 @@ interface PublicForm {
   description?: string;
 }
 
+// oxlint-disable-next-line complexity -- Coordinates the public form editor, draft lifecycle, and exit confirmation.
 const FillRoute = () => {
   const { publicId } = useParams({ from: "/forms/$publicId/fill" });
   const { responseId } = useSearch({ from: "/forms/$publicId/fill" });
@@ -258,8 +259,16 @@ const FillRoute = () => {
     return () => {
       cancelled = true;
     };
-  }, [activeResponseId, authLoading, editorConfigUrl, form, publicId, startAttempt, user]);
-
+  }, [
+    activeResponseId,
+    authLoading,
+    editorConfigUrl,
+    form,
+    publicId,
+    startAttempt,
+    user,
+  ]);
+  // oxlint-disable-next-line complexity -- Applies bridge updates, operation state, and save/export transitions.
   const handleBridgeMessage = async (message: EditorBridgeMessage) => {
     if (message.type === "dirty-state") {
       setDirty(message.dirty);

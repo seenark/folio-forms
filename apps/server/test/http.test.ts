@@ -4876,6 +4876,176 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       },
     ],
   });
+  const paginationUsers = Array.from({ length: 26 }, (_, index) => ({
+    email: `ticket20-pagination-${String(index).padStart(2, "0")}@example.com`,
+    id: `ticket20-pagination-${String(index).padStart(2, "0")}`,
+    name: `Ticket 20 pagination ${index}`,
+  }));
+  const [firstPaginationUser] = paginationUsers;
+  if (!firstPaginationUser) {
+    throw new Error("The pagination fixture user was not created");
+  }
+  await prisma.user.createMany({ data: paginationUsers });
+  await prisma.response.createMany({
+    data: paginationUsers.map((paginationUser, index) => ({
+      createdAt: new Date(2020, 0, index + 1),
+      draftDocumentKey: `responses/pagination-${index}/draft/document.docx`,
+      draftObjectKey: `responses/pagination-${index}/draft/object.docx`,
+      formId,
+      publishedTemplateId: publishedManifestRecord.id,
+      publishedVersion: publishedManifestRecord.version,
+      updatedAt: new Date(2020, 0, index + 1),
+      userId: paginationUser.id,
+    })),
+  });
+  const paginatedResultsFirstResponse = await app.handle(
+    new Request("http://test.local/api/admin/results", {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(paginatedResultsFirstResponse.status).toBe(200);
+  const paginatedResultsFirstBody =
+    (await paginatedResultsFirstResponse.json()) as {
+      nextCursor: string | null;
+      results: { id: string }[];
+    };
+  expect(paginatedResultsFirstBody.results).toHaveLength(25);
+  expect(paginatedResultsFirstBody.nextCursor).toEqual(expect.any(String));
+  const paginatedResultsSecondResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results?cursor=${encodeURIComponent(paginatedResultsFirstBody.nextCursor as string)}`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(paginatedResultsSecondResponse.status).toBe(200);
+  const paginatedResultsSecondBody =
+    (await paginatedResultsSecondResponse.json()) as {
+      nextCursor: string | null;
+      results: { id: string }[];
+    };
+  expect(paginatedResultsSecondBody.results.length).toBeGreaterThan(0);
+  expect(
+    new Set([
+      ...paginatedResultsFirstBody.results.map((result) => result.id),
+      ...paginatedResultsSecondBody.results.map((result) => result.id),
+    ]).size
+  ).toBe(
+    paginatedResultsFirstBody.results.length +
+      paginatedResultsSecondBody.results.length
+  );
+  const filteredPaginationResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results?form=${formRecord.publicId}&user=${encodeURIComponent(firstPaginationUser.email)}&state=draft&correction=0`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(filteredPaginationResponse.status).toBe(200);
+  expect(await filteredPaginationResponse.json()).toMatchObject({
+    nextCursor: null,
+    results: [
+      {
+        formPublicId: formRecord.publicId,
+        state: "draft",
+        userEmail: firstPaginationUser.email,
+      },
+    ],
+  });
+  const excludedPaginationResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results?form=${formRecord.publicId}&user=${encodeURIComponent(firstPaginationUser.email)}&state=submitted`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(excludedPaginationResponse.status).toBe(200);
+  expect(await excludedPaginationResponse.json()).toEqual({
+    nextCursor: null,
+    results: [],
+  });
+  const adminDraftResultsResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results?form=${formRecord.publicId}&user=${encodeURIComponent(userEmail)}&state=draft&correction=0&from=2020-01-01T00:00:00.000Z&to=2030-01-01T00:00:00.000Z`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(adminDraftResultsResponse.status).toBe(200);
+  const adminDraftResultsBody = (await adminDraftResultsResponse.json()) as {
+    nextCursor: string | null;
+    results: Record<string, unknown>[];
+  };
+  await prisma.response.deleteMany({
+    where: {
+      userId: {
+        in: paginationUsers.map((paginationUser) => paginationUser.id),
+      },
+    },
+  });
+  await prisma.user.deleteMany({
+    where: {
+      id: { in: paginationUsers.map((paginationUser) => paginationUser.id) },
+    },
+  });
+  expect(adminDraftResultsBody).toMatchObject({
+    nextCursor: null,
+    results: [
+      {
+        formPublicId: formRecord.publicId,
+        id: responseId,
+        latestCorrectionNumber: null,
+        state: "draft",
+        userEmail,
+      },
+    ],
+  });
+  const adminDraftDetailResponse = await app.handle(
+    new Request(`http://test.local/api/admin/results/${responseId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(adminDraftDetailResponse.status).toBe(200);
+  const adminDraftDetailBody = (await adminDraftDetailResponse.json()) as {
+    result: Record<string, unknown>;
+  };
+  expect(adminDraftDetailBody.result).toMatchObject({
+    data: savedDraftData,
+    document: { available: true, state: "draft" },
+    id: responseId,
+    state: "draft",
+  });
+  expect(JSON.stringify(adminDraftDetailBody)).not.toContain("draftObjectKey");
+  const adminDraftExportResponse = await app.handle(
+    new Request(`http://test.local/api/responses/${responseId}/draft/json`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(adminDraftExportResponse.status).toBe(403);
+  const userResultsResponse = await app.handle(
+    new Request("http://test.local/api/admin/results", {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(userResultsResponse.status).toBe(403);
+  const invalidAdminResultsCursor = await app.handle(
+    new Request("http://test.local/api/admin/results?cursor=not-a-cursor", {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(invalidAdminResultsCursor.status).toBe(400);
+  const draftViewAudit = await prisma.auditEvent.findFirstOrThrow({
+    orderBy: { createdAt: "desc" },
+    where: {
+      action: "view_response",
+      actorId: adminId,
+      targetId: responseId,
+      targetType: "response",
+    },
+  });
+  expect(draftViewAudit).toMatchObject({
+    outcome: "success",
+    safeMetadata: { state: "draft" },
+  });
+  expect(JSON.stringify(draftViewAudit.safeMetadata)).toBe(
+    JSON.stringify({ state: "draft" })
+  );
   const draftResponseBeforeExport = await prisma.response.findUnique({
     select: { draftData: true, draftObjectKey: true },
     where: { id: responseId },
@@ -5373,6 +5543,53 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     `attachment; filename="submission-${completedSubmissionId}.pdf"`
   );
   expect(await adminPdfResponse.text()).toBe("%PDF-test");
+  const adminSubmittedResultsResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results?form=${formRecord.publicId}&state=submitted`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(adminSubmittedResultsResponse.status).toBe(200);
+  expect(await adminSubmittedResultsResponse.json()).toMatchObject({
+    results: [
+      {
+        formPublicId: formRecord.publicId,
+        id: responseId,
+        latestCorrectionNumber: null,
+        state: "submitted",
+        submissionId: completedSubmissionId,
+      },
+    ],
+  });
+  const adminSubmittedDetailResponse = await app.handle(
+    new Request(`http://test.local/api/admin/results/${responseId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(adminSubmittedDetailResponse.status).toBe(200);
+  expect(await adminSubmittedDetailResponse.json()).toMatchObject({
+    result: {
+      data: savedDraftData,
+      document: { available: true, state: "submission" },
+      id: responseId,
+      state: "submitted",
+      submissionId: completedSubmissionId,
+    },
+  });
+  const exportAudits = await prisma.auditEvent.findMany({
+    orderBy: { createdAt: "asc" },
+    where: {
+      action: "export_response",
+      actorId: adminId,
+      targetId: completedSubmissionId,
+      targetType: "submission",
+    },
+  });
+  expect(exportAudits.map((audit) => audit.safeMetadata)).toEqual([
+    { format: "json", state: "submitted" },
+    { format: "docx", state: "submitted" },
+    { format: "pdf", state: "submitted" },
+  ]);
   const stableSubmissionBeforeConversion = await prisma.submission.findUnique({
     select: {
       data: true,

@@ -45,6 +45,7 @@ const currentReturnPath = () => {
   return safeReturnPath(`${window.location.pathname}${window.location.search}`);
 };
 
+// oxlint-disable-next-line complexity -- Coordinates session expiry, reauthentication, and routing in the app shell.
 const AuthGate = () => {
   const { expiresAt, loading, signOut, user } = useAuth();
   const location = useLocation();

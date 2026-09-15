@@ -1,5 +1,6 @@
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 import {
+  ClipboardList,
   FilePlus2,
   FileText,
   KeyRound,
@@ -26,6 +27,7 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
   const formsAreActive =
     location.pathname === "/admin" ||
     location.pathname.startsWith("/admin/forms/");
+  const resultsAreActive = location.pathname.startsWith("/admin/results");
 
   const logout = async () => {
     if (loggingOut) {
@@ -92,6 +94,20 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
                   onClick={() => setOpen(false)}
                 >
                   แบบฟอร์ม
+                </Link>
+                <Link
+                  to="/admin/results"
+                  search={{ form: undefined }}
+                  className={`rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] ${
+                    resultsAreActive
+                      ? "bg-[var(--accent-soft)] text-[var(--ink)]"
+                      : ""
+                  }`}
+                  aria-current={resultsAreActive ? "page" : undefined}
+                  onClick={() => setOpen(false)}
+                >
+                  <ClipboardList className="mr-1 inline" size={15} />
+                  ผลลัพธ์
                 </Link>
                 <Link
                   to="/admin/users"

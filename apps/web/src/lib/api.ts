@@ -92,6 +92,33 @@ export interface Submission {
   submittedAt?: string;
   updatedAt?: string;
 }
+export type AdminResultState = "draft" | "submitted";
+export interface AdminResult {
+  createdAt: string;
+  formPublicId: string;
+  formTitle: string;
+  id: string;
+  latestCorrectionNumber: number | null;
+  state: AdminResultState;
+  submissionId: string | null;
+  submittedAt: string | null;
+  updatedAt: string;
+  userEmail: string;
+}
+export interface AdminResultListResponse {
+  nextCursor: string | null;
+  results: AdminResult[];
+}
+export interface AdminResultDetail extends AdminResult {
+  data: Record<string, unknown>;
+  document: {
+    available: boolean;
+    state: "draft" | "submission";
+  };
+}
+export interface AdminResultDetailResponse {
+  result: AdminResultDetail;
+}
 export interface Operation {
   id: string;
   status: "pending" | "processing" | "completed" | "failed";
@@ -153,6 +180,7 @@ const errorCodeFor = (
   return fallback;
 };
 
+// oxlint-disable-next-line complexity -- Rejects malformed return paths at every URL decoding boundary.
 export const safeReturnPath = (value: unknown): string | null => {
   if (
     typeof value !== "string" ||

@@ -138,6 +138,7 @@ const fieldPointerMaximumLength = 2048;
 const schemaPageSize = 5;
 const schemaQueryMaximumLength = 200;
 const accountUserPageSize = 20;
+const adminResultPageSize = 25;
 const accountBodyMaximumBytes = 64 * 1024;
 const documentActionBodyMaximumBytes = 8 * 1024;
 const accountEmailMaximumLength = 254;
@@ -1878,6 +1879,57 @@ function queryString(record: JsonRecord, key: string): string | undefined {
   }
   return value;
 }
+interface AdminResultCursor {
+  id: string;
+  updatedAt: Date;
+}
+
+function adminResultCursor(
+  value: string | undefined
+): AdminResultCursor | null {
+  if (value === undefined) {
+    return null;
+  }
+  try {
+    const decoded = JSON.parse(
+      Buffer.from(value, "base64url").toString("utf-8")
+    ) as { id?: unknown; updatedAt?: unknown };
+    if (
+      typeof decoded.id !== "string" ||
+      !idPattern.test(decoded.id) ||
+      typeof decoded.updatedAt !== "string"
+    ) {
+      fail(400, "invalid_request", "cursor is invalid");
+    }
+    const updatedAt = new Date(decoded.updatedAt);
+    if (!Number.isFinite(updatedAt.getTime())) {
+      fail(400, "invalid_request", "cursor is invalid");
+    }
+    return { id: decoded.id, updatedAt };
+  } catch {
+    fail(400, "invalid_request", "cursor is invalid");
+  }
+}
+
+function adminResultCursorValue(result: {
+  id: string;
+  updatedAt: Date;
+}): string {
+  return Buffer.from(
+    JSON.stringify({ id: result.id, updatedAt: result.updatedAt.toISOString() })
+  ).toString("base64url");
+}
+
+function adminResultDate(value: string | undefined, key: string): Date | null {
+  if (value === undefined) {
+    return null;
+  }
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    fail(400, "invalid_request", `${key} is invalid`);
+  }
+  return date;
+}
 function normalizedAccountEmail(value: string): string {
   const email = normalizeEmail(value);
   if (
@@ -2162,6 +2214,39 @@ async function createFormFailureAudit({
     },
   });
 }
+type ResponseAuditAction = "export_response" | "view_response";
+type ResponseAuditTargetType = "response" | "submission";
+interface ResponseAuditMetadata {
+  format?: "docx" | "json" | "pdf";
+  state: "draft" | "submitted";
+}
+
+async function createResponseAudit({
+  action,
+  actorId,
+  outcome,
+  safeMetadata,
+  targetId,
+  targetType,
+}: {
+  action: ResponseAuditAction;
+  actorId: string;
+  outcome: AuditOutcome;
+  safeMetadata: ResponseAuditMetadata;
+  targetId: string;
+  targetType: ResponseAuditTargetType;
+}): Promise<void> {
+  await prisma.auditEvent.create({
+    data: {
+      action,
+      actorId,
+      outcome,
+      safeMetadata: jsonValue(safeMetadata),
+      targetId,
+      targetType,
+    },
+  });
+}
 
 interface FormCounts {
   activeDraftCount: number;
@@ -2230,6 +2315,30 @@ function submissionSummary(
   };
 }
 
+function adminResultSummary(response: {
+  corrections: { revision: number }[];
+  createdAt: Date;
+  form: { publicId: string; title: string };
+  id: string;
+  owner: { email: string };
+  status: ResponseStatus;
+  submission: { createdAt: Date; id: string } | null;
+  updatedAt: Date;
+}): JsonRecord {
+  const submitted = response.status === ResponseStatus.submitted;
+  return {
+    createdAt: response.createdAt,
+    formPublicId: response.form.publicId,
+    formTitle: response.form.title,
+    id: response.id,
+    latestCorrectionNumber: response.corrections[0]?.revision ?? null,
+    state: submitted ? "submitted" : "draft",
+    submissionId: response.submission?.id ?? null,
+    submittedAt: response.submission?.createdAt ?? null,
+    updatedAt: response.updatedAt,
+    userEmail: response.owner.email,
+  };
+}
 async function findTemplateSource(): Promise<string | null> {
   const configuredSource = Bun.file(env.TEMPLATE_PATH);
   if (await configuredSource.exists()) {
@@ -7575,6 +7684,160 @@ export function createApp(options: AppOptions = {}) {
         };
       }
     )
+    .get("/api/admin/results", async ({ request, query }) => {
+      const identity = await requireIdentity(request);
+      requireAdmin(identity);
+      const queryRecord = query as unknown as JsonRecord;
+      const cursor = adminResultCursor(queryString(queryRecord, "cursor"));
+      const formPublicId = queryString(queryRecord, "form");
+      const userQuery = queryString(queryRecord, "user");
+      const state = queryString(queryRecord, "state");
+      const from = adminResultDate(queryString(queryRecord, "from"), "from");
+      const to = adminResultDate(queryString(queryRecord, "to"), "to");
+      const correctionQuery = queryString(queryRecord, "correction");
+      let correction: number | undefined;
+      if (correctionQuery !== undefined) {
+        correction = Number(correctionQuery);
+        if (
+          !Number.isInteger(correction) ||
+          correction < 0 ||
+          correction > 10_000
+        ) {
+          fail(400, "invalid_request", "correction is invalid");
+        }
+      }
+      if (formPublicId !== undefined && !publicIdPattern.test(formPublicId)) {
+        fail(400, "invalid_request", "form is invalid");
+      }
+      if (state !== undefined && state !== "draft" && state !== "submitted") {
+        fail(400, "invalid_request", "state is invalid");
+      }
+      const and: Prisma.ResponseWhereInput[] = [];
+      if (cursor) {
+        and.push({
+          OR: [
+            { updatedAt: { lt: cursor.updatedAt } },
+            { id: { lt: cursor.id }, updatedAt: cursor.updatedAt },
+          ],
+        });
+      }
+      if (formPublicId) {
+        and.push({ form: { publicId: formPublicId } });
+      }
+      if (userQuery) {
+        and.push({ owner: { email: { contains: normalizeEmail(userQuery) } } });
+      }
+      if (state === "draft") {
+        and.push({
+          status: { in: [ResponseStatus.draft, ResponseStatus.submitting] },
+        });
+      } else if (state === "submitted") {
+        and.push({ status: ResponseStatus.submitted });
+      }
+      if (from || to) {
+        and.push({
+          updatedAt: {
+            ...(from ? { gte: from } : {}),
+            ...(to ? { lte: to } : {}),
+          },
+        });
+      }
+      if (correction !== undefined) {
+        and.push(
+          correction === 0
+            ? { corrections: { none: {} } }
+            : { corrections: { some: { revision: correction } } },
+          { corrections: { none: { revision: { gt: correction } } } }
+        );
+      }
+      const responses = await prisma.response.findMany({
+        include: {
+          corrections: {
+            orderBy: { revision: "desc" },
+            select: { revision: true },
+            take: 1,
+          },
+          form: { select: { publicId: true, title: true } },
+          owner: { select: { email: true } },
+          submission: { select: { createdAt: true, id: true } },
+        },
+        orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
+        take: adminResultPageSize + 1,
+        where: and.length > 0 ? { AND: and } : {},
+      });
+      const page = responses.slice(0, adminResultPageSize);
+      return {
+        nextCursor:
+          responses.length > adminResultPageSize
+            ? adminResultCursorValue(page.at(-1) as (typeof page)[number])
+            : null,
+        results: page.map(adminResultSummary),
+      };
+    })
+    .get("/api/admin/results/:id", async ({ request, params }) => {
+      const identity = await requireIdentity(request);
+      requireAdmin(identity);
+      validateId(params.id, "Response");
+      const response = await prisma.response.findUnique({
+        include: {
+          corrections: {
+            orderBy: { revision: "desc" },
+            select: { revision: true },
+            take: 1,
+          },
+          form: { select: { publicId: true, title: true } },
+          owner: { select: { email: true } },
+          submission: {
+            select: {
+              createdAt: true,
+              data: true,
+              documentKey: true,
+              id: true,
+              objectKey: true,
+            },
+          },
+        },
+        where: { id: params.id },
+      });
+      if (!response) {
+        fail(404, "not_found", "Response was not found");
+      }
+      const submitted = response.status === ResponseStatus.submitted;
+      await createResponseAudit({
+        action: "view_response",
+        actorId: identity.id,
+        outcome: AuditOutcome.success,
+        safeMetadata: { state: submitted ? "submitted" : "draft" },
+        targetId: response.id,
+        targetType: "response",
+      });
+      const documentAvailable = submitted
+        ? Boolean(
+            response.submission?.documentKey && response.submission.objectKey
+          )
+        : Boolean(response.draftDocumentKey && response.draftObjectKey);
+      return {
+        result: {
+          createdAt: response.createdAt,
+          data: submitted
+            ? jsonRecord(response.submission?.data ?? {})
+            : jsonRecord(response.draftData ?? {}),
+          document: {
+            available: documentAvailable,
+            state: submitted ? "submission" : "draft",
+          },
+          formPublicId: response.form.publicId,
+          formTitle: response.form.title,
+          id: response.id,
+          latestCorrectionNumber: response.corrections[0]?.revision ?? null,
+          state: submitted ? "submitted" : "draft",
+          submissionId: response.submission?.id ?? null,
+          submittedAt: response.submission?.createdAt ?? null,
+          updatedAt: response.updatedAt,
+          userEmail: response.owner.email,
+        },
+      };
+    })
     .get("/api/forms/:publicId", async ({ params, request }) => {
       const identity = await requireIdentity(request);
       const form = await findFormByPublicId(params.publicId);
@@ -7763,7 +8026,6 @@ export function createApp(options: AppOptions = {}) {
       let unusedDraftObjectKey: string | undefined;
       try {
         await putObject(draftObjectKey, document, DOCX_CONTENT_TYPE);
-
         const response = await prisma.$transaction(
           async (tx) => {
             const [lockedFormRow] = await tx.$queryRaw<{ id: string }[]>(
@@ -8429,6 +8691,16 @@ export function createApp(options: AppOptions = {}) {
         fail(404, "not_found", "Submission was not found");
       }
       canReadSubmission(identity, submission);
+      if (identity.role === "admin") {
+        await createResponseAudit({
+          action: "view_response",
+          actorId: identity.id,
+          outcome: AuditOutcome.success,
+          safeMetadata: { state: "submitted" },
+          targetId: submission.responseId,
+          targetType: "submission",
+        });
+      }
       return {
         data: jsonRecord(submission.data),
         returnUrl: prefillReturnUrl,
@@ -8450,6 +8722,16 @@ export function createApp(options: AppOptions = {}) {
         fail(404, "not_found", "Submission was not found");
       }
       canReadSubmission(identity, submission);
+      if (identity.role === "admin") {
+        await createResponseAudit({
+          action: "export_response",
+          actorId: identity.id,
+          outcome: AuditOutcome.success,
+          safeMetadata: { format: "json", state: "submitted" },
+          targetId: submission.id,
+          targetType: "submission",
+        });
+      }
       return Response.json(jsonRecord(submission.data), {
         headers: {
           "Content-Disposition": `attachment; filename="submission-${submission.id}.json"`,
@@ -8470,6 +8752,16 @@ export function createApp(options: AppOptions = {}) {
       if (!(await objectExists(submission.objectKey))) {
         fail(404, "not_found", "Submission document was not found");
       }
+      if (identity.role === "admin") {
+        await createResponseAudit({
+          action: "export_response",
+          actorId: identity.id,
+          outcome: AuditOutcome.success,
+          safeMetadata: { format: "docx", state: "submitted" },
+          targetId: submission.id,
+          targetType: "submission",
+        });
+      }
       return new Response(streamObject(submission.objectKey), {
         headers: {
           "Content-Disposition": `attachment; filename="submission-${submission.id}.docx"`,
@@ -8488,6 +8780,16 @@ export function createApp(options: AppOptions = {}) {
       }
       canReadSubmission(identity, submission);
       const pdf = await onlyOffice.convertDocxToPdf(submission.documentKey);
+      if (identity.role === "admin") {
+        await createResponseAudit({
+          action: "export_response",
+          actorId: identity.id,
+          outcome: AuditOutcome.success,
+          safeMetadata: { format: "pdf", state: "submitted" },
+          targetId: submission.id,
+          targetType: "submission",
+        });
+      }
       set.headers["Content-Type"] = "application/pdf";
       set.headers["Content-Disposition"] =
         `attachment; filename="submission-${submission.id}.pdf"`;
