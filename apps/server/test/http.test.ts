@@ -1380,7 +1380,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
           prefillPointer: selectedPointer,
           prefillPolicy: "editable",
           previousTag: "ticket-09-renamed",
-          required: false,
+          required: true,
           tag: "full_name",
         }),
         headers: configureHeaders,
@@ -1393,10 +1393,30 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     rule: {
       prefillPointer: selectedPointer,
       prefillPolicy: "editable",
-      required: false,
+      required: true,
       tag: "full_name",
     },
   });
+  for (const requiredTag of ["accept_terms", "department", "start_date"]) {
+    const requiredRuleResponse = await app.handle(
+      new Request(
+        `http://test.local/api/admin/forms/${formPublicId}/field-rules`,
+        {
+          body: JSON.stringify({
+            documentKey: templateDocumentKey,
+            prefillPointer: null,
+            prefillPolicy: "editable",
+            previousTag: null,
+            required: true,
+            tag: requiredTag,
+          }),
+          headers: configureHeaders,
+          method: "PATCH",
+        }
+      )
+    );
+    expect(requiredRuleResponse.status).toBe(200);
+  }
 
   expect(
     Math.abs(
@@ -1919,7 +1939,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       pictureMaxHeight: null,
       pictureMaxWidth: null,
       prefillPolicy: "editable",
-      required: false,
+      required: true,
       tag: "accept_terms",
       type: "checkbox",
     },
@@ -1936,7 +1956,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       pictureMaxHeight: null,
       pictureMaxWidth: null,
       prefillPolicy: "editable",
-      required: false,
+      required: true,
       tag: "department",
       type: "dropdown",
     },
@@ -1972,7 +1992,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       pictureMaxHeight: null,
       pictureMaxWidth: null,
       prefillPolicy: "editable",
-      required: false,
+      required: true,
       tag: "full_name",
       type: "text",
     },
@@ -1984,7 +2004,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       pictureMaxHeight: null,
       pictureMaxWidth: null,
       prefillPolicy: "editable",
-      required: false,
+      required: true,
       tag: "start_date",
       type: "date",
     },
@@ -2312,9 +2332,18 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       )
     )
   );
-  expect(concurrentStarts.some((response) => response.status === 200)).toBe(
+  expect(concurrentStarts.every((response) => response.status === 200)).toBe(
     true
   );
+  const concurrentStartBodies = (await Promise.all(
+    concurrentStarts.map((response) => response.json())
+  )) as { response?: { id?: string } }[];
+  expect(concurrentStartBodies[0]).toMatchObject({
+    response: { id: expect.any(String) },
+  });
+  expect(concurrentStartBodies[1]).toMatchObject({
+    response: { id: concurrentStartBodies[0]?.response?.id },
+  });
   expect(
     await prisma.response.count({ where: { formId, userId: user.id } })
   ).toBe(1);
@@ -2996,6 +3025,31 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     full_name: "Ada Lovelace",
     start_date: "2026-09-15",
   };
+  const submitRequest = (data: Record<string, unknown>, targetApp = app) =>
+    targetApp.handle(
+      new Request(`http://test.local/api/forms/${formRecord.publicId}/submit`, {
+        body: JSON.stringify({
+          data,
+          documentKey: responseDocumentKey,
+          responseId,
+        }),
+        headers: capabilityHeaders(submitCapability),
+        method: "POST",
+      })
+    );
+  const invalidSubmitCases = [
+    { ...savedDraftData, full_name: "" },
+    { ...savedDraftData, accept_terms: false },
+    { ...savedDraftData, department: "not-an-option" },
+    { ...savedDraftData, start_date: "2026-02-30" },
+  ];
+  for (const invalidSubmitData of invalidSubmitCases) {
+    const invalidSubmitResponse = await submitRequest(invalidSubmitData);
+    expect(invalidSubmitResponse.status).toBe(422);
+    expect(await invalidSubmitResponse.json()).toMatchObject({
+      error: "invalid_response_data",
+    });
+  }
 
   const saveResponse = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
@@ -3136,18 +3190,55 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       })
     ).status
   ).toBe("completed");
-  const submitResponse = await app.handle(
-    new Request(`http://test.local/api/forms/${formRecord.publicId}/submit`, {
-      body: JSON.stringify({
-        data: savedDraftData,
-        documentKey: responseDocumentKey,
-        responseId,
-      }),
-      headers: capabilityHeaders(submitCapability),
-      method: "POST",
-    })
+  const stableBeforeSubmitFailure = await prisma.response.findUnique({
+    select: { draftData: true, draftObjectKey: true, status: true },
+    where: { id: responseId },
+  });
+  const failedSubmitResponse = await submitRequest(savedDraftData, failureApp);
+  expect(failedSubmitResponse.status).toBe(202);
+  const failedSubmitBody = (await failedSubmitResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!failedSubmitBody.operationCapability || !failedSubmitBody.operationId) {
+    throw new Error("The failed submit operation was not created");
+  }
+  const failedSubmitOperation = await waitForOperation(
+    failedSubmitBody.operationId,
+    { "X-Editor-Capability": failedSubmitBody.operationCapability }
   );
-  expect(submitResponse.status).toBe(202);
+  expect(failedSubmitOperation).toMatchObject({
+    error: "force_save_failed",
+    status: "failed",
+  });
+  expect(
+    await prisma.response.findUnique({
+      select: { draftData: true, draftObjectKey: true, status: true },
+      where: { id: responseId },
+    })
+  ).toEqual(stableBeforeSubmitFailure);
+  expect(await prisma.submission.count({ where: { responseId } })).toBe(0);
+
+  const concurrentSubmitResponses = await Promise.all([
+    submitRequest(savedDraftData),
+    submitRequest(savedDraftData),
+  ]);
+  expect(
+    concurrentSubmitResponses.filter((response) => response.status === 202)
+  ).toHaveLength(1);
+  const rejectedSubmitResponses = concurrentSubmitResponses.filter(
+    (response) => response.status === 409
+  );
+  expect(rejectedSubmitResponses).toHaveLength(1);
+  expect(await rejectedSubmitResponses[0]?.json()).toMatchObject({
+    error: "operation_in_progress",
+  });
+  const submitResponse = concurrentSubmitResponses.find(
+    (response) => response.status === 202
+  );
+  if (!submitResponse) {
+    throw new Error("The concurrent submit operation was not created");
+  }
   const submitBody = (await submitResponse.json()) as {
     operationCapability?: string;
     operationId?: string;
@@ -3165,6 +3256,32 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     "X-Editor-Capability": submitBody.operationCapability,
   });
   expect(submitOperation.status).toBe("completed");
+  const repeatStartResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  expect(repeatStartResponse.status).toBe(200);
+  expect(await repeatStartResponse.json()).toMatchObject({
+    receiptUrl: `/receipt/${completedSubmissionId}`,
+    response: {
+      id: responseId,
+      status: "submitted",
+      submissionId: completedSubmissionId,
+    },
+    submissionId: completedSubmissionId,
+  });
+  expect(
+    await prisma.response.count({
+      where: { formId, userId },
+    })
+  ).toBe(1);
+  const immutableDraftResponse = await draftRequest(savedDraftData);
+  expect(immutableDraftResponse.status).toBe(409);
+  expect(await immutableDraftResponse.json()).toMatchObject({
+    error: "stale_response",
+  });
   const submittedCountListResponse = await app.handle(
     new Request("http://test.local/api/admin/forms", {
       headers: { Authorization: `Bearer ${adminBearer}` },
@@ -3220,6 +3337,13 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(forbiddenDocxResponse.status).toBe(403);
+  const forbiddenPdfResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/pdf`,
+      { headers: { Authorization: `Bearer ${otherUserBearer}` } }
+    )
+  );
+  expect(forbiddenPdfResponse.status).toBe(403);
 
   const dataResponse = await app.handle(
     new Request(
@@ -3230,10 +3354,50 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(dataResponse.status).toBe(200);
-  expect(await dataResponse.json()).toMatchObject({
-    data: {},
+  const dataBody = (await dataResponse.json()) as {
+    data: Record<string, unknown>;
+    submission: Record<string, unknown>;
+  };
+  expect(dataBody).toMatchObject({
+    data: savedDraftData,
     submission: { id: completedSubmissionId, responseId },
   });
+  expect(dataBody.submission).not.toHaveProperty("userEmail");
+  const ownerJsonResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/json`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(ownerJsonResponse.status).toBe(200);
+  expect(ownerJsonResponse.headers.get("content-type")).toBe(
+    "application/json; charset=utf-8"
+  );
+  expect(ownerJsonResponse.headers.get("content-disposition")).toBe(
+    `attachment; filename="submission-${completedSubmissionId}.json"`
+  );
+  expect(JSON.parse(await ownerJsonResponse.text())).toEqual(savedDraftData);
+  const adminJsonResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/json`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(adminJsonResponse.status).toBe(200);
+  expect(adminJsonResponse.headers.get("content-type")).toBe(
+    "application/json; charset=utf-8"
+  );
+  expect(adminJsonResponse.headers.get("content-disposition")).toBe(
+    `attachment; filename="submission-${completedSubmissionId}.json"`
+  );
+  expect(JSON.parse(await adminJsonResponse.text())).toEqual(savedDraftData);
+  const forbiddenJsonResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/json`,
+      { headers: { Authorization: `Bearer ${otherUserBearer}` } }
+    )
+  );
+  expect(forbiddenJsonResponse.status).toBe(403);
 
   const docxResponse = await app.handle(
     new Request(
@@ -3242,6 +3406,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         headers: { Authorization: `Bearer ${userBearer}` },
       }
     )
+  );
+  expect(docxResponse.headers.get("content-disposition")).toBe(
+    `attachment; filename="submission-${completedSubmissionId}.docx"`
   );
   expect(docxResponse.status).toBe(200);
   expect(docxResponse.headers.get("content-type")).toBe(DOCX_CONTENT_TYPE);
@@ -3255,6 +3422,18 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   }
   const sourceDocument = await readObject(templateDraft.objectKey);
   expect(submissionDocument).toEqual(Uint8Array.from(sourceDocument));
+  const adminDocxResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/docx`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(adminDocxResponse.status).toBe(200);
+  expect(adminDocxResponse.headers.get("content-type")).toBe(DOCX_CONTENT_TYPE);
+  expect(adminDocxResponse.headers.get("content-disposition")).toBe(
+    `attachment; filename="submission-${completedSubmissionId}.docx"`
+  );
+  await adminDocxResponse.arrayBuffer();
 
   const pdfResponse = await app.handle(
     new Request(
@@ -3265,7 +3444,23 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(pdfResponse.status).toBe(200);
+  expect(pdfResponse.headers.get("content-type")).toBe("application/pdf");
+  expect(pdfResponse.headers.get("content-disposition")).toBe(
+    `attachment; filename="submission-${completedSubmissionId}.pdf"`
+  );
   expect(await pdfResponse.text()).toBe("%PDF-test");
+  const adminPdfResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/pdf`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(adminPdfResponse.status).toBe(200);
+  expect(adminPdfResponse.headers.get("content-type")).toBe("application/pdf");
+  expect(adminPdfResponse.headers.get("content-disposition")).toBe(
+    `attachment; filename="submission-${completedSubmissionId}.pdf"`
+  );
+  expect(await adminPdfResponse.text()).toBe("%PDF-test");
   const stableSubmissionBeforeConversion = await prisma.submission.findUnique({
     select: {
       data: true,

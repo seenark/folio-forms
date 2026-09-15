@@ -1828,6 +1828,7 @@ function responseSummary(
     formPublicId?: string;
     formTitle?: string;
     submissionId?: string | null;
+    submittedAt?: Date | null;
   } = {}
 ): JsonRecord {
   return {
@@ -1839,6 +1840,7 @@ function responseSummary(
     publishedVersion: response.publishedVersion,
     status: response.status,
     submissionId: extra.submissionId,
+    submittedAt: extra.submittedAt,
     updatedAt: response.updatedAt,
   };
 }
@@ -1858,6 +1860,7 @@ function submissionSummary(
     id: submission.id,
     responseId: submission.responseId,
     status: "submitted",
+    submittedAt: submission.createdAt,
     userEmail: extra.userEmail,
     userId: submission.userId,
   };
@@ -5829,13 +5832,23 @@ export function createApp(options: AppOptions = {}) {
       }
 
       const existing = await prisma.response.findUnique({
-        include: { prefillSnapshot: true },
+        include: { prefillSnapshot: true, submission: true },
         where: {
           formId_userId: { formId: form.id, userId: identity.id },
         },
       });
       if (existing?.status === ResponseStatus.submitted) {
-        fail(409, "already_submitted", "You have already submitted this form");
+        if (!existing.submission) {
+          fail(500, "internal_error", "The submitted receipt is unavailable");
+        }
+        return {
+          receiptUrl: `/receipt/${existing.submission.id}`,
+          response: responseSummary(existing, {
+            submissionId: existing.submission.id,
+            submittedAt: existing.submission.createdAt,
+          }),
+          submissionId: existing.submission.id,
+        };
       }
       if (existing?.status === ResponseStatus.submitting) {
         fail(
@@ -5882,6 +5895,7 @@ export function createApp(options: AppOptions = {}) {
       );
       const draftDocumentKey = `response-${responseId}-${crypto.randomUUID()}`;
       const snapshotId = crypto.randomUUID();
+      let unusedDraftObjectKey: string | undefined;
       try {
         await putObject(draftObjectKey, document, DOCX_CONTENT_TYPE);
 
@@ -5918,6 +5932,15 @@ export function createApp(options: AppOptions = {}) {
                 "operation_in_progress",
                 "Your submission is being processed"
               );
+            }
+            if (
+              current?.status === ResponseStatus.draft &&
+              current.publishedVersion === form.version &&
+              current.draftDocumentKey &&
+              current.draftObjectKey
+            ) {
+              unusedDraftObjectKey = draftObjectKey;
+              return current;
             }
             const responseTargetId = current?.id ?? responseId;
             if (!current) {
@@ -5972,10 +5995,10 @@ export function createApp(options: AppOptions = {}) {
         if (!response) {
           fail(500, "start_failed", "Unable to start response");
         }
-        await deleteObjects([existing?.draftObjectKey]);
+        await deleteObjects([existing?.draftObjectKey, unusedDraftObjectKey]);
         return {
-          editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${response.id}&action=fill`,
-          prefill: { data: {}, editableFields: {} },
+          editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${response.id}&action=${response.draftData ? "draft" : "fill"}`,
+          prefill: response.draftData ? null : { data: {}, editableFields: {} },
           response: responseSummary(response),
         };
       } catch (error) {
@@ -6018,6 +6041,7 @@ export function createApp(options: AppOptions = {}) {
             formPublicId: response.form.publicId,
             formTitle: response.form.title,
             submissionId: response.submission?.id,
+            submittedAt: response.submission?.createdAt,
           })
         ),
       };
@@ -6185,60 +6209,72 @@ export function createApp(options: AppOptions = {}) {
           submissionDocumentKey,
           submissionId,
         };
-        const operation = await prisma.$transaction(
-          async (tx) => {
-            await lockActiveEditorLease(tx, authorization, capabilityScope);
-            const activeOperation = await tx.operation.findFirst({
-              where: {
-                responseId: response.id,
-                status: {
-                  in: [OperationStatus.pending, OperationStatus.processing],
+        let operation: Operation;
+        try {
+          operation = await prisma.$transaction(
+            async (tx) => {
+              await lockActiveEditorLease(tx, authorization, capabilityScope);
+              const activeOperation = await tx.operation.findFirst({
+                where: {
+                  responseId: response.id,
+                  status: {
+                    in: [OperationStatus.pending, OperationStatus.processing],
+                  },
+                  targetId: response.id,
+                  targetType: OperationTargetType.response,
                 },
-                targetId: response.id,
-                targetType: OperationTargetType.response,
-              },
-            });
-            if (activeOperation) {
-              fail(
-                409,
-                "operation_in_progress",
-                "Another response operation is already in progress"
-              );
-            }
-            const claimed = await tx.response.updateMany({
-              data: {
-                status: ResponseStatus.submitting,
-                updatedAt: new Date(),
-              },
-              where: { id: response.id, status: ResponseStatus.draft },
-            });
-            if (claimed.count !== 1) {
-              fail(
-                409,
-                "operation_in_progress",
-                "Another response operation is already in progress"
-              );
-            }
-            return tx.operation.create({
-              data: {
-                actorId: identity.id,
-                documentKey,
-                errorCode: null,
-                formId: form.id,
-                metadata: jsonValue(metadata),
-                ownerUserId: identity.id,
-                responseId: response.id,
-                stagingObjectKey: stagedObjectKey,
-                status: OperationStatus.pending,
-                submissionId: null,
-                targetId: response.id,
-                targetType: OperationTargetType.response,
-                type: operationTypeForAction.submit,
-              },
-            });
-          },
-          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
-        );
+              });
+              if (activeOperation) {
+                fail(
+                  409,
+                  "operation_in_progress",
+                  "Another response operation is already in progress"
+                );
+              }
+              const claimed = await tx.response.updateMany({
+                data: {
+                  status: ResponseStatus.submitting,
+                  updatedAt: new Date(),
+                },
+                where: { id: response.id, status: ResponseStatus.draft },
+              });
+              if (claimed.count !== 1) {
+                fail(
+                  409,
+                  "operation_in_progress",
+                  "Another response operation is already in progress"
+                );
+              }
+              return tx.operation.create({
+                data: {
+                  actorId: identity.id,
+                  documentKey,
+                  errorCode: null,
+                  formId: form.id,
+                  metadata: jsonValue(metadata),
+                  ownerUserId: identity.id,
+                  responseId: response.id,
+                  stagingObjectKey: stagedObjectKey,
+                  status: OperationStatus.pending,
+                  submissionId: null,
+                  targetId: response.id,
+                  targetType: OperationTargetType.response,
+                  type: operationTypeForAction.submit,
+                },
+              });
+            },
+            { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+          );
+        } catch (error) {
+          if (databaseErrorCode(error) === "P2034") {
+            fail(
+              409,
+              "operation_in_progress",
+              "Another response operation is already in progress"
+            );
+          }
+          throw error;
+        }
         set.status = 202;
         launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
         return {
@@ -6337,9 +6373,27 @@ export function createApp(options: AppOptions = {}) {
         submission: submissionSummary(submission, {
           formPublicId: submission.form.publicId,
           formTitle: submission.form.title,
-          userEmail: submission.owner.email,
+          userEmail:
+            identity.role === "admin" ? submission.owner.email : undefined,
         }),
       };
+    })
+    .get("/api/submissions/:id/json", async ({ request, params }) => {
+      const identity = await requireIdentity(request);
+      validateId(params.id, "Submission");
+      const submission = await prisma.submission.findUnique({
+        where: { id: params.id },
+      });
+      if (!submission) {
+        fail(404, "not_found", "Submission was not found");
+      }
+      canReadSubmission(identity, submission);
+      return new Response(JSON.stringify(jsonRecord(submission.data)), {
+        headers: {
+          "Content-Disposition": `attachment; filename="submission-${submission.id}.json"`,
+          "Content-Type": "application/json; charset=utf-8",
+        },
+      });
     })
     .get("/api/submissions/:id/docx", async ({ request, params }) => {
       const identity = await requireIdentity(request);

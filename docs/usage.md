@@ -190,6 +190,12 @@ Bearer session นี้ใช้เฉพาะระหว่าง Web กั
 
 Share Link เป็น opaque public ID ที่ระบบสร้างให้แต่ละ Form ไม่มีค่า demo แบบคงที่
 
+### 3.1 วงจร Draft และ Receipt
+
+`Response` มีได้หนึ่งรายการต่อ User และ Form เดียวกันเท่านั้น การกด **Save Draft** จะเก็บค่า Field และ DOCX ล่าสุดที่ตรวจสอบแล้ว ส่วน Field ที่ยังไม่ครบ Required ยังบันทึกเป็น Draft ได้ เมื่อกด **Submit** ระบบจะ Force-save เอกสาร ตรวจ Field Manifest แล้วสร้าง `Submission` และ DOCX ต้นฉบับแบบ immutable ใน transaction เดียวกัน หาก Force-save, Callback หรือการตรวจเอกสารล้มเหลว ระบบจะคง Draft เดิมไว้และสามารถลอง Submit ใหม่ได้
+
+หลัง Submit สำเร็จ การเปิด Form หรือ Handoff ซ้ำจะพาไป Receipt เดิม ไม่สร้าง Response ใหม่ Receipt แสดงชื่อ Form สถานะเวลาส่ง และข้อมูลต้นฉบับแบบอ่านอย่างเดียว เจ้าของ Response และ Admin ดาวน์โหลด JSON/DOCX ต้นฉบับได้ ส่วน PDF สร้างจาก DOCX เมื่อร้องขอและไม่เก็บเป็นไฟล์ถาวรใน PostgreSQL หรือ RustFS
+
 ## 4. ทดลองใช้งานในฐานะ Admin
 
 1. เปิด `http://localhost:5173/login`

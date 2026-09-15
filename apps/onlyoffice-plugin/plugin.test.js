@@ -13,6 +13,7 @@ const createHarness = ({
   capabilityResponses = [],
   clipboard,
   controls = [],
+  prefill,
   responses = [],
   selection,
 } = {}) => {
@@ -219,8 +220,8 @@ const createHarness = ({
         apiBase: "https://api.example.test/",
         bridgeId,
         documentKey: "document-key",
-        formId: "form-id",
         parentOrigin,
+        prefill,
         publicId: "public-id",
         responseId: "response-id",
         targetId: "target-id",
@@ -325,6 +326,7 @@ const createHarness = ({
   };
   const context = {
     Api,
+    Asc: window.Asc,
     Headers,
     Response,
     document,
@@ -480,6 +482,119 @@ test("extracts scalar form values with plugin contract semantics", async () => {
     notes: "line one\nline two",
     start_date: "2026-09-15",
   });
+});
+test("applies a saved scalar response and reports Thai action status", async () => {
+  const createMutableControl = ({ kind, tag, items = [] }) => {
+    let checked = false;
+    let dateValue = null;
+    let textValue = "";
+    const optionControls = items.map(({ display, value }) => ({
+      GetText: () => display,
+      GetValue: () => value,
+      Select: () => {
+        textValue = display;
+      },
+    }));
+    return {
+      AddText: (value) => {
+        textValue += value;
+      },
+      GetClassType: () => "inlineLvlSdt",
+      GetDate: () => dateValue,
+      GetDropdownList: () => ({
+        GetAllItems: () => optionControls,
+      }),
+      GetRange: () => ({ GetText: () => textValue }),
+      GetTag: () => tag,
+      IsCheckBox: () => kind === "checkbox",
+      IsCheckBoxChecked: () => checked,
+      IsComboBox: () => kind === "combo",
+      IsDatePicker: () => kind === "date",
+      IsDropDownList: () => kind === "dropdown",
+      RemoveAllElements: () => {
+        textValue = "";
+      },
+      SetCheckBoxChecked: (value) => {
+        checked = value;
+      },
+      SetDate: (value) => {
+        dateValue = value;
+      },
+      SetLock: () => {},
+      read: () => ({ checked, dateValue, textValue }),
+    };
+  };
+  const controls = [
+    createMutableControl({ kind: "text", tag: "notes" }),
+    createMutableControl({ kind: "checkbox", tag: "accept_terms" }),
+    createMutableControl({ kind: "date", tag: "start_date" }),
+    createMutableControl({
+      items: [{ display: "Engineering", value: "engineering" }],
+      kind: "dropdown",
+      tag: "department",
+    }),
+    createMutableControl({
+      items: [{ display: "Known", value: "known" }],
+      kind: "combo",
+      tag: "custom",
+    }),
+  ];
+  const harness = createHarness({
+    capabilityResponses: ["save-draft-capability"],
+    controls,
+    prefill: {
+      values: {
+        accept_terms: true,
+        custom: "Custom value",
+        department: "engineering",
+        notes: "line one\nline two",
+        start_date: "2026-09-15",
+      },
+    },
+    responses: [
+      { operationCapability: "save-operation-capability", operationId: "save" },
+      completedOperation({ saved: true }),
+    ],
+  });
+  acknowledgeBridge(harness);
+  await expect(
+    harness.window.FormBridge.runAction("save-draft")
+  ).resolves.toMatchObject({ ok: true });
+  expect(controls.map((control) => control.read())).toEqual([
+    { checked: false, dateValue: null, textValue: "line one\nline two" },
+    { checked: true, dateValue: null, textValue: "" },
+    {
+      checked: false,
+      dateValue: new Date(2026, 8, 15),
+      textValue: "",
+    },
+    { checked: false, dateValue: null, textValue: "Engineering" },
+    { checked: false, dateValue: null, textValue: "Custom value" },
+  ]);
+  expect(JSON.parse(harness.requests[0].body).data).toEqual({
+    accept_terms: true,
+    custom: "Custom value",
+    department: "engineering",
+    notes: "line one\nline two",
+    start_date: "2026-09-15",
+  });
+  expect(harness.statusElement.textContent).toBe("บันทึกฉบับร่าง สำเร็จ");
+
+  const errorHarness = createHarness({
+    action: "draft",
+    capabilityResponses: ["save-draft-capability"],
+    responses: [
+      {
+        body: { error: "invalid_response_data", message: "invalid" },
+        httpStatus: 422,
+      },
+    ],
+  });
+  acknowledgeBridge(errorHarness);
+  await expect(
+    errorHarness.window.FormBridge.runAction("save-draft")
+  ).resolves.toMatchObject({ ok: false });
+  expect(errorHarness.statusElement.textContent).toContain("ไม่สำเร็จ");
 });
 test("uses fresh capabilities and an exact acknowledged bridge", async () => {
   const harness = createHarness({

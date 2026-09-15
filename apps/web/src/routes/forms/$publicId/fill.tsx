@@ -94,11 +94,19 @@ const FillRoute = () => {
     const startResponse = async () => {
       try {
         const result = await apiPost<{
-          response?: { id: string };
           editorConfigUrl?: string;
+          response?: { id: string };
+          submissionId?: string;
         }>(`/api/forms/${publicId}/start`, {
           responseId: activeResponseId,
         });
+        if (result.submissionId) {
+          await navigate({
+            params: { submissionId: result.submissionId },
+            to: "/receipt/$submissionId",
+          });
+          return;
+        }
         if (cancelled) {
           return;
         }

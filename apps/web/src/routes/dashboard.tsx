@@ -116,7 +116,9 @@ const DashboardRoute = () => {
                     {row.formTitle ?? "แบบฟอร์มไม่มีชื่อ"}
                   </h2>
                   <p className="mt-1 text-sm text-[var(--ink-soft)]">
-                    บันทึกล่าสุด {formatDate(row.updatedAt ?? row.createdAt)}
+                    {submitted
+                      ? `ส่งเมื่อ ${formatDate(row.submittedAt ?? row.createdAt)}`
+                      : `บันทึกล่าสุด ${formatDate(row.updatedAt ?? row.createdAt)}`}
                   </p>
                 </div>
                 <div className="flex items-center gap-3">

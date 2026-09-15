@@ -380,7 +380,7 @@ function applyPrefillCommand() {
           }
         }
       }
-      return false;
+      return isComboBox && setControlText(control, valueText);
     }
 
     return setControlText(control, value === null ? "" : String(value));
@@ -2321,19 +2321,19 @@ function normalizeRuntimeOptions() {
 function actionLabel(action) {
   switch (action) {
     case ACTIONS.SAVE_TEMPLATE: {
-      return "Save Template";
+      return "บันทึก Template";
     }
     case ACTIONS.PUBLISH: {
-      return "Publish";
+      return "เผยแพร่";
     }
     case ACTIONS.SAVE_DRAFT: {
-      return "Save Draft";
+      return "บันทึกฉบับร่าง";
     }
     case ACTIONS.SUBMIT: {
-      return "Submit";
+      return "ส่งคำตอบ";
     }
     default: {
-      return "Form action";
+      return "การดำเนินการ";
     }
   }
 }
@@ -2696,7 +2696,7 @@ async function runAction(action) {
       );
     }
 
-    setStatus(`${actionLabel(action)} completed`, "success");
+    setStatus(`${actionLabel(action)} สำเร็จ`, "success");
     notifyParent(
       action,
       "completed",
@@ -2711,7 +2711,7 @@ async function runAction(action) {
     };
   } catch (error) {
     const message = errorMessage(error);
-    setStatus(`${actionLabel(action)} failed: ${message}`, "error");
+    setStatus(`${actionLabel(action)} ไม่สำเร็จ: ${message}`, "error");
     notifyParent(action, "failed", operationId, completedPayload, message);
 
     return {
