@@ -3132,6 +3132,8 @@ const templateCheckboxNamespace =
   "http://schemas.microsoft.com/office/word/2010/wordml";
 const templateWord2012Namespace =
   "http://schemas.microsoft.com/office/word/2012/wordml";
+const templateMarkupCompatibilityNamespace =
+  "http://schemas.openxmlformats.org/markup-compatibility/2006";
 const templateWordNamespaces = new Set([
   templateWordStrictNamespace,
   templateWordMainNamespace,
@@ -3707,6 +3709,7 @@ const templateControlMetadataProperties = new Set([
   "color",
   "dataBinding",
   "dateFormat",
+  "formPr",
   "id",
   "lock",
   "placeholder",
@@ -3808,9 +3811,20 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
   const fields: ParsedTemplateField[] = [];
   const controlPaths = reachableTemplateControlParts(archive, xmlPaths);
   for (const archivePath of controlPaths) {
+    let alternateFallbackDepth = 0;
     const controls: TemplateControlFrame[] = [];
     parseTemplateXml(templateArchiveText(archive, archivePath), {
       close: (element) => {
+        if (
+          element.local === "Fallback" &&
+          element.uri === templateMarkupCompatibilityNamespace
+        ) {
+          alternateFallbackDepth -= 1;
+          return;
+        }
+        if (alternateFallbackDepth > 0) {
+          return;
+        }
         const frame = controls.at(-1);
         if (!frame) {
           return;
@@ -3836,6 +3850,16 @@ function parseTemplateFields(bytes: Uint8Array): ParsedTemplateField[] {
         }
       },
       open: (element) => {
+        if (
+          element.local === "Fallback" &&
+          element.uri === templateMarkupCompatibilityNamespace
+        ) {
+          alternateFallbackDepth += 1;
+          return;
+        }
+        if (alternateFallbackDepth > 0) {
+          return;
+        }
         if (
           element.local === "sdt" &&
           templateWordNamespaces.has(element.uri)
@@ -4213,9 +4237,20 @@ function validateResponsePictureControls(
   const relationshipsBySource = new Map<string, Map<string, string | null>>();
   for (const archivePath of reachableTemplateControlParts(archive, xmlPaths)) {
     const controls: ResponsePictureControlFrame[] = [];
+    let alternateFallbackDepth = 0;
     const pictureControls: ResponsePictureControl[] = [];
     parseTemplateXml(templateArchiveText(archive, archivePath), {
       close: (element) => {
+        if (
+          element.local === "Fallback" &&
+          element.uri === templateMarkupCompatibilityNamespace
+        ) {
+          alternateFallbackDepth -= 1;
+          return;
+        }
+        if (alternateFallbackDepth > 0) {
+          return;
+        }
         const frame = controls.at(-1);
         if (!frame) {
           return;
@@ -4248,6 +4283,16 @@ function validateResponsePictureControls(
         }
       },
       open: (element) => {
+        if (
+          element.local === "Fallback" &&
+          element.uri === templateMarkupCompatibilityNamespace
+        ) {
+          alternateFallbackDepth += 1;
+          return;
+        }
+        if (alternateFallbackDepth > 0) {
+          return;
+        }
         if (
           element.local === "sdt" &&
           templateWordNamespaces.has(element.uri)
@@ -5410,7 +5455,12 @@ async function completeDraftOperation(
     fail(409, "stale_operation", "The response is no longer editable");
   }
   await validateResponseDocument(response.publishedTemplateId, bytes, false);
-  const result = { publicId: metadata.publicId, responseId: response.id };
+  const nextDocumentKey = metadata.nextDocumentKey ?? documentKey;
+  const result = {
+    documentKey: nextDocumentKey,
+    publicId: metadata.publicId,
+    responseId: response.id,
+  };
   const cleanupObjectKeys = [
     metadata.stagedObjectKey,
     ...(response.draftObjectKey ? [response.draftObjectKey] : []),
@@ -5420,6 +5470,7 @@ async function completeDraftOperation(
       const updated = await tx.response.updateMany({
         data: {
           draftData: jsonValue(metadata.data),
+          draftDocumentKey: nextDocumentKey,
           draftObjectKey: metadata.finalObjectKey,
           updatedAt: new Date(),
         },
@@ -10196,6 +10247,7 @@ export function createApp(options: AppOptions = {}) {
             "docx"
           ),
           formId: form.id,
+          nextDocumentKey: `response-${response.id}-${crypto.randomUUID()}`,
           publicId: form.publicId,
           responseId: response.id,
           stagedObjectKey,

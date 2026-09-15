@@ -436,13 +436,16 @@ export function editorConfig(
   options: EditorOptions,
   user: { id: string; name: string }
 ): Record<string, unknown> {
+  // DOCXF enables ONLYOFFICE's native fixed-form interactions in fill mode.
+  const documentFileType =
+    options.action === "template-edit" ? "docx" : "docxf";
   const { capabilities, lease, ...pluginOptions } = options;
   const officeServerOrigin = trimOrigin(env.ONLYOFFICE_DOCUMENT_BASE_URL);
   const browserServerOrigin = trimOrigin(env.API_BASE);
   const bridgeId = crypto.randomUUID();
   const config = {
     document: {
-      fileType: "docx",
+      fileType: documentFileType,
       key: options.documentKey,
       permissions: {
         comment: false,
@@ -454,7 +457,7 @@ export function editorConfig(
         fillForms: options.action !== "template-edit",
         review: false,
       },
-      title: `${options.action}-${options.publicId}.docx`,
+      title: `${options.action}-${options.publicId}.${documentFileType}`,
       url: documentUrl(options.documentKey),
     },
     documentType: "word",

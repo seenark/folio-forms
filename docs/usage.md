@@ -4,11 +4,8 @@ Folio Forms เป็นระบบสร้างและกรอกแบ�
 
 - **Admin** สร้าง Template, กำหนด Field, Publish และดู Submission
 - **User** เปิดลิงก์แบบฟอร์ม, กรอกข้อมูล, Save Draft, Resume และ Submit
-- **API** รันด้วย Bun + Elysia ที่ port `3000`
-- **Web** รันด้วย React + Vite ที่ port `5173`
-- **ONLYOFFICE Docs** รันใน Docker ที่ port `8080`
-- **PostgreSQL** รันใน Docker ที่ port `5432`
-- **RustFS** เก็บ DOCX ใน private S3 bucket ที่ port `9000` และมี console local ที่ port `9001`
+- **Production Compose** exposes only Caddy on the Forms and Office hosts; API, Web, ONLYOFFICE, PostgreSQL, and RustFS stay on the private Compose network.
+- **Development Mode** (section 1) runs the API on `3000`, Web on `5173`, ONLYOFFICE on `8080`, and RustFS on `9000`/`9001`.
 
 เอกสารนี้อธิบายการรันระบบ MMVP, การใช้ Share Link, การจัดการ Form และตำแหน่งข้อมูลสำคัญ
 
@@ -36,7 +33,6 @@ The deterministic external connector is never enabled by default. For explicit v
 docker compose --env-file .env.production -f compose.yaml --profile verification up prefill-mock
 ```
 
-
 ## 1. Development Mode
 
 สำหรับการพัฒนาเร็ว ให้รัน API และ Web ด้วย Bun โดยชี้ `apps/server/.env` ไปยัง PostgreSQL, RustFS และ ONLYOFFICE ที่เตรียมไว้สำหรับ development. ใช้ `apps/server/.env.example` เป็นรูปแบบ และใช้ credential local เฉพาะเครื่องเท่านั้น.
@@ -60,8 +56,7 @@ Host API (`3000`) กับ Compose `server` ห้ามเปิดพร้�
 
 ทุกความพยายามจัดการบัญชีจะเพิ่ม Audit Event แบบ immutable พร้อมผู้กระทำ เป้าหมาย เวลา Action และ Outcome โดยไม่เก็บรหัสผ่าน, password hash, token หรือ credential material
 
-การ **ลบบัญชีถาวร** ทำได้เมื่อบัญชีนั้นไม่มี `Response` หรือไฟล์ส่วนบุคคลค้างอยู่แล้วเท่านั้น ต้องลบ Response จากหน้า **ผลลัพธ์** ก่อน ระบบจะ revoke Session และล้างข้อมูลที่เกี่ยวข้องก่อนลบบัญชี ส่วนการ Disable ยังคง Response, Prefill และ Audit ไว้เพื่อการตรวจสอบภายหลัง
-หน้า **Audit Trail** ที่ `/admin/audit` เป็น read-only สำหรับ Admin เท่านั้น รองรับกรองตามช่วงเวลา, Actor ID, Action, Target ID และ Outcome พร้อม cursor pagination ลำดับเวลา/ID คงที่ Metadata ที่แสดงเป็น allowlist และไม่รวมค่า Field, Prefill, เอกสาร, token หรือ request body
+การ **ลบบัญชีถาวร** ทำได้เมื่อบัญชีนั้นไม่มี `Response` หรือไฟล์ส่วนบุคคลค้างอยู่แล้วเท่านั้น ต้องลบ Response จากหน้า **ผลลัพธ์** ก่อน ระบบจะ revoke Session และล้างข้อมูลที่เกี่ยวข้องก่อนลบบัญชี ส่วนการ Disable ยังคง Response, Prefill และ Audit ไว้เพื่อการตรวจสอบภายหลัง หน้า **Audit Trail** ที่ `/admin/audit` เป็น read-only สำหรับ Admin เท่านั้น รองรับกรองตามช่วงเวลา, Actor ID, Action, Target ID และ Outcome พร้อม cursor pagination ลำดับเวลา/ID คงที่ Metadata ที่แสดงเป็น allowlist และไม่รวมค่า Field, Prefill, เอกสาร, token หรือ request body
 
 ### 2.2 สิทธิ์ของแต่ละ Role
 
@@ -168,7 +163,7 @@ Receipt มีปุ่ม **กลับไปยังระบบต้นท
 
 ## 4. ทดลองใช้งานในฐานะ Admin
 
-1. เปิด `http://localhost:5173/login`
+1. เปิด `https://FORMS_HOST/login` ใน Production หรือ `http://localhost:5173/login` เมื่อตั้ง Development Mode
 2. Login ด้วยบัญชีที่ถูก provision เป็น role `Admin`
 3. ระบบจะพาไปที่ `/admin`
 
@@ -267,15 +262,16 @@ Admin จะสามารถดูข้อมูล, เปิด Receipt แ
 
 | URL | ใช้งาน |
 | --- | --- |
-| `http://localhost:5173` | หน้าเริ่มต้น |
-| `http://localhost:5173/login` | Login |
-| `http://localhost:5173/dashboard` | Dashboard ของ User |
-| `http://localhost:5173/admin` | Dashboard ของ Admin |
-| `http://localhost:5173/admin/users` | จัดการบัญชี User และ Admin |
-| `http://localhost:5173/admin/forms/new` | สร้าง Form |
-| `http://localhost:3000/health` | ตรวจ API |
-| `http://localhost:8080` | ONLYOFFICE Document Server |
-| `http://localhost:9001` | RustFS console สำหรับ local development |
+| `https://FORMS_HOST` | หน้าเริ่มต้นใน Production |
+| `https://FORMS_HOST/login` | Login ใน Production |
+| `https://FORMS_HOST/dashboard` | Dashboard ของ User ใน Production |
+| `https://FORMS_HOST/admin` | Dashboard ของ Admin ใน Production |
+| `https://FORMS_HOST/admin/users` | จัดการบัญชี User และ Admin ใน Production |
+| `https://FORMS_HOST/admin/forms/new` | สร้าง Form ใน Production |
+| `http://localhost:5173` | หน้าเริ่มต้นใน Development Mode |
+| `http://localhost:3000/health` | ตรวจ API ใน Development Mode |
+| `http://localhost:8080` | ONLYOFFICE ใน Development Mode |
+| `http://localhost:9001` | RustFS console ใน Development Mode |
 
 ถ้าเปิด Share Link โดยยังไม่ Login ระบบจะพาไป `/login` ก่อน แล้วกลับมายัง Form เดิมหลัง Login สำเร็จ
 

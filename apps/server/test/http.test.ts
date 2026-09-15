@@ -2432,12 +2432,37 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(pictureEditorResponse.status).toBe(200);
   const pictureEditor =
     (await pictureEditorResponse.json()) as EditorConfigBody;
-  const pictureDocumentKey = pictureEditor.config.document.key;
-  const pictureSaveCapability = pictureEditor.bridge.capabilities["save-draft"];
-  const pictureSubmitCapability = pictureEditor.bridge.capabilities.submit;
+  let pictureDocumentKey = pictureEditor.config.document.key;
+  let pictureSaveCapability: string =
+    pictureEditor.bridge.capabilities["save-draft"] ?? "";
+  let pictureSubmitCapability: string =
+    pictureEditor.bridge.capabilities.submit ?? "";
   if (!pictureSaveCapability || !pictureSubmitCapability) {
     throw new Error("The picture response capabilities were not returned");
   }
+  const refreshPictureEditor = async (): Promise<void> => {
+    const refreshedResponse = await pictureApp.handle(
+      new Request(
+        `http://test.local/api/forms/${requiredPicturePublicId}/editor-config?responseId=${pictureResponseId}&action=draft`,
+        { headers: { Authorization: `Bearer ${adminBearer}` } }
+      )
+    );
+    expect(refreshedResponse.status).toBe(200);
+    const refreshedConfig =
+      (await refreshedResponse.json()) as EditorConfigBody;
+    const refreshedSaveCapability =
+      refreshedConfig.bridge.capabilities["save-draft"];
+    const refreshedSubmitCapability =
+      refreshedConfig.bridge.capabilities.submit;
+    if (!refreshedSaveCapability || !refreshedSubmitCapability) {
+      throw new Error(
+        "The refreshed picture response capabilities were not returned"
+      );
+    }
+    pictureDocumentKey = refreshedConfig.config.document.key;
+    pictureSaveCapability = refreshedSaveCapability;
+    pictureSubmitCapability = refreshedSubmitCapability;
+  };
   const pictureDraftRequest = (data: Record<string, unknown>) =>
     pictureApp.handle(
       new Request(
@@ -2482,9 +2507,13 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     if (!body.operationCapability || !body.operationId) {
       throw new Error("The picture draft operation was not created");
     }
-    return waitForOperation(body.operationId, {
+    const operation = await waitForOperation(body.operationId, {
       "X-Editor-Capability": body.operationCapability,
     });
+    if (operation.status === "completed") {
+      await refreshPictureEditor();
+    }
+    return operation;
   };
   const validPictureDocument = nextPictureDocument;
   const validPictureSave = await savePicture(validPictureDocument, {
@@ -4612,11 +4641,13 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   );
   expect(editorResponse.status).toBe(200);
   const editorConfig = (await editorResponse.json()) as EditorConfigBody;
-  const responseDocumentKey = editorConfig.config.document.key;
+  let responseDocumentKey = editorConfig.config.document.key;
+  const originalResponseDocumentKey = responseDocumentKey;
   const userPluginOptions =
     editorConfig.config.editorConfig.plugins.options[pluginGuid];
-  const saveDraftCapability = editorConfig.bridge.capabilities["save-draft"];
-  const submitCapability = editorConfig.bridge.capabilities.submit;
+  let saveDraftCapability: string =
+    editorConfig.bridge.capabilities["save-draft"] ?? "";
+  let submitCapability: string = editorConfig.bridge.capabilities.submit ?? "";
   if (
     !userPluginOptions ||
     !responseDocumentKey ||
@@ -4625,7 +4656,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   ) {
     throw new Error("The User editor capabilities were not returned");
   }
-  const userLease = editorConfig.bridge.lease;
+  let userLease = editorConfig.bridge.lease;
   expect(userLease).toEqual({
     expiresAt: expect.any(String),
     id: expect.any(String),
@@ -4636,6 +4667,31 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     expect(JSON.stringify(editorConfig.config)).not.toContain(leaseValue);
   }
   expect(userPluginOptions).not.toHaveProperty("lease");
+  const originalSaveDraftCapability = saveDraftCapability;
+  const refreshResponseEditor = async (): Promise<void> => {
+    const refreshedResponse = await app.handle(
+      new Request(
+        `http://test.local/api/forms/${formRecord.publicId}/editor-config?responseId=${responseId}&action=draft`,
+        { headers: { Authorization: `Bearer ${userBearer}` } }
+      )
+    );
+    expect(refreshedResponse.status).toBe(200);
+    const refreshedConfig =
+      (await refreshedResponse.json()) as EditorConfigBody;
+    const refreshedSaveDraftCapability =
+      refreshedConfig.bridge.capabilities["save-draft"];
+    const refreshedSubmitCapability =
+      refreshedConfig.bridge.capabilities.submit;
+    if (!refreshedSaveDraftCapability || !refreshedSubmitCapability) {
+      throw new Error(
+        "The refreshed User editor capabilities were not returned"
+      );
+    }
+    responseDocumentKey = refreshedConfig.config.document.key;
+    saveDraftCapability = refreshedSaveDraftCapability;
+    submitCapability = refreshedSubmitCapability;
+    userLease = refreshedConfig.bridge.lease;
+  };
   const sessionOnlyUserDraftResponse = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
       body: JSON.stringify({
@@ -4826,6 +4882,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     { "X-Editor-Capability": oversizedClientValueBody.operationCapability }
   );
   expect(oversizedClientValueOperation.status).toBe("completed");
+  await refreshResponseEditor();
   const normalizedClientTamperResponse =
     await prisma.response.findUniqueOrThrow({
       select: { draftData: true },
@@ -4890,6 +4947,12 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     "X-Editor-Capability": saveBody.operationCapability,
   });
   expect(saveOperation.status).toBe("completed");
+  const saveOperationResult = saveOperation.result as {
+    documentKey?: unknown;
+    responseId?: unknown;
+  };
+  expect(saveOperationResult.documentKey).toEqual(expect.any(String));
+  expect(saveOperationResult.responseId).toBe(responseId);
   const savedResponse = await prisma.response.findUnique({
     select: {
       draftData: true,
@@ -4900,15 +4963,35 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     },
     where: { id: responseId },
   });
+  const savedResponseDocumentKey = savedResponse?.draftDocumentKey;
+  const savedResponseObjectKey = savedResponse?.draftObjectKey;
   expect(savedResponse).toMatchObject({
     draftData: savedDraftData,
-    draftDocumentKey: responseDocumentKey,
+    draftDocumentKey: expect.any(String),
     status: "draft",
     updatedAt: expect.any(Date),
   });
-  if (!savedResponse?.draftObjectKey) {
+  if (!savedResponseDocumentKey || !savedResponseObjectKey) {
     throw new Error("The saved response document was not persisted");
   }
+  expect(savedResponseDocumentKey).not.toBe(originalResponseDocumentKey);
+  expect(saveOperationResult.documentKey).toBe(savedResponseDocumentKey);
+  const staleDraftResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
+      body: JSON.stringify({
+        data: savedDraftData,
+        documentKey: originalResponseDocumentKey,
+        responseId,
+      }),
+      headers: capabilityHeaders(originalSaveDraftCapability),
+      method: "POST",
+    })
+  );
+  expect(staleDraftResponse.status).toBe(409);
+  expect(await staleDraftResponse.json()).toMatchObject({
+    error: "stale_response",
+  });
+  responseDocumentKey = savedResponseDocumentKey;
   const resumedStartResponse = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
       headers: { Authorization: `Bearer ${userBearer}` },
@@ -4926,9 +5009,21 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(resumedEditorResponse.status).toBe(200);
-  expect(await resumedEditorResponse.json()).toMatchObject({
+  const resumedEditorConfig =
+    (await resumedEditorResponse.json()) as EditorConfigBody;
+  expect(resumedEditorConfig).toMatchObject({
     config: { document: { key: responseDocumentKey } },
   });
+  const resumedSaveDraftCapability =
+    resumedEditorConfig.bridge.capabilities["save-draft"];
+  const resumedSubmitCapability =
+    resumedEditorConfig.bridge.capabilities.submit;
+  if (!resumedSaveDraftCapability || !resumedSubmitCapability) {
+    throw new Error("The resumed User editor capabilities were not returned");
+  }
+  saveDraftCapability = resumedSaveDraftCapability;
+  submitCapability = resumedSubmitCapability;
+  userLease = resumedEditorConfig.bridge.lease;
   const responseList = await app.handle(
     new Request("http://test.local/api/responses/me", {
       headers: { Authorization: `Bearer ${userBearer}` },
@@ -5205,6 +5300,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       where: { id: responseId },
     })
   ).toEqual(stableBeforeFailure);
+  const retryDocumentKeyBeforeSave = responseDocumentKey;
   const retrySaveResponse = await draftRequest(savedDraftData);
   expect(retrySaveResponse.status).toBe(202);
   const retrySaveBody = (await retrySaveResponse.json()) as {
@@ -5218,6 +5314,8 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     "X-Editor-Capability": retrySaveBody.operationCapability,
   });
   expect(retrySaveOperation.status).toBe("completed");
+  await refreshResponseEditor();
+  expect(responseDocumentKey).not.toBe(retryDocumentKeyBeforeSave);
   const stableBeforeSubmitFailure = await prisma.response.findUnique({
     select: { draftData: true, draftObjectKey: true, status: true },
     where: { id: responseId },

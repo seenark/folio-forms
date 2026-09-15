@@ -4,7 +4,7 @@
 
 **Blocked by:** 08 — Create and save leased Template Drafts
 
-**Status:** done
+**Status:** ready-for-human
 
 - [x] The side panel is available only in an authorized Admin Template Draft editor and reflects the selected content control.
 - [x] The deterministic external mock exposes a searchable cursor-paginated schema large enough to prove paging and filtering.

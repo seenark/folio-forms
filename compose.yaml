@@ -56,9 +56,7 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-
-        rc alias set local http://rustfs:9000 "$$RUSTFS_ACCESS_KEY" "$$RUSTFS_SECRET_KEY" &&
-        rc bucket create "local/$$RUSTFS_BUCKET" --ignore-existing &&
-        rc anonymous set private "local/$$RUSTFS_BUCKET"
+        rc alias set local http://rustfs:9000 "$$RUSTFS_ACCESS_KEY" "$$RUSTFS_SECRET_KEY" && rc bucket create "local/$$RUSTFS_BUCKET" --ignore-existing && rc anonymous set private "local/$$RUSTFS_BUCKET"
 
   onlyoffice:
     image: onlyoffice/documentserver:9.4.0.1@sha256:3ab6ebc7c605e5a32b7ae3ff19daed4925090245acc8100ce2230bd766c88212
@@ -76,7 +74,8 @@ services:
     expose:
       - "80"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://localhost/healthcheck"]
+      test:
+        ["CMD", "curl", "--fail", "--silent", "http://localhost/healthcheck"]
       interval: 15s
       timeout: 10s
       retries: 20
@@ -126,7 +125,11 @@ services:
       RUSTFS_REGION: ${RUSTFS_REGION:-us-east-1}
       TEMPLATE_PATH: /app/onlyoffice-templates/template.docx
     command:
-      ["sh", "-c", "cd /app && bun run --cwd packages/db db:migrate && cd /app/apps/server && bun dist/index.mjs"]
+      [
+        "sh",
+        "-c",
+        "cd /app && bun run --cwd packages/db db:migrate && cd /app/apps/server && bun dist/index.mjs",
+      ]
     healthcheck:
       test:
         [
@@ -144,11 +147,13 @@ services:
     build:
       context: .
       dockerfile: apps/web/Dockerfile
+      args:
+        VITE_API_ORIGIN: https://${FORMS_HOST:?set FORMS_HOST}
     restart: unless-stopped
     expose:
       - "80"
     healthcheck:
-      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost/"]
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1/"]
       interval: 10s
       timeout: 5s
       retries: 12

@@ -89,6 +89,7 @@ const FillRoute = () => {
   const navigate = useNavigate();
   const [form, setForm] = useState<PublicForm | null>(null);
   const [editorConfigUrl, setEditorConfigUrl] = useState<string | null>(null);
+  const [editorRevision, setEditorRevision] = useState(0);
   const [activeResponseId, setActiveResponseId] = useState(responseId);
   const [loading, setLoading] = useState(true);
   const [startBusy, setStartBusy] = useState(false);
@@ -308,6 +309,9 @@ const FillRoute = () => {
     }
 
     setDirty(false);
+    if (message.action === "save-draft") {
+      setEditorRevision((value) => value + 1);
+    }
     if (message.action === "submit") {
       const submissionId = message.operation?.result?.submissionId;
       if (submissionId) {
@@ -690,6 +694,7 @@ const FillRoute = () => {
             configUrl={editorConfigUrl ?? undefined}
             onBridgeMessage={handleBridgeMessage}
             onDirtyChange={setDirty}
+            revision={editorRevision}
             saveRequest={saveRequest}
             title={`กรอกแบบฟอร์ม ${form.title}`}
           />

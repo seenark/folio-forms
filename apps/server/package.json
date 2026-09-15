@@ -6,7 +6,8 @@
     "build": "tsdown",
     "check-types": "tsc -b",
     "compile": "bun build --compile --minify --sourcemap --bytecode ./src/index.ts --outfile server",
-    "test:http": "test -n \"$DATABASE_URL\" || (echo 'DATABASE_URL must point to an isolated PostgreSQL database' >&2; exit 1); bun run --cwd ../prefill-mock build && bun test --timeout 120000 test/http.test.ts"
+    "test:http": "test -n \"$DATABASE_URL\" || (echo 'DATABASE_URL must point to an isolated PostgreSQL database' >&2; exit 1); bun run --cwd ../prefill-mock build && bun test --timeout 120000 test/http.test.ts",
+    "test:storage": "bun test --timeout 120000 test/storage.test.ts"
   },
   "dependencies": {
     "@elysiajs/cors": "^1.4.2",

@@ -4,7 +4,7 @@
 
 **Blocked by:** 09 — Configure Fields from the ONLYOFFICE side panel
 
-**Status:** done
+**Status:** ready-for-human
 
 - [x] Publish force-saves the Template Draft, hashes and versions the exact DOCX, and atomically binds that Published Template identity to the Field Manifest, required rules, and Prefill Configuration.
 - [x] The Field Manifest records every supported scalar control tag, type, dropdown/combo options, required state, and Prefill policy.

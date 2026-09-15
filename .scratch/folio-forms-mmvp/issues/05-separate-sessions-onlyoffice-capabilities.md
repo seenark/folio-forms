@@ -15,7 +15,7 @@
 - [x] The existing Admin edit and User save/submit editor flow still completes with valid credentials.
 - [x] Targeted HTTP and plugin-contract tests cover valid use, cross-target use, tampering, expiry, and origin rejection.
 - [x] Plugin-boundary tests exercise action requests, Operation polling, duplicate-action suppression, valid messages, and strict source/origin rejection without a real browser Session token.
- 
+
 ## Agent proof
 
 - `bun test --timeout 120000 apps/server/test/http.test.ts` passed against isolated PostgreSQL and RustFS: 1 journey, 191 assertions. It covers five-minute actor/role/Form/document/action capabilities, six-minute Operation capabilities, cross-action/target/Operation rejection, signature tampering, expiry, live disabled/role-changed actors, private document access, standard timed ONLYOFFICE callback header/body JWTs, callback scope/replay/process guards, origin/redirect/size controls, callback-less timeout cleanup, Admin Save→new key→Publish, and User Save→Submit.

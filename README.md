@@ -25,7 +25,6 @@ Startup applies Prisma migrations before serving traffic, bootstraps only the co
 
 This is a single-host, single-disk deployment with no application or off-host backup. Disk loss, ransomware, and regional loss are unrecoverable. The intended ceiling is about 100 accounts, 100 Forms, and 20 concurrent editors; queues, distributed locks, and horizontal scaling are intentionally absent.
 
-
 ## Contents
 
 - [Stack and ports](#stack-and-ports)
@@ -97,7 +96,13 @@ This topology has no application or off-host backup. Disk, ransomware, or region
 
 ## Open the application
 
-Main application:
+Production:
+
+```text
+https://<FORMS_HOST>
+```
+
+For local development only:
 
 ```text
 http://localhost:5173

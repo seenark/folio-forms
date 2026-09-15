@@ -14,7 +14,7 @@
 - [x] Drizzle runtime dependencies, schema, migrations, client, adapter usage, and migration commands are removed after every caller moves.
 - [x] Production startup no longer runs a demo seed or creates demo accounts.
 - [x] Setup and migration guidance uses only Prisma, and obsolete Drizzle, prototype migration, demo-account, and demo-seed instructions are removed.
- 
+
 ## Agent proof
 
 - Applied `20260914145344_initial` to fresh PostgreSQL database `folio_forms_ticket02_test2`, then reran `prisma migrate deploy`; the second run reported no pending migrations.
