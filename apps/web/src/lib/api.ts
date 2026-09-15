@@ -351,8 +351,11 @@ export const apiPatch = <T>(path: string, body?: unknown) =>
     body: JSON.stringify(body ?? {}),
     method: "PATCH",
   });
-export const apiDelete = <T>(path: string) =>
-  request<T>(path, { method: "DELETE" });
+export const apiDelete = <T>(path: string, body?: unknown) =>
+  request<T>(path, {
+    body: body === undefined ? undefined : JSON.stringify(body),
+    method: "DELETE",
+  });
 export const downloadArtifact = async (path: string, filename: string) => {
   const token = getToken();
   const response = await fetch(`${API_ORIGIN}${path}`, {

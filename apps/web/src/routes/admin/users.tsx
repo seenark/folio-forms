@@ -13,6 +13,7 @@ import {
   RefreshCw,
   Search,
   ShieldCheck,
+  Trash2,
   UserRound,
   UsersRound,
   X,
@@ -22,7 +23,14 @@ import { useEffect, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/app-shell";
 import { Badge, Button, Card, Input, Notice, Spinner } from "@/components/ui";
-import { ApiError, apiGet, apiPatch, apiPost, formatDate } from "@/lib/api";
+import {
+  ApiError,
+  apiDelete,
+  apiGet,
+  apiPatch,
+  apiPost,
+  formatDate,
+} from "@/lib/api";
 import type {
   AdminUser,
   AdminUserCredentialResponse,
@@ -34,7 +42,13 @@ import { useAuth } from "@/lib/auth";
 
 type FilterRole = Role | "all";
 type FilterEnabled = "all" | "true" | "false";
-type ConfirmKind = "disable" | "email" | "promote" | "demote" | "reset";
+type ConfirmKind =
+  | "delete"
+  | "disable"
+  | "email"
+  | "promote"
+  | "demote"
+  | "reset";
 type ActionKind = ConfirmKind | "enable";
 
 interface Confirmation {
@@ -84,6 +98,9 @@ const errorMessageFor = (caughtError: unknown, fallback: string) => {
     if (caughtError.code === "final_admin_required") {
       return "ต้องมีผู้ดูแลระบบที่เปิดใช้งานอยู่อย่างน้อยหนึ่งบัญชี";
     }
+    if (caughtError.code === "personal_data_remains") {
+      return "ยังมีข้อมูลส่วนบุคคลหรือไฟล์ของคำตอบค้างอยู่ ต้องลบคำตอบก่อน";
+    }
     if (caughtError.code === "user_not_found" || caughtError.status === 404) {
       return "ไม่พบบัญชีผู้ใช้นี้ อาจถูกลบไปแล้ว กรุณาโหลดรายการใหม่";
     }
@@ -101,6 +118,9 @@ const errorMessageFor = (caughtError: unknown, fallback: string) => {
 };
 
 const confirmationTitle = (kind: ConfirmKind) => {
+  if (kind === "delete") {
+    return "ยืนยันการลบบัญชีถาวร";
+  }
   if (kind === "disable") {
     return "ยืนยันการปิดใช้งานบัญชี";
   }
@@ -117,6 +137,9 @@ const confirmationTitle = (kind: ConfirmKind) => {
 };
 
 const confirmationDescription = (kind: ConfirmKind) => {
+  if (kind === "delete") {
+    return "ระบบจะลบข้อมูลบัญชีและข้อมูลส่วนบุคคลที่เหลืออยู่ถาวร ผู้ใช้ที่มี Response ต้องลบ Response ก่อน";
+  }
   if (kind === "disable") {
     return "การปิดใช้งานจะออกจากระบบของบัญชีนี้ทุกอุปกรณ์";
   }
@@ -130,6 +153,9 @@ const confirmationDescription = (kind: ConfirmKind) => {
 };
 
 const actionSuccessMessage = (kind: ActionKind) => {
+  if (kind === "delete") {
+    return "ลบบัญชีและข้อมูลส่วนบุคคลถาวรแล้ว";
+  }
   if (kind === "enable") {
     return "เปิดใช้งานบัญชีแล้ว";
   }
@@ -149,6 +175,9 @@ const actionSuccessMessage = (kind: ActionKind) => {
 };
 
 const actionFailureMessage = (kind: ActionKind) => {
+  if (kind === "delete") {
+    return "ไม่สามารถลบบัญชีและข้อมูลส่วนบุคคลได้ กรุณาตรวจสอบเงื่อนไขแล้วลองใหม่";
+  }
   if (kind === "enable") {
     return "ไม่สามารถเปิดใช้งานบัญชีได้ กรุณาลองใหม่อีกครั้ง";
   }
@@ -496,6 +525,29 @@ const AdminUsersRoute = () => {
         });
         setTemporaryPassword(payload.temporaryPassword);
         setReloadVersion((value) => value + 1);
+        succeeded = true;
+        return;
+      }
+      if (kind === "delete") {
+        await apiDelete(`/api/admin/users/${encodeURIComponent(user.id)}`, {
+          confirm: true,
+        });
+        if (authenticatedUser?.id === user.id) {
+          clearSession();
+          await navigate({
+            replace: true,
+            search: { returnTo: "/admin/users" },
+            to: "/login",
+          });
+          return;
+        }
+        setUsers((currentUsers) =>
+          currentUsers.filter((currentUser) => currentUser.id !== user.id)
+        );
+        setFeedback({
+          message: actionSuccessMessage(kind),
+          tone: "success",
+        });
         succeeded = true;
         return;
       }
@@ -1160,6 +1212,20 @@ const AdminUsersRoute = () => {
                             >
                               <KeyRound size={14} />
                               ตั้งรหัสผ่านใหม่
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="danger"
+                              size="sm"
+                              data-user-action-id={actionKey(user.id, "delete")}
+                              onClick={() =>
+                                requestConfirmation(user, "delete")
+                              }
+                              disabled={rowDisabled}
+                              aria-label={`ลบบัญชี ${user.email} ถาวร`}
+                            >
+                              <Trash2 size={14} />
+                              ลบบัญชีถาวร
                             </Button>
                           </div>
                         )}

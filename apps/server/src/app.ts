@@ -177,6 +177,7 @@ type Actor = Pick<
 >;
 type AccountAuditAction =
   | "create_user"
+  | "delete_user"
   | "enable_user"
   | "disable_user"
   | "change_user_email"
@@ -528,6 +529,7 @@ interface CallbackPayload {
 
 export interface AppOptions {
   clock?: () => Date;
+  deleteObject?: (key: string) => Promise<void>;
   onlyOffice?: OnlyOfficeClient;
   onlyOfficeCallbackOrigins?: readonly string[];
   onlyOfficeCallbackMaxBytes?: number;
@@ -936,18 +938,21 @@ async function deleteObjects(
 }
 
 async function drainObjectCleanupIntents(
-  objectKeys?: readonly string[]
+  objectKeys?: readonly string[],
+  deletionResponseLookupDigest?: string,
+  removeObject: (key: string) => Promise<void> = deleteObject
 ): Promise<void> {
   const cleanupAfter = new Date();
   const intents = await prisma.objectCleanupIntent.findMany({
     orderBy: { createdAt: "asc" },
     where: {
       cleanupAfter: { lte: cleanupAfter },
+      ...(deletionResponseLookupDigest ? { deletionResponseLookupDigest } : {}),
       ...(objectKeys ? { objectKey: { in: [...objectKeys] } } : {}),
     },
   });
   for (const intent of intents) {
-    if (!(await deleteObjectUnlessCanonical(intent.objectKey))) {
+    if (!(await deleteObjectUnlessCanonical(intent.objectKey, removeObject))) {
       continue;
     }
     await prisma.objectCleanupIntent.deleteMany({
@@ -956,7 +961,10 @@ async function drainObjectCleanupIntents(
   }
 }
 
-async function deleteObjectUnlessCanonical(key: string): Promise<boolean> {
+async function deleteObjectUnlessCanonical(
+  key: string,
+  removeObject: (key: string) => Promise<void> = deleteObject
+): Promise<boolean> {
   try {
     const references = await Promise.all([
       prisma.templateDraft.findFirst({
@@ -987,8 +995,8 @@ async function deleteObjectUnlessCanonical(key: string): Promise<boolean> {
     if (references.some((reference) => reference !== null)) {
       return false;
     }
-    await deleteObject(key);
-    return true;
+    await removeObject(key);
+    return !(await objectExists(key));
   } catch (error) {
     console.error(`Could not verify whether object ${key} is canonical`, error);
     return false;
@@ -2432,6 +2440,385 @@ async function createResponseAudit({
       targetType,
     },
   });
+}
+type ResponseDeletionAuditAction =
+  | "delete_response"
+  | "delete_response_pending";
+interface ResponseDeletionAuditMetadata {
+  errorCode?: string;
+}
+
+async function createResponseDeletionAudit({
+  action = "delete_response",
+  actorId,
+  error,
+  outcome,
+  targetId,
+  tx = prisma,
+}: {
+  action?: ResponseDeletionAuditAction;
+  actorId: string;
+  error?: unknown;
+  outcome: AuditOutcome;
+  targetId: string;
+  tx?: Prisma.TransactionClient;
+}): Promise<void> {
+  await tx.auditEvent.create({
+    data: {
+      action,
+      actorId,
+      outcome,
+      safeMetadata: jsonValue(
+        error
+          ? {
+              errorCode:
+                error instanceof HttpError ? error.code : "internal_error",
+            }
+          : ({} satisfies ResponseDeletionAuditMetadata)
+      ),
+      targetId,
+      targetType: "response",
+    },
+  });
+}
+
+interface ResponseDeletionResult {
+  alreadyDeleted: boolean;
+  deleted: boolean;
+}
+
+function responseDeletionPrefixes(
+  responseId: string,
+  submissionId: string | null,
+  operationPrefixes: readonly string[]
+): string[] {
+  return [
+    `responses/${responseId}/`,
+    ...(submissionId ? [`submissions/${submissionId}/`] : []),
+    ...operationPrefixes,
+  ];
+}
+
+function responseDeletionKeyBelongs(
+  key: string,
+  prefixes: readonly string[]
+): boolean {
+  return prefixes.some((prefix) => key.startsWith(prefix));
+}
+
+async function deleteResponseData({
+  actor,
+  allowActiveLease,
+  missingOk,
+  removeObject,
+  responseId,
+  revokeOwnerSessions,
+}: {
+  actor: Identity;
+  allowActiveLease: boolean;
+  missingOk: boolean;
+  removeObject: (key: string) => Promise<void>;
+  responseId: string;
+  revokeOwnerSessions: boolean;
+}): Promise<ResponseDeletionResult> {
+  const responseLookupDigest = tokenDigest(responseId);
+  const existingTombstone = await prisma.deletionTombstone.findUnique({
+    where: { responseLookupDigest },
+  });
+  if (existingTombstone) {
+    await drainObjectCleanupIntents(
+      undefined,
+      responseLookupDigest,
+      removeObject
+    );
+    const remaining = await prisma.objectCleanupIntent.count({
+      where: { deletionResponseLookupDigest: responseLookupDigest },
+    });
+    if (remaining > 0) {
+      fail(503, "deletion_cleanup_failed", "Response objects remain");
+    }
+    return { alreadyDeleted: true, deleted: true };
+  }
+  const result = await prisma.$transaction(
+    async (tx) => {
+      const [lockedResponse] = await tx.$queryRaw<{ id: string }[]>(
+        Prisma.sql`
+          SELECT "id"
+          FROM "responses"
+          WHERE "id" = ${responseId}::uuid
+          FOR UPDATE
+        `
+      );
+      if (!lockedResponse) {
+        if (missingOk) {
+          return { alreadyDeleted: false, deleted: false };
+        }
+        fail(404, "not_found", "Response was not found");
+      }
+      const response = await tx.response.findUnique({
+        include: {
+          corrections: { orderBy: { revision: "asc" } },
+          submission: true,
+        },
+        where: { id: responseId },
+      });
+      if (!response) {
+        if (missingOk) {
+          return { alreadyDeleted: false, deleted: false };
+        }
+        fail(404, "not_found", "Response was not found");
+      }
+      if (actor.role !== "admin" && response.userId !== actor.id) {
+        fail(403, "forbidden", "You may only delete your own Draft");
+      }
+      if (actor.role !== "admin" && response.status !== ResponseStatus.draft) {
+        fail(409, "draft_unavailable", "Only a Draft can be discarded");
+      }
+      const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
+        Prisma.sql`
+          SELECT "id"
+          FROM "forms"
+          WHERE "id" = ${response.formId}::uuid
+          FOR UPDATE
+        `
+      );
+      if (!lockedForm) {
+        fail(409, "stale_response", "The Response form is unavailable");
+      }
+      const operations = await tx.operation.findMany({
+        select: {
+          id: true,
+          metadata: true,
+          stagingObjectKey: true,
+          status: true,
+        },
+        where: {
+          OR: [
+            { responseId: response.id },
+            ...(response.submission
+              ? [{ submissionId: response.submission.id }]
+              : []),
+            ...(response.corrections.length > 0
+              ? [
+                  {
+                    correctionId: {
+                      in: response.corrections.map(
+                        (correction) => correction.id
+                      ),
+                    },
+                  },
+                ]
+              : []),
+          ],
+        },
+      });
+      if (
+        operations.some(
+          (operation) =>
+            operation.status === OperationStatus.pending ||
+            operation.status === OperationStatus.processing
+        )
+      ) {
+        fail(409, "operation_in_progress", "The Response operation is active");
+      }
+      const correctionIds = response.corrections.map(
+        (correction) => correction.id
+      );
+      const leases = await tx.editorLease.findMany({
+        select: { id: true, workspaceObjectKey: true },
+        where: {
+          OR: [
+            {
+              targetId: response.id,
+              targetType: OperationTargetType.response,
+            },
+            {
+              targetId: response.id,
+              targetType: OperationTargetType.correction,
+            },
+          ],
+        },
+      });
+      if (leases.length > 0 && !allowActiveLease) {
+        fail(409, "editor_in_use", "The Response is open in an editor");
+      }
+
+      const candidateKeys = [
+        response.draftObjectKey,
+        response.submission?.objectKey,
+        ...response.corrections.map((correction) => correction.objectKey),
+        ...leases.map((lease) => lease.workspaceObjectKey),
+        ...operations.flatMap((operation) => {
+          const metadata = operationMetadata(operation.metadata);
+          return [
+            operation.stagingObjectKey,
+            metadata.finalObjectKey,
+            metadata.stagedObjectKey,
+            ...(metadata.cleanupObjectKeys ?? []),
+            metadata.workspaceObjectKey,
+          ];
+        }),
+      ];
+      const linkedObjectPrefixes = [
+        ...new Set(
+          uniqueObjectKeys(candidateKeys).flatMap((key) => {
+            const [scope, pathId] = key.split("/", 3);
+            return (scope === "operations" || scope === "submissions") && pathId
+              ? [`${scope}/${pathId}/`]
+              : [];
+          })
+        ),
+      ];
+      const prefixes = responseDeletionPrefixes(
+        response.id,
+        response.submission?.id ?? null,
+        linkedObjectPrefixes
+      );
+      for (const key of uniqueObjectKeys(candidateKeys)) {
+        if (!responseDeletionKeyBelongs(key, prefixes)) {
+          fail(
+            500,
+            "invalid_object_key",
+            "Response object ownership is invalid"
+          );
+        }
+      }
+      const cleanupIntents = await tx.objectCleanupIntent.findMany({
+        select: { objectKey: true },
+        where: {
+          OR: prefixes.map((prefix) => ({
+            objectKey: { startsWith: prefix },
+          })),
+        },
+      });
+      const objectKeys = uniqueObjectKeys([
+        ...candidateKeys,
+        ...cleanupIntents.map((intent) => intent.objectKey),
+      ]);
+      for (const objectKeyValue of objectKeys) {
+        await tx.objectCleanupIntent.upsert({
+          create: {
+            deletionOwnerUserId: response.userId,
+            deletionResponseLookupDigest: responseLookupDigest,
+            objectKey: objectKeyValue,
+          },
+          update: {
+            cleanupAfter: new Date(),
+            deletionOwnerUserId: response.userId,
+            deletionResponseLookupDigest: responseLookupDigest,
+          },
+          where: { objectKey: objectKeyValue },
+        });
+      }
+
+      const handoffs = await tx.handoff.findMany({
+        select: { id: true },
+        where: {
+          OR: [
+            { responseId: response.id },
+            ...(response.externalReferenceDigest
+              ? [{ externalReferenceDigest: response.externalReferenceDigest }]
+              : []),
+          ],
+        },
+      });
+      if (handoffs.length > 0) {
+        const handoffIds = handoffs.map((handoff) => handoff.id);
+        await tx.pendingClaim.deleteMany({
+          where: { handoffId: { in: handoffIds } },
+        });
+        await tx.handoff.updateMany({
+          data: {
+            codeDigest: null,
+            configurationHash: null,
+            consumedAt: null,
+            deletionResponseLookupDigest: responseLookupDigest,
+            filteredValues: Prisma.JsonNull,
+            formId: null,
+            normalizedEmail: null,
+            reservedAt: null,
+            responseId: null,
+            status: HandoffStatus.deleted,
+          },
+          where: { id: { in: handoffIds } },
+        });
+      }
+      await tx.editorLease.deleteMany({
+        where: {
+          OR: [
+            {
+              targetId: response.id,
+              targetType: OperationTargetType.response,
+            },
+            {
+              targetId: response.id,
+              targetType: OperationTargetType.correction,
+            },
+          ],
+        },
+      });
+      await tx.operation.deleteMany({
+        where: {
+          OR: [
+            { responseId: response.id },
+            ...(response.submission
+              ? [{ submissionId: response.submission.id }]
+              : []),
+            ...(correctionIds.length > 0
+              ? [{ correctionId: { in: correctionIds } }]
+              : []),
+          ],
+        },
+      });
+      if (revokeOwnerSessions) {
+        await tx.session.deleteMany({ where: { userId: response.userId } });
+      }
+      await tx.correction.deleteMany({ where: { responseId: response.id } });
+      await tx.submission.deleteMany({ where: { responseId: response.id } });
+      await tx.prefillSnapshot.deleteMany({
+        where: { responseId: response.id },
+      });
+      await tx.response.delete({ where: { id: response.id } });
+      await tx.deletionTombstone.create({
+        data: {
+          actorId: actor.id,
+          externalReferenceDigest: response.externalReferenceDigest,
+          id: crypto.randomUUID(),
+          outcome: AuditOutcome.success,
+          responseLookupDigest,
+        },
+      });
+      await createResponseDeletionAudit({
+        action: "delete_response_pending",
+        actorId: actor.id,
+        outcome: AuditOutcome.success,
+        targetId: response.id,
+        tx,
+      });
+      return { alreadyDeleted: false, deleted: true };
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+  );
+  if (!result.deleted) {
+    return result;
+  }
+  await drainObjectCleanupIntents(
+    undefined,
+    responseLookupDigest,
+    removeObject
+  );
+  const remaining = await prisma.objectCleanupIntent.count({
+    where: { deletionResponseLookupDigest: responseLookupDigest },
+  });
+  if (remaining > 0) {
+    fail(503, "deletion_cleanup_failed", "Response objects remain");
+  }
+  await createResponseDeletionAudit({
+    actorId: actor.id,
+    outcome: AuditOutcome.success,
+    targetId: responseId,
+  });
+  return result;
 }
 
 interface FormCounts {
@@ -5575,6 +5962,20 @@ async function createPrefillHandoff(
         ) {
           fail(404, "not_found", "Form was not found");
         }
+        const deletedReference = await tx.deletionTombstone.findUnique({
+          select: { id: true },
+          where: { externalReferenceDigest },
+        });
+        if (deletedReference) {
+          handoffUnavailable();
+        }
+        const existingReference = await tx.handoff.findUnique({
+          select: { id: true },
+          where: { externalReferenceDigest },
+        });
+        if (existingReference) {
+          handoffUnavailable();
+        }
         await tx.handoff.create({
           data: {
             codeDigest,
@@ -5814,6 +6215,15 @@ async function redeemPrefillHandoff(
           configuration.configurationHash !==
             currentForm.publishedTemplate.contentHash
         ) {
+          handoffUnavailable();
+        }
+        const deletedReference = await tx.deletionTombstone.findUnique({
+          select: { id: true },
+          where: {
+            externalReferenceDigest: handoff.externalReferenceDigest,
+          },
+        });
+        if (deletedReference) {
           handoffUnavailable();
         }
         const currentResponse = await tx.response.findUnique({
@@ -6186,6 +6596,22 @@ function externalPrefillStatus(handoff: {
     updatedAt: handoff.updatedAt.toISOString(),
   };
 }
+function deletedExternalPrefillStatus(
+  createdAt: Date
+): ReturnType<typeof externalPrefillStatus> & { deletedAt: string } {
+  const timestamp = createdAt.toISOString();
+  return {
+    consumedAt: null,
+    createdAt: timestamp,
+    deletedAt: timestamp,
+    expiresAt: timestamp,
+    latestCorrectionNumber: null,
+    reservedAt: null,
+    status: "deleted",
+    submittedAt: null,
+    updatedAt: timestamp,
+  };
+}
 
 async function pollPrefillHandoffStatus(
   externalReference: string,
@@ -6205,7 +6631,20 @@ async function pollPrefillHandoffStatus(
     },
   } as const;
   const externalReferenceDigest = tokenDigest(externalReference);
-  const handoff = await prisma.$transaction(async (tx) => {
+  const handoffResult = await prisma.$transaction(async (tx) => {
+    const deletionTombstone = await tx.deletionTombstone.findUnique({
+      where: { externalReferenceDigest },
+    });
+    if (deletionTombstone) {
+      const pendingCleanup = await tx.objectCleanupIntent.count({
+        where: {
+          deletionResponseLookupDigest: deletionTombstone.responseLookupDigest,
+        },
+      });
+      return pendingCleanup > 0
+        ? { cleanupPending: true }
+        : { deletedAt: deletionTombstone.createdAt };
+    }
     const current = await tx.handoff.findFirst({
       include: relations,
       orderBy: { createdAt: "desc" },
@@ -6213,6 +6652,19 @@ async function pollPrefillHandoffStatus(
     });
     if (!current) {
       handoffUnavailable();
+    }
+    if (
+      current.status === HandoffStatus.deleted &&
+      current.deletionResponseLookupDigest
+    ) {
+      const pendingCleanup = await tx.objectCleanupIntent.count({
+        where: {
+          deletionResponseLookupDigest: current.deletionResponseLookupDigest,
+        },
+      });
+      if (pendingCleanup > 0) {
+        return { cleanupPending: true };
+      }
     }
     const now = clock();
     if (
@@ -6254,11 +6706,23 @@ async function pollPrefillHandoffStatus(
       if (!refreshed) {
         handoffUnavailable();
       }
-      return refreshed;
+      return { handoff: refreshed };
     }
-    return current;
+    return { handoff: current };
   });
-  return externalPrefillStatus(handoff);
+  if (handoffResult.cleanupPending) {
+    handoffUnavailable();
+  }
+  if (handoffResult.deletedAt instanceof Date) {
+    return deletedExternalPrefillStatus(handoffResult.deletedAt);
+  }
+  if (!handoffResult.handoff) {
+    handoffUnavailable();
+  }
+  if (handoffResult.handoff.status === HandoffStatus.deleted) {
+    return deletedExternalPrefillStatus(handoffResult.handoff.updatedAt);
+  }
+  return externalPrefillStatus(handoffResult.handoff);
 }
 
 async function findOwnedResponse(
@@ -6681,6 +7145,7 @@ async function userEditorConfig(
 
 export function createApp(options: AppOptions = {}) {
   const onlyOffice = options.onlyOffice ?? createOnlyOfficeClient();
+  const removeObject = options.deleteObject ?? deleteObject;
   const allowedCallbackOrigins = options.onlyOfficeCallbackOrigins
     ? new Set(options.onlyOfficeCallbackOrigins)
     : callbackOrigins;
@@ -7160,6 +7625,26 @@ export function createApp(options: AppOptions = {}) {
                   fail(409, "email_in_use", "Email is already in use");
                 }
               }
+              if (newEmail !== undefined && newEmail !== target.email) {
+                const staleHandoffs = await tx.handoff.findMany({
+                  select: { id: true },
+                  where: {
+                    normalizedEmail: target.email,
+                    responseId: null,
+                  },
+                });
+                if (staleHandoffs.length > 0) {
+                  const staleHandoffIds = staleHandoffs.map(
+                    (handoff) => handoff.id
+                  );
+                  await tx.pendingClaim.deleteMany({
+                    where: { handoffId: { in: staleHandoffIds } },
+                  });
+                  await tx.handoff.deleteMany({
+                    where: { id: { in: staleHandoffIds } },
+                  });
+                }
+              }
               const updated = await tx.user.update({
                 data: updateData,
                 select: adminUserSelect,
@@ -7178,6 +7663,97 @@ export function createApp(options: AppOptions = {}) {
               return updated;
             });
             return { user: accountUserSummary(user) };
+          }
+        ),
+      { parse: "none" }
+    )
+    .delete(
+      "/api/admin/users/:id",
+      ({ request, params }) =>
+        withAdminMutation(
+          request,
+          "delete_user",
+          accountAuditTargetId(params.id),
+          async (identity) => {
+            const userId = validateId(params.id, "User");
+            const input = await readJsonRecord(
+              request,
+              accountBodyMaximumBytes
+            );
+            if (Object.keys(input).length !== 1 || input.confirm !== true) {
+              fail(400, "invalid_request", "confirm must be true");
+            }
+            await accountTransaction(identity, async (tx) => {
+              const target = await lockAccountUser(tx, userId);
+              if (target.role === "admin" && target.enabled) {
+                const enabledAdminCount = await tx.user.count({
+                  where: { enabled: true, role: "admin" },
+                });
+                if (enabledAdminCount <= 1) {
+                  fail(
+                    409,
+                    "final_admin_required",
+                    "At least one enabled Admin is required"
+                  );
+                }
+              }
+              const responseCount = await tx.response.count({
+                where: { userId: target.id },
+              });
+              if (responseCount > 0) {
+                fail(
+                  409,
+                  "personal_data_remains",
+                  "Personal Responses must be deleted first"
+                );
+              }
+              const cleanupIntentCount = await tx.objectCleanupIntent.count({
+                where: { deletionOwnerUserId: target.id },
+              });
+              if (cleanupIntentCount > 0) {
+                fail(
+                  409,
+                  "personal_data_remains",
+                  "Response object cleanup is still pending"
+                );
+              }
+              const handoffs = await tx.handoff.findMany({
+                select: { id: true },
+                where: { normalizedEmail: target.email },
+              });
+              if (handoffs.length > 0) {
+                await tx.pendingClaim.deleteMany({
+                  where: {
+                    handoffId: {
+                      in: handoffs.map((handoff) => handoff.id),
+                    },
+                  },
+                });
+                await tx.handoff.updateMany({
+                  data: {
+                    codeDigest: null,
+                    configurationHash: null,
+                    consumedAt: null,
+                    filteredValues: Prisma.JsonNull,
+                    formId: null,
+                    normalizedEmail: null,
+                    reservedAt: null,
+                    responseId: null,
+                    status: HandoffStatus.deleted,
+                  },
+                  where: { id: { in: handoffs.map((handoff) => handoff.id) } },
+                });
+              }
+              await createAccountAudit(tx, {
+                action: "delete_user",
+                actorId: identity.id,
+                outcome: AuditOutcome.success,
+                safeMetadata: { change: "deleted" },
+                targetId: target.id,
+              });
+              await tx.user.delete({ where: { id: target.id } });
+            });
+            return { deleted: true };
           }
         ),
       { parse: "none" }
@@ -9272,124 +9848,75 @@ export function createApp(options: AppOptions = {}) {
         return pdf;
       }
     )
+    .delete(
+      "/api/admin/responses/:id",
+      async ({ request, params }) => {
+        const identity = await requireIdentity(request);
+        requireAdmin(identity);
+        const responseId = validateId(params.id, "Response");
+        try {
+          const input = await readJsonRecord(request, accountBodyMaximumBytes);
+          if (Object.keys(input).length !== 1 || input.confirm !== true) {
+            fail(400, "invalid_request", "confirm must be true");
+          }
+          const result = await deleteResponseData({
+            actor: identity,
+            allowActiveLease: false,
+            missingOk: false,
+            removeObject,
+            responseId,
+            revokeOwnerSessions: true,
+          });
+          if (result.alreadyDeleted) {
+            await createResponseDeletionAudit({
+              actorId: identity.id,
+              outcome: AuditOutcome.success,
+              targetId: responseId,
+            });
+          }
+          return { deleted: true };
+        } catch (error) {
+          try {
+            await createResponseDeletionAudit({
+              actorId: identity.id,
+              error,
+              outcome: AuditOutcome.failure,
+              targetId: responseId,
+            });
+          } catch {
+            // Preserve the deletion error if the failure audit cannot be persisted.
+          }
+          throw error;
+        }
+      },
+      { parse: "none" }
+    )
     .delete("/api/responses/:id", async ({ request, params }) => {
       const identity = await requireIdentity(request);
-      validateId(params.id, "Response");
-      const objectKeys: string[] = [];
-      const discarded = await prisma.$transaction(async (tx) => {
-        const response = await tx.response.findUnique({
-          select: { formId: true },
-          where: { id: params.id },
+      const responseId = validateId(params.id, "Response");
+      try {
+        await deleteResponseData({
+          actor: identity,
+          allowActiveLease: true,
+          missingOk: true,
+          removeObject,
+          responseId,
+          revokeOwnerSessions: false,
         });
-        if (!response) {
-          return false;
-        }
-        const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
-          Prisma.sql`
-            SELECT "id"
-            FROM "forms"
-            WHERE "id" = ${response.formId}::uuid
-            FOR UPDATE
-          `
-        );
-        if (!lockedForm) {
-          return false;
-        }
-        const current = await tx.response.findUnique({
-          include: { submission: true },
-          where: { id: params.id },
-        });
-        if (!current) {
-          return false;
-        }
-        if (current.userId !== identity.id) {
-          fail(403, "forbidden", "You may only discard your own Draft");
-        }
-        if (current.status !== ResponseStatus.draft || current.submission) {
-          fail(409, "draft_unavailable", "Only a Draft can be discarded");
-        }
-        const operations = await tx.operation.findMany({
-          select: {
-            metadata: true,
-            stagingObjectKey: true,
-          },
-          where: { responseId: current.id },
-        });
-        const activeOperation = await tx.operation.findFirst({
-          select: { id: true },
-          where: {
-            responseId: current.id,
-            status: {
-              in: [OperationStatus.pending, OperationStatus.processing],
-            },
-          },
-        });
-        if (activeOperation) {
-          fail(409, "operation_in_progress", "The Draft is still being saved");
-        }
-        objectKeys.push(current.draftObjectKey ?? "");
-        for (const operation of operations) {
-          objectKeys.push(operation.stagingObjectKey ?? "");
-          try {
-            const metadata = operationMetadata(operation.metadata);
-            objectKeys.push(
-              metadata.finalObjectKey,
-              metadata.stagedObjectKey,
-              ...(metadata.cleanupObjectKeys ?? [])
-            );
-          } catch {
-            // The operation row is deleted below; no trusted object key exists.
-          }
-        }
-        const cleanupKeys = uniqueObjectKeys(objectKeys);
-        if (cleanupKeys.length > 0) {
-          await tx.objectCleanupIntent.createMany({
-            data: cleanupKeys.map((objectKeyValue) => ({
-              objectKey: objectKeyValue,
-            })),
-            skipDuplicates: true,
-          });
-        }
-        await tx.editorLease.deleteMany({
-          where: {
-            targetId: current.id,
-            targetType: OperationTargetType.response,
-          },
-        });
-        await tx.operation.deleteMany({ where: { responseId: current.id } });
-        await tx.pendingClaim.deleteMany({
-          where: { handoff: { responseId: current.id } },
-        });
-        await tx.handoff.updateMany({
-          data: { status: HandoffStatus.deleted },
-          where: {
-            responseId: current.id,
-            status: {
-              in: [
-                HandoffStatus.pending,
-                HandoffStatus.reserved,
-                HandoffStatus.consumed,
-              ],
-            },
-          },
-        });
-        await tx.response.delete({ where: { id: current.id } });
-        await tx.auditEvent.create({
-          data: {
-            action: "discard_response",
+        return { discarded: true };
+      } catch (error) {
+        try {
+          await createResponseDeletionAudit({
             actorId: identity.id,
-            outcome: AuditOutcome.success,
-            safeMetadata: jsonValue({}),
-            targetId: current.id,
-            targetType: "response",
-          },
-        });
-        return true;
-      });
-      if (discarded) {
-        await drainObjectCleanupIntents(objectKeys);
+            error,
+            outcome: AuditOutcome.failure,
+            targetId: responseId,
+          });
+        } catch {
+          // Preserve the deletion error if the failure audit cannot be persisted.
+        }
+        throw error;
       }
-      return { discarded: true };
     })
     .post(
       "/api/forms/:publicId/draft",

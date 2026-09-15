@@ -1,12 +1,13 @@
 // oxlint-disable unicorn/filename-case -- TanStack Router requires this dynamic route filename.
 import { createFileRoute, Link, useParams } from "@tanstack/react-router";
-import { FileJson, FileText, LockKeyhole } from "lucide-react";
-import { useEffect, useState } from "react";
+import { FileJson, FileText, LockKeyhole, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 
 import { PageHeader } from "@/components/app-shell";
 import { Badge, Button, Card, Notice, Spinner } from "@/components/ui";
 import {
   ApiError,
+  apiDelete,
   apiGet,
   downloadArtifact,
   formatDate,
@@ -111,6 +112,19 @@ const RevisionSelector = ({
   </div>
 );
 
+const deletionErrorMessage = (caughtError: unknown) => {
+  if (caughtError instanceof ApiError && caughtError.code === "editor_in_use") {
+    return "คำตอบกำลังเปิดอยู่ในตัวแก้ไข กรุณาปิดหน้าต่างนั้นแล้วลองใหม่";
+  }
+  if (
+    caughtError instanceof ApiError &&
+    caughtError.code === "deletion_cleanup_failed"
+  ) {
+    return "ลบข้อมูลแล้ว แต่ไฟล์ยังอยู่ระหว่างการล้างข้อมูล กรุณาลองใหม่";
+  }
+  return "ลบคำตอบไม่สำเร็จ กรุณาลองใหม่อีกครั้ง";
+};
+// oxlint-disable-next-line complexity -- The detail route owns read, history, export, and deletion states.
 const AdminResultDetailRoute = () => {
   const { responseId } = useParams({ from: "/admin/results/$responseId/" });
   const [result, setResult] = useState<AdminResultDetail | null>(null);
@@ -126,6 +140,12 @@ const AdminResultDetailRoute = () => {
   const [error, setError] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState<string | null>(null);
+  const [deleteConfirmation, setDeleteConfirmation] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteSuccess, setDeleteSuccess] = useState(false);
+  const deleteTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const deleteFeedbackRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     let cancelled = false;
     const loadResult = async () => {
@@ -187,6 +207,53 @@ const AdminResultDetailRoute = () => {
       cancelled = true;
     };
   }, [responseId, result]);
+  useEffect(() => {
+    if (deleteConfirmation) {
+      document
+        .querySelector<HTMLButtonElement>("#delete-response-cancel")
+        ?.focus();
+    }
+  }, [deleteConfirmation]);
+
+  useEffect(() => {
+    if (deleteError || deleteSuccess) {
+      deleteFeedbackRef.current?.focus();
+    }
+  }, [deleteError, deleteSuccess]);
+
+  const requestDelete = (trigger: HTMLButtonElement) => {
+    deleteTriggerRef.current = trigger;
+    setDeleteError(null);
+    setDeleteConfirmation(true);
+  };
+
+  const cancelDelete = () => {
+    if (deleting) {
+      return;
+    }
+    setDeleteConfirmation(false);
+    setDeleteError(null);
+    deleteTriggerRef.current?.focus();
+    deleteTriggerRef.current = null;
+  };
+
+  const deleteResult = async () => {
+    if (!result || deleting) {
+      return;
+    }
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await apiDelete(`/api/admin/responses/${responseId}`, { confirm: true });
+      setDeleteConfirmation(false);
+      setResult(null);
+      setDeleteSuccess(true);
+    } catch (caughtError) {
+      setDeleteError(deletionErrorMessage(caughtError));
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   const download = async (
     format: "json" | "docx" | "pdf",
@@ -209,6 +276,24 @@ const AdminResultDetailRoute = () => {
       setDownloading(null);
     }
   };
+  if (deleteSuccess) {
+    return (
+      <div
+        ref={deleteFeedbackRef}
+        className="space-y-4 focus:outline-none"
+        role="status"
+        tabIndex={-1}
+      >
+        <Notice tone="success">
+          <strong>ลบข้อมูลคำตอบถาวรแล้ว</strong>
+          <div>ระบบลบข้อมูลส่วนบุคคล เอกสาร และข้อมูล Prefill ที่เกี่ยวข้องแล้ว</div>
+        </Notice>
+        <Link search={{ form: undefined }} to="/admin/results">
+          <Button variant="secondary">กลับไปรายการผลลัพธ์</Button>
+        </Link>
+      </div>
+    );
+  }
 
   if (loading) {
     return <Spinner />;
@@ -237,131 +322,195 @@ const AdminResultDetailRoute = () => {
     submittedDataLabel = "ข้อมูลล่าสุดของ Correction";
   }
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title={result.formTitle}
-        description={`${result.userEmail} · ${result.formPublicId}`}
-        action={
-          <Link to="/admin/results" search={{ form: undefined }}>
-            <Button variant="secondary">กลับไปรายการ</Button>
-          </Link>
-        }
-      />
-      <Card>
-        <div className="flex flex-wrap items-center gap-3">
-          <Badge tone={isSubmitted ? "success" : "warning"}>
-            {isSubmitted ? "ส่งแล้ว" : "ฉบับร่าง"}
-          </Badge>
-          <Badge tone="neutral">
-            <LockKeyhole className="mr-1 inline" size={14} />
-            อ่านอย่างเดียว
-          </Badge>
-          <span className="text-sm text-[var(--ink-soft)]">
-            อัปเดต {formatDate(result.updatedAt)} · Correction{" "}
-            {result.latestCorrectionNumber ?? "—"}
-          </span>
-        </div>
-        {isDraft ? (
-          <Notice>
-            <strong>ฉบับร่างอ่านได้อย่างเดียว</strong>
-            <div>
-              Admin ไม่สามารถแก้ไข ยึด Lease หรือส่งออกฉบับร่างจาก workflow นี้ได้
+    <>
+      {deleteConfirmation ? (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/35 px-5"
+          role="presentation"
+        >
+          <div
+            className="w-full max-w-lg rounded-[var(--radius)] border border-[var(--line)] bg-[var(--paper)] p-6 shadow-xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-response-title"
+          >
+            <h2 id="delete-response-title" className="text-lg font-semibold">
+              ยืนยันการลบคำตอบถาวร
+            </h2>
+            <p className="mt-2 text-sm text-[var(--ink-soft)]">
+              ระบบจะลบ Draft หรือ Submission นี้พร้อม Prefill, ประวัติ Correction,
+              เอกสาร และเซสชันของเจ้าของบัญชี การลบไม่สามารถกู้คืนได้
+            </p>
+            {deleteError ? (
+              <div
+                ref={deleteFeedbackRef}
+                className="mt-4 focus:outline-none"
+                role="alert"
+                tabIndex={-1}
+              >
+                <Notice tone="danger">{deleteError}</Notice>
+              </div>
+            ) : null}
+            <div className="mt-6 flex justify-end gap-2">
+              <Button
+                id="delete-response-cancel"
+                type="button"
+                variant="ghost"
+                onClick={cancelDelete}
+                disabled={deleting}
+              >
+                ยกเลิก
+              </Button>
+              <Button
+                type="button"
+                variant="danger"
+                onClick={deleteResult}
+                disabled={deleting}
+              >
+                {deleting ? <Spinner /> : <Trash2 size={16} />}
+                {deleting ? "กำลังลบ…" : "ยืนยันการลบถาวร"}
+              </Button>
             </div>
-          </Notice>
-        ) : (
-          <div className="mt-5 flex flex-wrap gap-2" aria-label="จัดการคำตอบ">
-            <RevisionSelector
-              hasOriginalRevision={hasOriginalRevision}
-              historyError={historyError}
-              historyLoading={historyLoading}
-              latestRevision={latestRevision}
-              setViewRevision={setViewRevision}
-              viewRevision={viewRevision}
-            />
-            <Link
-              search={{ form: undefined }}
-              to="/admin/results/$responseId/correction"
-              params={{ responseId }}
-            >
-              <Button variant="primary">เปิด Correction</Button>
+          </div>
+        </div>
+      ) : null}
+      <div className="space-y-6">
+        <PageHeader
+          title={result.formTitle}
+          description={`${result.userEmail} · ${result.formPublicId}`}
+          action={
+            <Link to="/admin/results" search={{ form: undefined }}>
+              <Button variant="secondary">กลับไปรายการ</Button>
             </Link>
+          }
+        />
+        <Card>
+          <div className="flex flex-wrap items-center gap-3">
+            <Badge tone={isSubmitted ? "success" : "warning"}>
+              {isSubmitted ? "ส่งแล้ว" : "ฉบับร่าง"}
+            </Badge>
+            <Badge tone="neutral">
+              <LockKeyhole className="mr-1 inline" size={14} />
+              อ่านอย่างเดียว
+            </Badge>
+            <span className="text-sm text-[var(--ink-soft)]">
+              อัปเดต {formatDate(result.updatedAt)} · Correction{" "}
+              {result.latestCorrectionNumber ?? "—"}
+            </span>
+          </div>
+          {isDraft ? (
+            <Notice>
+              <strong>ฉบับร่างอ่านได้อย่างเดียว</strong>
+              <div>
+                Admin ไม่สามารถแก้ไข ยึด Lease หรือส่งออกฉบับร่างจาก workflow นี้ได้
+              </div>
+            </Notice>
+          ) : (
+            <div className="mt-5 flex flex-wrap gap-2" aria-label="จัดการคำตอบ">
+              <RevisionSelector
+                hasOriginalRevision={hasOriginalRevision}
+                historyError={historyError}
+                historyLoading={historyLoading}
+                latestRevision={latestRevision}
+                setViewRevision={setViewRevision}
+                viewRevision={viewRevision}
+              />
+              <Link
+                search={{ form: undefined }}
+                to="/admin/results/$responseId/correction"
+                params={{ responseId }}
+              >
+                <Button variant="primary">เปิด Correction</Button>
+              </Link>
+              <Button
+                disabled={downloading !== null}
+                onClick={() => download("json", "original")}
+                variant="secondary"
+              >
+                <FileJson size={16} />
+                JSON เดิม
+              </Button>
+              <Button
+                disabled={downloading !== null}
+                onClick={() => download("docx", "original")}
+                variant="secondary"
+              >
+                <FileText size={16} />
+                DOCX เดิม
+              </Button>
+              <Button
+                disabled={downloading !== null}
+                onClick={() => download("pdf", "original")}
+                variant="secondary"
+              >
+                <FileText size={16} />
+                PDF เดิม
+              </Button>
+              <Button
+                disabled={downloading !== null}
+                onClick={() => download("json", "latest")}
+                variant="secondary"
+              >
+                <FileJson size={16} />
+                JSON ล่าสุด
+              </Button>
+              <Button
+                disabled={downloading !== null}
+                onClick={() => download("docx", "latest")}
+                variant="secondary"
+              >
+                <FileText size={16} />
+                DOCX ล่าสุด
+              </Button>
+              <Button
+                disabled={downloading !== null}
+                onClick={() => download("pdf", "latest")}
+                variant="secondary"
+              >
+                <FileText size={16} />
+                PDF ล่าสุด
+              </Button>
+            </div>
+          )}
+          {downloadError ? (
+            <Notice tone="danger">
+              <strong>ส่งออกไม่สำเร็จ</strong>
+              <div>{downloadError}</div>
+            </Notice>
+          ) : null}
+          <div className="mt-5 border-t border-[var(--line)] pt-4">
             <Button
-              disabled={downloading !== null}
-              onClick={() => download("json", "original")}
-              variant="secondary"
+              type="button"
+              variant="danger"
+              onClick={(event) => requestDelete(event.currentTarget)}
+              disabled={deleting || downloading !== null}
             >
-              <FileJson size={16} />
-              JSON เดิม
-            </Button>
-            <Button
-              disabled={downloading !== null}
-              onClick={() => download("docx", "original")}
-              variant="secondary"
-            >
-              <FileText size={16} />
-              DOCX เดิม
-            </Button>
-            <Button
-              disabled={downloading !== null}
-              onClick={() => download("pdf", "original")}
-              variant="secondary"
-            >
-              <FileText size={16} />
-              PDF เดิม
-            </Button>
-            <Button
-              disabled={downloading !== null}
-              onClick={() => download("json", "latest")}
-              variant="secondary"
-            >
-              <FileJson size={16} />
-              JSON ล่าสุด
-            </Button>
-            <Button
-              disabled={downloading !== null}
-              onClick={() => download("docx", "latest")}
-              variant="secondary"
-            >
-              <FileText size={16} />
-              DOCX ล่าสุด
-            </Button>
-            <Button
-              disabled={downloading !== null}
-              onClick={() => download("pdf", "latest")}
-              variant="secondary"
-            >
-              <FileText size={16} />
-              PDF ล่าสุด
+              <Trash2 size={16} />
+              ลบคำตอบถาวร
             </Button>
           </div>
-        )}
-        {downloadError ? (
-          <Notice tone="danger">
-            <strong>ส่งออกไม่สำเร็จ</strong>
-            <div>{downloadError}</div>
-          </Notice>
-        ) : null}
-      </Card>
-      {isSubmitted ? (
-        <Card>
-          <h2 className="font-semibold">ประวัติ Correction</h2>
-          <CorrectionHistory
-            error={historyError}
-            history={history}
-            loading={historyLoading}
-          />
         </Card>
-      ) : null}
-      <Card>
-        <h2 className="font-semibold">ข้อมูลคำตอบ</h2>
-        <p className="mt-1 text-sm text-[var(--ink-soft)]">
-          {isSubmitted ? submittedDataLabel : "ข้อมูล Draft ปัจจุบัน"}
-        </p>
-        <pre className="mt-4 max-h-[560px] overflow-auto rounded-[10px] bg-[#eef1ed] p-4 text-sm leading-6 text-[var(--ink-soft)]">
-          {JSON.stringify(displayedData, null, 2)}
-        </pre>
-      </Card>
-    </div>
+        {isSubmitted ? (
+          <Card>
+            <h2 className="font-semibold">ประวัติ Correction</h2>
+            <CorrectionHistory
+              error={historyError}
+              history={history}
+              loading={historyLoading}
+            />
+          </Card>
+        ) : null}
+        <Card>
+          <h2 className="font-semibold">ข้อมูลคำตอบ</h2>
+          <p className="mt-1 text-sm text-[var(--ink-soft)]">
+            {isSubmitted ? submittedDataLabel : "ข้อมูล Draft ปัจจุบัน"}
+          </p>
+          <pre className="mt-4 max-h-[560px] overflow-auto rounded-[10px] bg-[#eef1ed] p-4 text-sm leading-6 text-[var(--ink-soft)]">
+            {JSON.stringify(displayedData, null, 2)}
+          </pre>
+        </Card>
+      </div>
+    </>
   );
 };
 

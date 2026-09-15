@@ -381,20 +381,21 @@ model Correction {
 }
 
 model Handoff {
-  id                      String        @id @default(uuid()) @db.Uuid
-  formId                  String?       @map("form_id") @db.Uuid
-  responseId              String?       @map("response_id") @db.Uuid
-  normalizedEmail         String?       @map("normalized_email")
-  externalReferenceDigest String        @map("external_reference_digest")
-  codeDigest              String?       @unique @map("code_digest")
-  filteredValues          Json?         @map("filtered_values")
-  configurationHash       String?       @map("configuration_hash")
-  status                  HandoffStatus @default(pending)
-  expiresAt               DateTime      @map("expires_at") @db.Timestamptz(3)
-  reservedAt              DateTime?     @map("reserved_at") @db.Timestamptz(3)
-  consumedAt              DateTime?     @map("consumed_at") @db.Timestamptz(3)
-  createdAt               DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt               DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+  id                           String        @id @default(uuid()) @db.Uuid
+  formId                       String?       @map("form_id") @db.Uuid
+  responseId                   String?       @map("response_id") @db.Uuid
+  deletionResponseLookupDigest String?       @map("deletion_response_lookup_digest")
+  normalizedEmail              String?       @map("normalized_email")
+  externalReferenceDigest      String        @unique @map("external_reference_digest")
+  codeDigest                   String?       @unique @map("code_digest")
+  filteredValues               Json?         @map("filtered_values")
+  configurationHash            String?       @map("configuration_hash")
+  status                       HandoffStatus @default(pending)
+  expiresAt                    DateTime      @map("expires_at") @db.Timestamptz(3)
+  reservedAt                   DateTime?     @map("reserved_at") @db.Timestamptz(3)
+  consumedAt                   DateTime?     @map("consumed_at") @db.Timestamptz(3)
+  createdAt                    DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                    DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
 
   form         Form?         @relation(fields: [formId], references: [id], onDelete: SetNull)
   response     Response?     @relation(fields: [responseId], references: [id], onDelete: SetNull)
@@ -403,6 +404,7 @@ model Handoff {
   @@index([formId, status, expiresAt])
   @@index([responseId])
   @@index([externalReferenceDigest, createdAt])
+  @@index([deletionResponseLookupDigest, updatedAt])
   @@index([status, expiresAt])
   @@map("handoffs")
 }
@@ -498,12 +500,16 @@ model EditorLease {
 }
 
 model ObjectCleanupIntent {
-  id           String   @id @default(uuid()) @db.Uuid
-  objectKey    String   @unique @map("object_key")
-  cleanupAfter DateTime @default(now()) @map("cleanup_after") @db.Timestamptz(3)
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  id                         String   @id @default(uuid()) @db.Uuid
+  objectKey                  String   @unique @map("object_key")
+  deletionResponseLookupDigest String? @map("deletion_response_lookup_digest")
+  deletionOwnerUserId        String?  @map("deletion_owner_user_id")
+  cleanupAfter               DateTime @default(now()) @map("cleanup_after") @db.Timestamptz(3)
+  createdAt                  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
 
   @@index([cleanupAfter, createdAt])
+  @@index([deletionResponseLookupDigest, cleanupAfter])
+  @@index([deletionOwnerUserId, cleanupAfter])
   @@map("object_cleanup_intents")
 }
 

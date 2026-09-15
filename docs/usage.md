@@ -121,6 +121,8 @@ docker compose --env-file apps/server/.env -f compose.yaml up -d --build server
 
 ทุกความพยายามจัดการบัญชีจะเพิ่ม Audit Event แบบ immutable พร้อมผู้กระทำ เป้าหมาย เวลา Action และ Outcome โดยไม่เก็บรหัสผ่าน, password hash, token หรือ credential material
 
+การ **ลบบัญชีถาวร** ทำได้เมื่อบัญชีนั้นไม่มี `Response` หรือไฟล์ส่วนบุคคลค้างอยู่แล้วเท่านั้น ต้องลบ Response จากหน้า **ผลลัพธ์** ก่อน ระบบจะ revoke Session และล้างข้อมูลที่เกี่ยวข้องก่อนลบบัญชี ส่วนการ Disable ยังคง Response, Prefill และ Audit ไว้เพื่อการตรวจสอบภายหลัง
+
 ### 2.2 สิทธิ์ของแต่ละ Role
 
 #### Admin
@@ -209,6 +211,8 @@ Admin เก็บถาวรได้เฉพาะ Form ที่ Publish �
 การออกจากหน้า, Reload, ปิดแท็บ หรือ Session ใกล้หมดอายุขณะมีการแก้ไขที่ยังไม่บันทึกจะแสดงคำเตือน ผู้ใช้เลือก **บันทึกแล้วออก**, **ทิ้งฉบับร่าง** หรืออยู่ต่อได้ การกด **ทิ้งฉบับร่าง** เป็นการลบข้อมูล Draft, Response Document, Lease และไฟล์ที่รอ cleanup อย่างถาวร และทำซ้ำได้อย่างปลอดภัย ปุ่มทิ้งฉบับร่างใน Dashboard ใช้การยืนยันอีกครั้ง
 
 ระบบเตือนก่อน Session หมดอายุ 5 นาที ผู้ใช้สามารถบันทึกก่อนเข้าสู่ระบบใหม่ได้ หลัง Re-authentication ระบบกลับมาที่ Response เดิมด้วย `responseId` แบบ opaque เท่านั้น ไม่ส่งค่าฟิลด์, Prefill, claims หรือ token ผ่าน URL หรือ localStorage
+
+Admin เปิด Receipt หรือหน้า Results เพื่อสลับดูข้อมูล Submission เดิมกับ Correction ล่าสุดและดาวน์โหลด Revision ที่เลือกได้ การลบ Response ถาวรจากหน้า Results ต้องยืนยันอีกครั้ง ระบบจะล้าง Draft, Submission, Prefill, Correction, Session และไฟล์ RustFS ที่เกี่ยวข้อง ไม่เก็บค่าฟิลด์หรือเหตุผลไว้ใน Audit และ retry ได้เมื่อการล้างไฟล์ภายนอกยังไม่เสร็จ
 
 ### 3.4 External editable Prefill Handoff
 
@@ -316,6 +320,8 @@ View submissions
 ```
 
 Admin จะสามารถดูข้อมูล, เปิด Receipt และดาวน์โหลด DOCX/PDF ได้
+
+หน้า Results มีปุ่ม **ลบคำตอบถาวร** สำหรับ Admin เท่านั้น การลบจะคง Tombstone และสถานะ External Handoff เป็น `deleted` โดยเปิดเผยเพียง timestamp ที่จำเป็น หาก RustFS ตอบผิดพลาด ระบบจะเก็บ cleanup intent ไว้และให้ retry จากคำขอเดิมได้โดยไม่ทำให้ข้อมูลที่ลบแล้วกลับมา
 
 ## 5. URL สำคัญ
 

@@ -30,6 +30,7 @@ import {
 } from "../src/onlyoffice";
 import {
   DOCX_CONTENT_TYPE,
+  deleteObject,
   objectExists,
   objectKey,
   putObject,
@@ -2979,6 +2980,20 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   }
   expect(handoffCreateBody.code).toMatch(/^[A-Za-z0-9_-]{43}$/u);
   expect(handoffCreateBody.launchPath).toBe("/prefill/handoff");
+  const duplicateHandoffCreateResponse = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: userEmail,
+      externalReference: handoffExternalReference,
+      publicId: formRecord.publicId,
+      values: handoffCandidateValues,
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(duplicateHandoffCreateResponse.status).toBe(409);
+  expect(await duplicateHandoffCreateResponse.json()).toMatchObject({
+    error: "handoff_unavailable",
+  });
   const handoffRecord = await prisma.handoff.findFirstOrThrow({
     orderBy: { createdAt: "desc" },
     where: {
@@ -7813,6 +7828,588 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     expect(await sessionStatus(authorityAdminB.token)).toBe(401);
   }
 
+  const erasureAdmin =
+    disableRaceResponse.status === 200 ? authorityAdminB : authorityAdminA;
+  const erasureAdminBearer = erasureAdmin.token;
+  const erasureAdminId = erasureAdmin.id;
+  const finalAdminDelete = await accountRequest(
+    "DELETE",
+    `/api/admin/users/${erasureAdmin.id}`,
+    erasureAdminBearer,
+    { confirm: true }
+  );
+  expect(finalAdminDelete.status).toBe(409);
+  expect(await finalAdminDelete.json()).toMatchObject({
+    error: "final_admin_required",
+  });
+  const releaseLeaseIfPresent = async (
+    targetId: string,
+    releaseUrl: string,
+    token: string
+  ) => {
+    const leaseCount = await prisma.editorLease.count({
+      where: { targetId },
+    });
+    if (leaseCount === 0) {
+      return;
+    }
+    const leaseReleaseResponse = await app.handle(
+      new Request(new URL(releaseUrl, "http://test.local").toString(), {
+        headers: { Authorization: `Bearer ${token}` },
+        method: "DELETE",
+      })
+    );
+    expect(leaseReleaseResponse.status).toBe(200);
+  };
+
+  const pictureResponseBeforeDeletion = await prisma.response.findUniqueOrThrow(
+    {
+      select: {
+        draftObjectKey: true,
+        externalReferenceDigest: true,
+      },
+      where: { id: pictureResponseId },
+    }
+  );
+  const pictureSubmissionBeforeDeletion =
+    await prisma.submission.findUniqueOrThrow({
+      select: { id: true, objectKey: true },
+      where: { responseId: pictureResponseId },
+    });
+  const pictureCorrectionBeforeDeletion =
+    await prisma.correction.findFirstOrThrow({
+      select: { id: true, objectKey: true },
+      where: { responseId: pictureResponseId },
+    });
+  await releaseLeaseIfPresent(
+    pictureResponseId,
+    pictureCorrectionEditor.bridge.lease.releaseUrl,
+    erasureAdminBearer
+  );
+  const forbiddenResponseDeletion = await app.handle(
+    new Request(`http://test.local/api/admin/responses/${pictureResponseId}`, {
+      body: JSON.stringify({ confirm: true }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${userBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(forbiddenResponseDeletion.status).toBe(403);
+  const malformedResponseDeletion = await accountRequest(
+    "DELETE",
+    `/api/admin/responses/${pictureResponseId}`,
+    erasureAdminBearer,
+    { confirm: false }
+  );
+  expect(malformedResponseDeletion.status).toBe(400);
+  const pictureDeletionResponse = await accountRequest(
+    "DELETE",
+    `/api/admin/responses/${pictureResponseId}`,
+    erasureAdminBearer,
+    { confirm: true }
+  );
+  expect(pictureDeletionResponse.status).toBe(200);
+  expect(await pictureDeletionResponse.json()).toEqual({ deleted: true });
+  expect(
+    await prisma.response.findUnique({ where: { id: pictureResponseId } })
+  ).toBeNull();
+  expect(
+    await prisma.submission.findUnique({
+      where: { id: pictureSubmissionBeforeDeletion.id },
+    })
+  ).toBeNull();
+  expect(
+    await prisma.correction.findUnique({
+      where: { id: pictureCorrectionBeforeDeletion.id },
+    })
+  ).toBeNull();
+  expect(
+    await prisma.prefillSnapshot.count({
+      where: { responseId: pictureResponseId },
+    })
+  ).toBe(0);
+  expect(
+    await prisma.editorLease.count({ where: { targetId: pictureResponseId } })
+  ).toBe(0);
+  expect(
+    await prisma.operation.count({
+      where: {
+        OR: [
+          { responseId: pictureResponseId },
+          { submissionId: pictureSubmissionBeforeDeletion.id },
+          { correctionId: pictureCorrectionBeforeDeletion.id },
+        ],
+      },
+    })
+  ).toBe(0);
+  if (pictureResponseBeforeDeletion.draftObjectKey) {
+    expect(
+      await objectExists(pictureResponseBeforeDeletion.draftObjectKey)
+    ).toBe(false);
+  }
+  expect(await objectExists(pictureSubmissionBeforeDeletion.objectKey)).toBe(
+    false
+  );
+  expect(await objectExists(pictureCorrectionBeforeDeletion.objectKey)).toBe(
+    false
+  );
+  const pictureDeletionAudit = await prisma.auditEvent.findFirstOrThrow({
+    orderBy: { createdAt: "desc" },
+    where: {
+      action: "delete_response",
+      outcome: "success",
+      targetId: pictureResponseId,
+    },
+  });
+  expect(pictureDeletionAudit.safeMetadata).toEqual({});
+  expect(JSON.stringify(pictureDeletionAudit)).not.toContain("ตรวจสอบรูปภาพ");
+  expect(JSON.stringify(pictureDeletionAudit)).not.toContain(
+    pictureSubmissionBeforeDeletion.objectKey
+  );
+  const pictureTombstone = await prisma.deletionTombstone.findUniqueOrThrow({
+    where: {
+      responseLookupDigest: createHash("sha256")
+        .update(pictureResponseId)
+        .digest("hex"),
+    },
+  });
+  expect(pictureTombstone).toMatchObject({
+    actorId: erasureAdminId,
+    externalReferenceDigest:
+      pictureResponseBeforeDeletion.externalReferenceDigest,
+    outcome: "success",
+  });
+
+  const blockedUserDeletion = await accountRequest(
+    "DELETE",
+    `/api/admin/users/${userId}`,
+    erasureAdminBearer,
+    { confirm: true }
+  );
+  expect(blockedUserDeletion.status).toBe(409);
+  expect(await blockedUserDeletion.json()).toMatchObject({
+    error: "personal_data_remains",
+  });
+  await releaseLeaseIfPresent(responseId, userLease.releaseUrl, userBearer);
+  const mainResponseBeforeDeletion = await prisma.response.findUniqueOrThrow({
+    select: {
+      draftObjectKey: true,
+      externalReferenceDigest: true,
+    },
+    where: { id: responseId },
+  });
+  const mainSubmissionBeforeDeletion =
+    await prisma.submission.findUniqueOrThrow({
+      select: { id: true, objectKey: true },
+      where: { responseId },
+    });
+  const mainDeletionResponse = await accountRequest(
+    "DELETE",
+    `/api/admin/responses/${responseId}`,
+    erasureAdminBearer,
+    { confirm: true }
+  );
+  expect(mainDeletionResponse.status).toBe(200);
+  expect(await mainDeletionResponse.json()).toEqual({ deleted: true });
+  expect(await sessionStatus(userBearer)).toBe(401);
+  expect(
+    await prisma.response.findUnique({ where: { id: responseId } })
+  ).toBeNull();
+  expect(
+    await prisma.submission.findUnique({
+      where: { id: mainSubmissionBeforeDeletion.id },
+    })
+  ).toBeNull();
+  expect(await prisma.prefillSnapshot.count({ where: { responseId } })).toBe(0);
+  expect(
+    await prisma.editorLease.count({ where: { targetId: responseId } })
+  ).toBe(0);
+  expect(
+    await prisma.operation.count({
+      where: {
+        OR: [{ responseId }, { submissionId: mainSubmissionBeforeDeletion.id }],
+      },
+    })
+  ).toBe(0);
+  if (mainResponseBeforeDeletion.draftObjectKey) {
+    expect(await objectExists(mainResponseBeforeDeletion.draftObjectKey)).toBe(
+      false
+    );
+  }
+  expect(await objectExists(mainSubmissionBeforeDeletion.objectKey)).toBe(
+    false
+  );
+  const deletedHandoff = await prisma.handoff.findUniqueOrThrow({
+    where: { id: postSubmitHandoffRecord.id },
+  });
+  expect(deletedHandoff).toMatchObject({
+    codeDigest: null,
+    configurationHash: null,
+    deletionResponseLookupDigest: createHash("sha256")
+      .update(responseId)
+      .digest("hex"),
+    filteredValues: null,
+    formId: null,
+    normalizedEmail: null,
+    responseId: null,
+    status: "deleted",
+  });
+  const deletedExternalStatus = await fetch(`${mock.url}/status`, {
+    body: JSON.stringify({ externalReference: postSubmitExternalReference }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(deletedExternalStatus.status).toBe(200);
+  const deletedExternalBody = await deletedExternalStatus.json();
+  expect(deletedExternalBody).toMatchObject({
+    deletedAt: expect.any(String),
+    status: "deleted",
+  });
+  const staleCapabilityResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
+      body: JSON.stringify({
+        data: {},
+        documentKey: responseDocumentKey,
+        responseId,
+      }),
+      headers: capabilityHeaders(saveDraftCapability),
+      method: "POST",
+    })
+  );
+  expect([401, 404]).toContain(staleCapabilityResponse.status);
+  const pendingStatusExternalReference = `ticket-22-pending-status-${crypto.randomUUID()}`;
+  const pendingStatusResponseDigest = createHash("sha256")
+    .update(`ticket-22-pending-response-${crypto.randomUUID()}`)
+    .digest("hex");
+  await prisma.deletionTombstone.create({
+    data: {
+      actorId: erasureAdminId,
+      externalReferenceDigest: createHash("sha256")
+        .update(pendingStatusExternalReference)
+        .digest("hex"),
+      id: crypto.randomUUID(),
+      outcome: "success",
+      responseLookupDigest: pendingStatusResponseDigest,
+    },
+  });
+  const pendingStatusObjectKey = `ticket-22-pending-status/${crypto.randomUUID()}`;
+  await prisma.objectCleanupIntent.create({
+    data: {
+      deletionResponseLookupDigest: pendingStatusResponseDigest,
+      objectKey: pendingStatusObjectKey,
+    },
+  });
+  const pendingExternalStatus = await fetch(`${mock.url}/status`, {
+    body: JSON.stringify({
+      externalReference: pendingStatusExternalReference,
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(pendingExternalStatus.status).toBe(404);
+  expect(await pendingExternalStatus.json()).toMatchObject({
+    error: "handoff_unavailable",
+  });
+  await prisma.objectCleanupIntent.delete({
+    where: { objectKey: pendingStatusObjectKey },
+  });
+  const completedExternalStatus = await fetch(`${mock.url}/status`, {
+    body: JSON.stringify({
+      externalReference: pendingStatusExternalReference,
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(completedExternalStatus.status).toBe(200);
+  expect(await completedExternalStatus.json()).toMatchObject({
+    status: "deleted",
+  });
+  expect(JSON.stringify(deletedExternalBody)).not.toContain(userEmail);
+  expect(JSON.stringify(deletedExternalBody)).not.toContain(
+    "Ticket 17 Prefill"
+  );
+  const mainDeletionAudit = await prisma.auditEvent.findFirstOrThrow({
+    orderBy: { createdAt: "desc" },
+    where: {
+      action: "delete_response",
+      outcome: "success",
+      targetId: responseId,
+    },
+  });
+  expect(mainDeletionAudit.safeMetadata).toEqual({});
+  expect(JSON.stringify(mainDeletionAudit)).not.toContain(
+    JSON.stringify(savedDraftData)
+  );
+  expect(JSON.stringify(mainDeletionAudit)).not.toContain(
+    postSubmitExternalReference
+  );
+  const mainTombstone = await prisma.deletionTombstone.findUniqueOrThrow({
+    where: {
+      responseLookupDigest: createHash("sha256")
+        .update(responseId)
+        .digest("hex"),
+    },
+  });
+  expect(mainTombstone).toMatchObject({
+    actorId: erasureAdminId,
+    externalReferenceDigest: mainResponseBeforeDeletion.externalReferenceDigest,
+    outcome: "success",
+  });
+  const repeatedMainDeletion = await accountRequest(
+    "DELETE",
+    `/api/admin/responses/${responseId}`,
+    erasureAdminBearer,
+    { confirm: true }
+  );
+  expect(repeatedMainDeletion.status).toBe(200);
+  expect(await repeatedMainDeletion.json()).toEqual({ deleted: true });
+  const deletedOwnerAccount = await accountRequest(
+    "DELETE",
+    `/api/admin/users/${userId}`,
+    erasureAdminBearer,
+    { confirm: true }
+  );
+  expect(deletedOwnerAccount.status).toBe(200);
+  expect(await deletedOwnerAccount.json()).toEqual({ deleted: true });
+  expect(
+    await prisma.auditEvent.findFirst({
+      orderBy: { createdAt: "desc" },
+      where: {
+        action: "delete_user",
+        outcome: "success",
+        targetId: userId,
+      },
+    })
+  ).toMatchObject({ actorId: erasureAdminId, targetId: userId });
+  expect(await prisma.user.findUnique({ where: { id: userId } })).toBeNull();
+  const deletedExternalStatusAfterAccount = await fetch(`${mock.url}/status`, {
+    body: JSON.stringify({ externalReference: postSubmitExternalReference }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(deletedExternalStatusAfterAccount.status).toBe(200);
+  expect(await deletedExternalStatusAfterAccount.json()).toMatchObject({
+    deletedAt: expect.any(String),
+    status: "deleted",
+  });
+
+  const cleanupStart = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: { Authorization: `Bearer ${otherUserBearer}` },
+      method: "POST",
+    })
+  );
+  expect(cleanupStart.status).toBe(200);
+  const cleanupStartBody = (await cleanupStart.json()) as {
+    response?: { id?: string };
+  };
+  const cleanupResponseId = cleanupStartBody.response?.id;
+  if (!cleanupResponseId) {
+    throw new Error("The cleanup failure response was not created");
+  }
+  const cleanupResponse = await prisma.response.findUniqueOrThrow({
+    select: { draftObjectKey: true },
+    where: { id: cleanupResponseId },
+  });
+  if (!cleanupResponse.draftObjectKey) {
+    throw new Error("The cleanup failure object was not created");
+  }
+  const databaseFailureResponseId = cleanupResponseId;
+  await prisma.$executeRawUnsafe(`
+    CREATE OR REPLACE FUNCTION ticket22_abort_response_delete()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $function$
+    BEGIN
+      RAISE EXCEPTION 'ticket22 database failure';
+    END;
+    $function$;
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE TRIGGER ticket22_abort_response_delete
+    BEFORE DELETE ON "responses"
+    FOR EACH ROW
+    EXECUTE FUNCTION ticket22_abort_response_delete();
+  `);
+  let databaseFailureDeletion: Response;
+  try {
+    databaseFailureDeletion = await app.handle(
+      new Request(
+        `http://test.local/api/admin/responses/${databaseFailureResponseId}`,
+        {
+          body: JSON.stringify({ confirm: true }),
+          headers: {
+            ...jsonHeaders,
+            Authorization: `Bearer ${erasureAdminBearer}`,
+          },
+          method: "DELETE",
+        }
+      )
+    );
+  } finally {
+    await prisma.$executeRawUnsafe(`
+      DROP TRIGGER IF EXISTS ticket22_abort_response_delete ON "responses";
+    `);
+    await prisma.$executeRawUnsafe(`
+      DROP FUNCTION IF EXISTS ticket22_abort_response_delete();
+    `);
+  }
+  expect(databaseFailureDeletion.status).toBe(500);
+  expect(await databaseFailureDeletion.json()).toMatchObject({
+    error: "internal_error",
+  });
+  expect(
+    await prisma.response.findUnique({
+      where: { id: databaseFailureResponseId },
+    })
+  ).not.toBeNull();
+  expect(
+    await prisma.objectCleanupIntent.count({
+      where: {
+        deletionResponseLookupDigest: createHash("sha256")
+          .update(databaseFailureResponseId)
+          .digest("hex"),
+      },
+    })
+  ).toBe(0);
+  expect(
+    await prisma.auditEvent.findFirst({
+      orderBy: { createdAt: "desc" },
+      where: {
+        action: "delete_response",
+        outcome: "failure",
+        targetId: databaseFailureResponseId,
+      },
+    })
+  ).toMatchObject({ safeMetadata: { errorCode: "internal_error" } });
+  let failCleanup = true;
+  const cleanupFailureApp = createApp({
+    deleteObject: async (key) => {
+      if (failCleanup) {
+        throw new Error(`deterministic cleanup failure: ${key}`);
+      }
+      await deleteObject(key);
+    },
+  });
+  const failedCleanupDeletion = await cleanupFailureApp.handle(
+    new Request(`http://test.local/api/admin/responses/${cleanupResponseId}`, {
+      body: JSON.stringify({ confirm: true }),
+      headers: {
+        ...jsonHeaders,
+        Authorization: `Bearer ${erasureAdminBearer}`,
+      },
+      method: "DELETE",
+    })
+  );
+  expect(failedCleanupDeletion.status).toBe(503);
+  expect(await failedCleanupDeletion.json()).toMatchObject({
+    error: "deletion_cleanup_failed",
+  });
+  expect(
+    await prisma.response.findUnique({ where: { id: cleanupResponseId } })
+  ).toBeNull();
+  expect(
+    await prisma.objectCleanupIntent.count({
+      where: {
+        deletionResponseLookupDigest: createHash("sha256")
+          .update(cleanupResponseId)
+          .digest("hex"),
+      },
+    })
+  ).toBeGreaterThan(0);
+  expect(
+    await prisma.auditEvent.findFirst({
+      where: {
+        action: "delete_response",
+        outcome: "success",
+        targetId: cleanupResponseId,
+      },
+    })
+  ).toBeNull();
+  expect(
+    await prisma.auditEvent.findFirst({
+      where: {
+        action: "delete_response_pending",
+        outcome: "success",
+        targetId: cleanupResponseId,
+      },
+    })
+  ).toMatchObject({ safeMetadata: {} });
+  const blockedCleanupOwner = await accountRequest(
+    "DELETE",
+    `/api/admin/users/${otherUser.id}`,
+    erasureAdminBearer,
+    { confirm: true }
+  );
+  expect(blockedCleanupOwner.status).toBe(409);
+  expect(await blockedCleanupOwner.json()).toMatchObject({
+    error: "personal_data_remains",
+  });
+  failCleanup = false;
+  const retriedCleanupDeletion = await cleanupFailureApp.handle(
+    new Request(`http://test.local/api/admin/responses/${cleanupResponseId}`, {
+      body: JSON.stringify({ confirm: true }),
+      headers: {
+        ...jsonHeaders,
+        Authorization: `Bearer ${erasureAdminBearer}`,
+      },
+      method: "DELETE",
+    })
+  );
+  expect(retriedCleanupDeletion.status).toBe(200);
+  expect(await retriedCleanupDeletion.json()).toEqual({ deleted: true });
+  expect(
+    await prisma.objectCleanupIntent.count({
+      where: {
+        deletionResponseLookupDigest: createHash("sha256")
+          .update(cleanupResponseId)
+          .digest("hex"),
+      },
+    })
+  ).toBe(0);
+  expect(
+    await prisma.auditEvent.findFirst({
+      where: {
+        action: "delete_response",
+        outcome: "success",
+        targetId: cleanupResponseId,
+      },
+    })
+  ).toMatchObject({ safeMetadata: {} });
+  expect(await objectExists(cleanupResponse.draftObjectKey)).toBe(false);
+  expect(
+    await prisma.auditEvent.findFirst({
+      orderBy: { createdAt: "desc" },
+      where: {
+        action: "delete_response",
+        outcome: "failure",
+        targetId: cleanupResponseId,
+      },
+    })
+  ).toMatchObject({
+    safeMetadata: { errorCode: "deletion_cleanup_failed" },
+  });
+
+  const managedDeleteResponse = await accountRequest(
+    "DELETE",
+    `/api/admin/users/${managedId}`,
+    erasureAdminBearer,
+    { confirm: true }
+  );
+  expect(managedDeleteResponse.status).toBe(200);
+  expect(await managedDeleteResponse.json()).toEqual({ deleted: true });
+  expect(await sessionStatus(managedToken)).toBe(401);
+  expect(await prisma.user.findUnique({ where: { id: managedId } })).toBeNull();
+  expect(
+    await prisma.auditEvent.findFirst({
+      orderBy: { createdAt: "desc" },
+      where: {
+        action: "delete_user",
+        outcome: "success",
+        targetId: managedId,
+      },
+    })
+  ).toMatchObject({ actorId: erasureAdminId, targetId: managedId });
+
   const accountAuditEvents = await prisma.auditEvent.findMany({
     orderBy: { createdAt: "asc" },
     where: { targetType: "user" },
@@ -7857,6 +8454,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     "promote_user",
     "demote_user",
     "reset_user_password",
+    "delete_user",
   ]) {
     expect(managedAuditActions.has(action)).toBe(true);
   }
