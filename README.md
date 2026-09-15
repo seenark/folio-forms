@@ -192,7 +192,7 @@ Publishing:
 6. Return through the dashboard to resume the same response.
 7. Select **Submit** to create the immutable receipt.
 
-The prefill is snapshotted when the response starts. Resuming a draft does not refresh the profile. Starting again after publication invalidates an old draft and creates a new snapshot for the new published version.
+The prefill is snapshotted when the response starts. Resuming a draft does not refresh the profile. Starting again after publication invalidates an old draft and creates a new snapshot for the new published version. The User dashboard lists the current User's Draft with the Form title and last-saved time. Save Draft is explicit: incomplete scalar values are allowed, but unknown tags, wrong types/options/dates, text over 10,000 characters, and response JSON over 256 KiB are rejected. Resume reopens the same Response and document under the owning User's Editor Lease; another User cannot access its data, Operation, editor configuration, or document.
 
 Submission is complete only after the extracted field JSON and canonical filled DOCX are persisted. PDF is an on-demand export and is not durable submission state.
 

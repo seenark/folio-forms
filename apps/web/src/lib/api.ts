@@ -90,6 +90,7 @@ export interface Submission {
   status?: string;
   createdAt?: string;
   submittedAt?: string;
+  updatedAt?: string;
 }
 export interface Operation {
   id: string;

@@ -12,6 +12,7 @@ const createHarness = ({
   action = "fill",
   capabilityResponses = [],
   clipboard,
+  controls = [],
   responses = [],
   selection,
 } = {}) => {
@@ -166,7 +167,6 @@ const createHarness = ({
       callbacks.push(callback);
       editorEvents.set(name, callbacks);
     },
-    attachToolbarMenuClickEvent() {},
     callCommand(...args) {
       const command = args[0];
       const done = args.at(-1);
@@ -187,6 +187,10 @@ const createHarness = ({
         const tag = window.Asc.scope?.formBridgeSelectionTag;
         selectionState.properties.Tag = tag;
         done(JSON.stringify({ ok: true, tag }));
+        return;
+      }
+      if (typeof command === "function") {
+        done(command());
         return;
       }
       done(JSON.stringify({ name: "Ada", value: "example" }));
@@ -308,7 +312,7 @@ const createHarness = ({
     GetDocument() {
       return {
         GetAllContentControls() {
-          return [];
+          return controls;
         },
         GetCurrentContentControl() {
           return selection ? officeControl : null;
@@ -402,6 +406,81 @@ const selectedControl = (
   },
 });
 
+test("extracts scalar form values with plugin contract semantics", async () => {
+  const control = ({
+    checkbox = false,
+    checked = false,
+    date = false,
+    dateValue = null,
+    dropdown = false,
+    items = [],
+    combo = false,
+    tag,
+    text,
+  }) => ({
+    GetClassType: () => "inlineLvlSdt",
+    GetDate: () => dateValue,
+    GetDropdownList: () => ({ GetAllItems: () => items }),
+    GetRange: () => ({ GetText: () => text }),
+    GetTag: () => tag,
+    IsCheckBox: () => checkbox,
+    IsCheckBoxChecked: () => checked,
+    IsComboBox: () => combo,
+    IsDatePicker: () => date,
+    IsDropDownList: () => dropdown,
+  });
+  const harness = createHarness({
+    action: "draft",
+    capabilityResponses: ["save-draft-capability"],
+    controls: [
+      control({ tag: "notes", text: "line one\nline two" }),
+      control({ checkbox: true, checked: true, tag: "accept_terms" }),
+      control({
+        date: true,
+        dateValue: new Date(2026, 8, 15),
+        tag: "start_date",
+      }),
+      control({
+        dropdown: true,
+        items: [
+          {
+            GetText: () => "Engineering",
+            GetValue: () => "engineering",
+          },
+        ],
+        tag: "department",
+        text: "Engineering",
+      }),
+      control({
+        combo: true,
+        items: [
+          {
+            GetText: () => "Known",
+            GetValue: () => "known",
+          },
+        ],
+        tag: "custom",
+        text: "Custom value",
+      }),
+    ],
+    responses: [
+      { operationCapability: "save-operation-capability", operationId: "save" },
+      completedOperation({ saved: true }),
+    ],
+  });
+  acknowledgeBridge(harness);
+  await expect(
+    harness.window.FormBridge.runAction("save-draft")
+  ).resolves.toMatchObject({ ok: true });
+  const requestBody = JSON.parse(harness.requests[0].body);
+  expect(requestBody.data).toEqual({
+    accept_terms: true,
+    custom: "Custom value",
+    department: "engineering",
+    notes: "line one\nline two",
+    start_date: "2026-09-15",
+  });
+});
 test("uses fresh capabilities and an exact acknowledged bridge", async () => {
   const harness = createHarness({
     capabilityResponses: [

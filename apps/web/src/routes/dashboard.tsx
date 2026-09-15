@@ -60,9 +60,7 @@ const DashboardRoute = () => {
       } catch (caughtError) {
         if (!cancelled) {
           setError(
-            caughtError instanceof Error
-              ? caughtError.message
-              : "Could not load responses."
+            caughtError instanceof Error ? caughtError.message : "โหลดคำตอบไม่ได้"
           );
         }
       } finally {
@@ -78,7 +76,7 @@ const DashboardRoute = () => {
     };
   }, [user]);
   if (authLoading) {
-    return <Centered message="Checking session…" />;
+    return <Centered message="กำลังตรวจสอบเซสชัน…" />;
   }
   if (!user) {
     return <Navigate to="/login" search={{ returnTo: "/dashboard" }} />;
@@ -88,15 +86,15 @@ const DashboardRoute = () => {
   if (error) {
     responseContent = <Notice tone="danger">{error}</Notice>;
   } else if (loading) {
-    responseContent = <Centered message="Loading responses…" />;
+    responseContent = <Centered message="กำลังโหลดคำตอบ…" />;
   } else if (rows.length === 0) {
     responseContent = (
       <Card className="grid min-h-56 place-items-center p-8 text-center">
         <div>
           <Inbox className="mx-auto mb-3 text-[var(--ink-soft)]" size={30} />
-          <h2 className="font-semibold">No responses yet</h2>
+          <h2 className="font-semibold">ยังไม่มีคำตอบ</h2>
           <p className="mt-1 text-sm text-[var(--ink-soft)]">
-            Open a shared form link to begin.
+            เปิดลิงก์แบบฟอร์มที่แชร์เพื่อเริ่มกรอกคำตอบ
           </p>
         </div>
       </Card>
@@ -115,15 +113,15 @@ const DashboardRoute = () => {
               >
                 <div>
                   <h2 className="font-semibold">
-                    {row.formTitle ?? "Untitled form"}
+                    {row.formTitle ?? "แบบฟอร์มไม่มีชื่อ"}
                   </h2>
                   <p className="mt-1 text-sm text-[var(--ink-soft)]">
-                    Last activity {formatDate(row.createdAt)}
+                    บันทึกล่าสุด {formatDate(row.updatedAt ?? row.createdAt)}
                   </p>
                 </div>
                 <div className="flex items-center gap-3">
                   <Badge tone={submitted ? "success" : "warning"}>
-                    {submitted ? "Submitted" : "Draft"}
+                    {submitted ? "ส่งแล้ว" : "ฉบับร่าง"}
                   </Badge>
                   {submitted ? (
                     <Link
@@ -131,7 +129,7 @@ const DashboardRoute = () => {
                       params={{ submissionId: row.submissionId ?? row.id }}
                       className="inline-flex items-center gap-1 text-sm font-semibold underline decoration-[var(--line-strong)] underline-offset-4 hover:decoration-[var(--ink)]"
                     >
-                      View receipt <ArrowUpRight size={15} />
+                      ดูใบรับคำตอบ <ArrowUpRight size={15} />
                     </Link>
                   ) : (
                     <Link
@@ -142,7 +140,7 @@ const DashboardRoute = () => {
                       search={{ responseId: row.id }}
                       className="inline-flex items-center gap-1 text-sm font-semibold text-[var(--success)]"
                     >
-                      Resume <ArrowUpRight size={15} />
+                      กลับไปกรอกต่อ <ArrowUpRight size={15} />
                     </Link>
                   )}
                 </div>
@@ -157,12 +155,12 @@ const DashboardRoute = () => {
   return (
     <AppShell>
       <PageHeader
-        title="My responses"
-        description="Pick up a saved draft or review a completed submission."
+        title="คำตอบของฉัน"
+        description="กลับไปกรอกฉบับร่างที่บันทึกไว้ หรือดูคำตอบที่ส่งแล้ว"
       />
       <div className="mb-8 grid gap-4 sm:grid-cols-3">
         <Stat
-          label="In progress"
+          label="กำลังดำเนินการ"
           value={
             rows.filter(
               (row) => row.status === "draft" || row.status === "in_progress"
@@ -171,7 +169,7 @@ const DashboardRoute = () => {
           icon={<ClipboardList size={18} />}
         />
         <Stat
-          label="Submitted"
+          label="ส่งแล้ว"
           value={
             rows.filter(
               (row) => row.status === "submitted" || row.status === "completed"
@@ -180,7 +178,7 @@ const DashboardRoute = () => {
           icon={<FileCheck2 size={18} />}
         />
         <Stat
-          label="Total responses"
+          label="คำตอบทั้งหมด"
           value={rows.length}
           icon={<Inbox size={18} />}
         />

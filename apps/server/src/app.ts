@@ -96,6 +96,7 @@ const loginFailureWindowMs = 15 * 60_000;
 const passwordMinimumLength = 12;
 const passwordMaximumLength = 128;
 const maxResponseDataBytes = 256 * 1024;
+const maxResponseTextLength = 10_000;
 const fieldRuleBodyMaximumBytes = 8 * 1024;
 const dateFieldPattern = /^\d{4}-\d{2}-\d{2}$/u;
 const isValidDateFieldValue = (value: string): boolean => {
@@ -2816,7 +2817,7 @@ async function normalizeResponseData(
 ): Promise<JsonRecord> {
   const data = { ...jsonRecord(inputData) };
   const serialized = JSON.stringify(data);
-  if (serialized.length > maxResponseDataBytes) {
+  if (new TextEncoder().encode(serialized).byteLength > maxResponseDataBytes) {
     fail(413, "response_too_large", "Response data exceeds the size limit");
   }
   const publishedTemplate = form.publishedTemplate;
@@ -2870,13 +2871,17 @@ async function normalizeResponseData(
       valid = typeof value === "string" && optionValues.has(value);
     } else if (field.type === FieldType.date) {
       valid = typeof value === "string" && isValidDateFieldValue(value);
-    } else {
+    } else if (
+      field.type === FieldType.combo ||
+      field.type === FieldType.picture ||
+      field.type === FieldType.text
+    ) {
       valid =
-        field.type === FieldType.combo ||
-        field.type === FieldType.picture ||
-        field.type === FieldType.text
-          ? typeof value === "string"
-          : false;
+        typeof value === "string" &&
+        ((field.type !== FieldType.combo && field.type !== FieldType.text) ||
+          value.length <= maxResponseTextLength);
+    } else {
+      valid = false;
     }
     if (!valid) {
       fail(
@@ -5914,6 +5919,7 @@ export function createApp(options: AppOptions = {}) {
                 "Your submission is being processed"
               );
             }
+            const responseTargetId = current?.id ?? responseId;
             if (!current) {
               await tx.response.create({
                 data: {
@@ -5921,7 +5927,7 @@ export function createApp(options: AppOptions = {}) {
                   draftDocumentKey,
                   draftObjectKey,
                   form: { connect: { id: form.id } },
-                  id: responseId,
+                  id: responseTargetId,
                   owner: { connect: { id: identity.id } },
                   publishedTemplate: {
                     connect: { id: lockedForm.publishedTemplate.id },
@@ -5932,7 +5938,7 @@ export function createApp(options: AppOptions = {}) {
               });
             }
             await tx.prefillSnapshot.deleteMany({
-              where: { responseId },
+              where: { responseId: responseTargetId },
             });
             await tx.prefillSnapshot.create({
               data: {
@@ -5940,7 +5946,7 @@ export function createApp(options: AppOptions = {}) {
                 id: snapshotId,
                 lockedFields: jsonValue({}),
                 owner: { connect: { id: identity.id } },
-                response: { connect: { id: responseId } },
+                response: { connect: { id: responseTargetId } },
                 values: jsonValue({}),
               },
             });
@@ -5954,12 +5960,12 @@ export function createApp(options: AppOptions = {}) {
                 status: ResponseStatus.draft,
                 updatedAt: new Date(),
               },
-              where: { id: responseId },
+              where: { id: responseTargetId },
             });
             if (updated.count !== 1) {
               fail(500, "start_failed", "Unable to start response");
             }
-            return tx.response.findUnique({ where: { id: responseId } });
+            return tx.response.findUnique({ where: { id: responseTargetId } });
           },
           { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
         );
@@ -5974,6 +5980,28 @@ export function createApp(options: AppOptions = {}) {
         };
       } catch (error) {
         await deleteObjectUnlessCanonical(draftObjectKey);
+        if (databaseErrorCode(error) === "P2034") {
+          const current = await prisma.response.findUnique({
+            where: {
+              formId_userId: { formId: form.id, userId: identity.id },
+            },
+          });
+          if (
+            current?.status === ResponseStatus.draft &&
+            current.publishedVersion === form.version &&
+            current.draftDocumentKey &&
+            current.draftObjectKey &&
+            (await objectExists(current.draftObjectKey))
+          ) {
+            return {
+              editorConfigUrl: `/api/forms/${form.publicId}/editor-config?responseId=${current.id}&action=${current.draftData ? "draft" : "fill"}`,
+              prefill: current.draftData
+                ? null
+                : { data: {}, editableFields: {} },
+              response: responseSummary(current),
+            };
+          }
+        }
         throw error;
       }
     })

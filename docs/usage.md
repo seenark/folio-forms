@@ -263,7 +263,17 @@ Form ที่ยังเป็น `Draft`, ไม่เคย Publish แล�
 
 การเปลี่ยนโครงสร้าง, Tag, required state หรือ Prefill policy ใน Form ที่ Publish แล้วทำไม่ได้ในที่เดิม ให้สร้าง Form ใหม่
 
-### 4.3 ดู Submission
+### 4.3 กรอกและ Resume ในฐานะ User
+
+1. Login ก่อนเปิด Share Link; บัญชีที่ถูกปิดใช้งานจะเริ่มคำตอบไม่ได้
+2. ระบบสร้าง Response ได้อย่างน้อยหนึ่งรายการต่อ User ต่อ Form แม้มีการกดเริ่มพร้อมกัน
+3. เปิดแท็บ **Form** แล้วแก้ได้เฉพาะ Content Control ที่มี Tag; ข้อความคงที่และรูปภาพของเอกสารแก้ไม่ได้
+4. กด **Save Draft** อย่างชัดเจนเพื่อบันทึกค่าที่กรอก ค่าไม่ครบยังบันทึกได้
+5. ค่า scalar ต้องตรงกับ Field Manifest: text/combo ไม่เกิน 10,000 ตัวอักษร, JSON รวมไม่เกิน 256 KiB, ส่วน dropdown/date/checkbox ต้องเป็น option, วันที่ หรือ boolean ที่ถูกต้อง
+6. กลับหน้า Dashboard เพื่อดูชื่อ Form และเวลาบันทึกล่าสุด แล้วกด **กลับไปกรอกต่อ** เพื่อเปิด Response เดิม
+7. เฉพาะ User เจ้าของเท่านั้นที่อ่าน Response, Operation, editor configuration และ DOCX ได้
+
+### 4.4 ดู Submission
 
 จากหน้า Form editor กด:
 

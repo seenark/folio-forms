@@ -2299,6 +2299,25 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   if (!formRecord) {
     throw new Error("The published test form was not found");
   }
+  const concurrentStarts = await Promise.all(
+    [0, 1].map(() =>
+      app.handle(
+        new Request(
+          `http://test.local/api/forms/${formRecord.publicId}/start`,
+          {
+            headers: { Authorization: `Bearer ${userBearer}` },
+            method: "POST",
+          }
+        )
+      )
+    )
+  );
+  expect(concurrentStarts.some((response) => response.status === 200)).toBe(
+    true
+  );
+  expect(
+    await prisma.response.count({ where: { formId, userId: user.id } })
+  ).toBe(1);
   const publishedContractBefore = await prisma.publishedTemplate.findUnique({
     include: {
       manifest: { include: { fields: { orderBy: { tag: "asc" } } } },
@@ -2939,11 +2958,49 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     })
   );
   expect(userCrossActionResponse.status).toBe(403);
+  const draftRequest = (data: Record<string, unknown>) =>
+    app.handle(
+      new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
+        body: JSON.stringify({
+          data,
+          documentKey: responseDocumentKey,
+          responseId,
+        }),
+        headers: capabilityHeaders(saveDraftCapability),
+        method: "POST",
+      })
+    );
+  const invalidDraftCases = [
+    { data: { unknown_tag: "value" }, status: 422 },
+    { data: { accept_terms: "true" }, status: 422 },
+    { data: { department: "not-an-option" }, status: 422 },
+    { data: { start_date: "2026-02-30" }, status: 422 },
+    { data: { full_name: "x".repeat(10_001) }, status: 422 },
+    { data: { full_name: "🙂".repeat(100_000) }, status: 413 },
+  ];
+  for (const invalidDraftCase of invalidDraftCases) {
+    const invalidDraftResponse = await draftRequest(invalidDraftCase.data);
+    expect(invalidDraftResponse.status).toBe(invalidDraftCase.status);
+    expect(await invalidDraftResponse.json()).toHaveProperty(
+      "error",
+      invalidDraftCase.status === 413
+        ? "response_too_large"
+        : "invalid_response_data"
+    );
+  }
+  const savedDraftData = {
+    accept_terms: true,
+    department: "engineering",
+    description_1: "line one\nline two",
+    description_2: "",
+    full_name: "Ada Lovelace",
+    start_date: "2026-09-15",
+  };
 
   const saveResponse = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
       body: JSON.stringify({
-        data: {},
+        data: savedDraftData,
         documentKey: responseDocumentKey,
         responseId,
       }),
@@ -2963,11 +3020,126 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     "X-Editor-Capability": saveBody.operationCapability,
   });
   expect(saveOperation.status).toBe("completed");
+  const savedResponse = await prisma.response.findUnique({
+    select: {
+      draftData: true,
+      draftDocumentKey: true,
+      draftObjectKey: true,
+      status: true,
+      updatedAt: true,
+    },
+    where: { id: responseId },
+  });
+  expect(savedResponse).toMatchObject({
+    draftData: savedDraftData,
+    draftDocumentKey: responseDocumentKey,
+    status: "draft",
+    updatedAt: expect.any(Date),
+  });
+  if (!savedResponse?.draftObjectKey) {
+    throw new Error("The saved response document was not persisted");
+  }
+  const resumedStartResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "POST",
+    })
+  );
+  expect(resumedStartResponse.status).toBe(200);
+  expect(await resumedStartResponse.json()).toMatchObject({
+    response: { id: responseId, status: "draft" },
+  });
+  const resumedEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/forms/${formRecord.publicId}/editor-config?responseId=${responseId}&action=draft`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(resumedEditorResponse.status).toBe(200);
+  expect(await resumedEditorResponse.json()).toMatchObject({
+    config: { document: { key: responseDocumentKey } },
+  });
+  const responseList = await app.handle(
+    new Request("http://test.local/api/responses/me", {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(await responseList.json()).toMatchObject({
+    responses: [
+      {
+        formPublicId: formRecord.publicId,
+        formTitle: secretFormTitle,
+        id: responseId,
+        status: "draft",
+        updatedAt: expect.any(String),
+      },
+    ],
+  });
 
+  const stableBeforeFailure = await prisma.response.findUnique({
+    select: { draftData: true, draftObjectKey: true },
+    where: { id: responseId },
+  });
+  const failureApp = createApp({
+    onlyOffice: {
+      convertDocxToPdf: () =>
+        Promise.reject(new Error("deterministic draft failure")),
+      forceSave: () => Promise.reject(new Error("deterministic draft failure")),
+    },
+  });
+  const failedSaveResponse = await failureApp.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
+      body: JSON.stringify({
+        data: savedDraftData,
+        documentKey: responseDocumentKey,
+        responseId,
+      }),
+      headers: capabilityHeaders(saveDraftCapability),
+      method: "POST",
+    })
+  );
+  expect(failedSaveResponse.status).toBe(202);
+  const failedSaveBody = (await failedSaveResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!failedSaveBody.operationCapability || !failedSaveBody.operationId) {
+    throw new Error("The failed draft operation was not created");
+  }
+  const failedSaveOperation = await waitForOperation(
+    failedSaveBody.operationId,
+    { "X-Editor-Capability": failedSaveBody.operationCapability }
+  );
+  expect(failedSaveOperation).toMatchObject({
+    error: "force_save_failed",
+    status: "failed",
+  });
+  expect(
+    await prisma.response.findUnique({
+      select: { draftData: true, draftObjectKey: true },
+      where: { id: responseId },
+    })
+  ).toEqual(stableBeforeFailure);
+  const retrySaveResponse = await draftRequest(savedDraftData);
+  expect(retrySaveResponse.status).toBe(202);
+  const retrySaveBody = (await retrySaveResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (!retrySaveBody.operationCapability || !retrySaveBody.operationId) {
+    throw new Error("The retry draft operation was not created");
+  }
+  expect(
+    (
+      await waitForOperation(retrySaveBody.operationId, {
+        "X-Editor-Capability": retrySaveBody.operationCapability,
+      })
+    ).status
+  ).toBe("completed");
   const submitResponse = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}/submit`, {
       body: JSON.stringify({
-        data: {},
+        data: savedDraftData,
         documentKey: responseDocumentKey,
         responseId,
       }),
