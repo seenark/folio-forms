@@ -84,8 +84,11 @@ const detailErrorMessage = (caughtError: unknown, fallback: string): string => {
       case "editor_lease_inactive": {
         return "เซสชันตัวแก้ไขหมดอายุ กรุณาลองใหม่";
       }
-      case "operation_in_progress": {
-        return "มีการดำเนินการกับเอกสารอยู่แล้ว กรุณารอแล้วลองใหม่";
+      case "form_not_published": {
+        return "เก็บถาวรหรือยกเลิกเก็บถาวรได้เฉพาะแบบฟอร์มที่เผยแพร่แล้ว";
+      }
+      case "form_unavailable": {
+        return "แบบฟอร์มนี้ยังไม่พร้อมรับคำตอบใหม่";
       }
       case "invalid_request": {
         return "ข้อมูลชื่อหรือคำอธิบายไม่ถูกต้อง กรุณาตรวจสอบความยาวแล้วลองใหม่";
@@ -135,10 +138,10 @@ const FormEditorRoute = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [metadataBusy, setMetadataBusy] = useState<
+    "archive" | "save" | "duplicate" | null
+  >(null);
   const [busy, setBusy] = useState<"save" | "publish" | null>(null);
-  const [metadataBusy, setMetadataBusy] = useState<"save" | "duplicate" | null>(
-    null
-  );
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [copied, setCopied] = useState(false);
@@ -383,6 +386,48 @@ const FormEditorRoute = () => {
       metadataGuardRef.current = false;
     }
   };
+  const toggleArchive = async () => {
+    if (
+      !metadataCanAct ||
+      metadataGuardRef.current ||
+      (loadedForm.status !== "published" && loadedForm.status !== "archived")
+    ) {
+      return;
+    }
+    const nextStatus =
+      loadedForm.status === "archived" ? "published" : "archived";
+    metadataGuardRef.current = true;
+    setMetadataBusy("archive");
+    setError(null);
+    setNotice(null);
+    setOperationStatus(null);
+    try {
+      const payload = await apiPatch<FormMutationResponse>(
+        `/api/admin/forms/${publicId}`,
+        { status: nextStatus }
+      );
+      setForm((currentForm) =>
+        currentForm ? { ...currentForm, ...payload.form } : currentForm
+      );
+      setNotice(
+        nextStatus === "archived"
+          ? "เก็บแบบฟอร์มเรียบร้อยแล้ว คำตอบเดิมยังเปิดได้"
+          : "ยกเลิกเก็บถาวรเรียบร้อยแล้ว แบบฟอร์มรับคำตอบใหม่ได้"
+      );
+    } catch (caughtError) {
+      setError(
+        detailErrorMessage(
+          caughtError,
+          nextStatus === "archived"
+            ? "เก็บแบบฟอร์มไม่สำเร็จ กรุณาลองใหม่อีกครั้ง"
+            : "ยกเลิกเก็บถาวรไม่สำเร็จ กรุณาลองใหม่อีกครั้ง"
+        )
+      );
+    } finally {
+      setMetadataBusy(null);
+      metadataGuardRef.current = false;
+    }
+  };
 
   const duplicateForm = async () => {
     if (!canDuplicate || !metadataCanAct || metadataGuardRef.current) {
@@ -399,8 +444,8 @@ const FormEditorRoute = () => {
         {}
       );
       navigate({
-        to: "/admin/forms/$formId",
         params: { formId: payload.form.publicId },
+        to: "/admin/forms/$formId",
       });
     } catch (caughtError) {
       setError(
@@ -472,6 +517,10 @@ const FormEditorRoute = () => {
       setNotice(null);
     }
   };
+  const archiveLabel =
+    loadedForm.status === "archived" ? "ยกเลิกเก็บถาวร" : "เก็บแบบฟอร์ม";
+  const archiveButtonLabel =
+    metadataBusy === "archive" ? "กำลังเปลี่ยนสถานะ…" : archiveLabel;
 
   const status = formStatusDetails[loadedForm.status];
 
@@ -491,12 +540,30 @@ const FormEditorRoute = () => {
             variant="secondary"
             size="sm"
             type="button"
-            onClick={() => void duplicateForm()}
+            onClick={duplicateForm}
             disabled={!canDuplicate || !metadataCanAct}
           >
             {metadataBusy === "duplicate" ? <Spinner /> : <Copy size={15} />}
             {metadataBusy === "duplicate" ? "กำลังสร้างสำเนา…" : "สร้างสำเนา"}
           </Button>
+          {loadedForm.status === "published" ||
+          loadedForm.status === "archived" ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              type="button"
+              onClick={toggleArchive}
+              disabled={!metadataCanAct}
+              aria-label={
+                loadedForm.status === "archived"
+                  ? "ยกเลิกเก็บถาวรแบบฟอร์ม"
+                  : "เก็บแบบฟอร์ม"
+              }
+            >
+              {metadataBusy === "archive" ? <Spinner /> : null}
+              {archiveButtonLabel}
+            </Button>
+          ) : null}
           <Button
             variant="secondary"
             size="sm"
@@ -600,8 +667,9 @@ const FormEditorRoute = () => {
       ) : null}
       {canEditTemplate ? null : (
         <Notice>
-          แบบฟอร์มนี้เผยแพร่แล้ว สัญญาเอกสารและการตั้งค่า Field ไม่สามารถแก้ไขในที่เดิมได้
-          หากต้องการเปลี่ยนโครงสร้างให้สร้าง Form ใหม่
+          {loadedForm.status === "archived"
+            ? "แบบฟอร์มนี้เก็บถาวรแล้ว คำตอบเดิมยังเปิดดูและดำเนินการต่อได้"
+            : "แบบฟอร์มนี้เผยแพร่แล้ว สัญญาเอกสารและการตั้งค่า Field ไม่สามารถแก้ไขในที่เดิมได้ หากต้องการเปลี่ยนโครงสร้างให้สร้าง Form ใหม่"}
         </Notice>
       )}
       <section

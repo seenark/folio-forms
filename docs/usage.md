@@ -196,6 +196,12 @@ Share Link เป็น opaque public ID ที่ระบบสร้างใ
 
 หลัง Submit สำเร็จ การเปิด Form หรือ Handoff ซ้ำจะพาไป Receipt เดิม ไม่สร้าง Response ใหม่ Receipt แสดงชื่อ Form สถานะเวลาส่ง และข้อมูลต้นฉบับแบบอ่านอย่างเดียว เจ้าของ Response และ Admin ดาวน์โหลด JSON/DOCX ต้นฉบับได้ ส่วน PDF สร้างจาก DOCX เมื่อร้องขอและไม่เก็บเป็นไฟล์ถาวรใน PostgreSQL หรือ RustFS
 
+### 3.2 เก็บถาวรและเปิดรับคำตอบอีกครั้ง
+
+Admin เก็บถาวรได้เฉพาะ Form ที่ Publish แล้วจากหน้ารายละเอียดหรือรายการ Form การเก็บถาวรคง Public ID, Published Template, Field Manifest และ Prefill เดิมไว้ แต่ไม่รับ Response ใหม่ ผู้ใช้ที่ยังมี Draft หรือ Submission เดิมจะเปิดต่อ, Save, Submit และดาวน์โหลด Receipt/ไฟล์เดิมได้
+
+เมื่อยกเลิกเก็บถาวร Form จะกลับมารับคำตอบใหม่ด้วยสัญญาเอกสารเดิม การเปลี่ยนสถานะเพิ่ม Audit Event ที่ระบุผู้กระทำ Form เวลา และผลลัพธ์ หากเปิด Share Link ของ Form ที่เก็บถาวรโดยยังไม่มี Response ระบบจะแสดงว่า Form ไม่พร้อมใช้งานหลัง Login และไม่เปิดเผย metadata ก่อน Login
+
 ## 4. ทดลองใช้งานในฐานะ Admin
 
 1. เปิด `http://localhost:5173/login`

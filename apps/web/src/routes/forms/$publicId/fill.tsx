@@ -17,8 +17,13 @@ import type { Operation } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 
 const formRequestError = (error: unknown, fallback: string) => {
-  if (error instanceof ApiError && error.status === 401) {
-    return "เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่";
+  if (error instanceof ApiError) {
+    if (error.status === 401) {
+      return "เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่";
+    }
+    if (error.code === "form_unavailable") {
+      return "แบบฟอร์มนี้เก็บถาวรแล้วและยังไม่รับคำตอบใหม่";
+    }
   }
   return fallback;
 };

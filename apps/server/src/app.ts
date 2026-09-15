@@ -392,12 +392,14 @@ type OperationErrorCode =
   | "operation_timeout";
 type FormSource = "blank" | "upload";
 type FormAuditAction =
+  | "archive_form"
   | "configure_field_rule"
   | "create_form"
   | "delete_form"
   | "duplicate_form"
   | "publish_form"
   | "save_template_draft"
+  | "unarchive_form"
   | "update_form_metadata";
 type FormAuditErrorCode =
   | "callback_claim_invalid"
@@ -430,6 +432,7 @@ interface FormAuditMetadata {
   errorCode?: FormAuditErrorCode;
   source?: FormSource;
   sourcePublicId?: string;
+  status?: FormStatus;
 }
 type OperationMetadata = JsonRecord & {
   action: OperationAction;
@@ -681,6 +684,7 @@ async function readDocumentKeyInput(request: Request): Promise<string> {
 }
 interface FormMetadataInput {
   description?: string | null;
+  status?: FormStatus;
   title?: string;
 }
 
@@ -691,9 +695,22 @@ async function readFormMetadataInput(
   const keys = Object.keys(input);
   if (
     keys.length === 0 ||
-    keys.some((key) => key !== "description" && key !== "title")
+    keys.some(
+      (key) => key !== "description" && key !== "status" && key !== "title"
+    )
   ) {
-    fail(400, "invalid_request", "Only title and description are accepted");
+    fail(
+      400,
+      "invalid_request",
+      "Only title, description, and status are accepted"
+    );
+  }
+  if (Object.hasOwn(input, "status") && keys.length !== 1) {
+    fail(
+      400,
+      "invalid_request",
+      "Status changes must not include title or description"
+    );
   }
   const metadata: FormMetadataInput = {};
   if (Object.hasOwn(input, "title")) {
@@ -719,6 +736,15 @@ async function readFormMetadataInput(
       typeof input.description === "string"
         ? input.description.trim() || null
         : null;
+  }
+  if (Object.hasOwn(input, "status")) {
+    if (
+      input.status !== FormStatus.archived &&
+      input.status !== FormStatus.published
+    ) {
+      fail(400, "invalid_request", "status must be archived or published");
+    }
+    metadata.status = input.status;
   }
   return metadata;
 }
@@ -4689,18 +4715,48 @@ export function createApp(options: AppOptions = {}) {
       const auditTarget = publicIdPattern.test(params.publicId)
         ? params.publicId
         : null;
+      let auditAction: FormAuditAction = "update_form_metadata";
       try {
         const input = await readFormMetadataInput(request);
+        auditAction =
+          input.status === FormStatus.archived
+            ? "archive_form"
+            : input.status === FormStatus.published
+              ? "unarchive_form"
+              : "update_form_metadata";
         const updated = await prisma.$transaction(async (tx) => {
           if (!publicIdPattern.test(params.publicId)) {
             fail(404, "not_found", "Form was not found");
           }
+          const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
+            Prisma.sql`
+              SELECT "id"
+              FROM "forms"
+              WHERE "public_id" = ${params.publicId}
+              FOR UPDATE
+            `
+          );
+          if (!lockedForm) {
+            fail(404, "not_found", "Form was not found");
+          }
           const current = await tx.form.findUnique({
             include: { publishedTemplate: true, templateDraft: true },
-            where: { publicId: params.publicId },
+            where: { id: lockedForm.id },
           });
           if (!current) {
             fail(404, "not_found", "Form was not found");
+          }
+          if (
+            input.status !== undefined &&
+            (!current.publishedTemplate ||
+              (current.status !== FormStatus.published &&
+                current.status !== FormStatus.archived))
+          ) {
+            fail(
+              409,
+              "form_not_published",
+              "Only a published Form can change archive state"
+            );
           }
           const form = await tx.form.update({
             data: {
@@ -4708,15 +4764,17 @@ export function createApp(options: AppOptions = {}) {
               ...(Object.hasOwn(input, "description")
                 ? { description: input.description }
                 : {}),
+              ...(input.status !== undefined ? { status: input.status } : {}),
             },
             include: { publishedTemplate: true, templateDraft: true },
             where: { id: current.id },
           });
           await createFormAudit(tx, {
-            action: "update_form_metadata",
+            action: auditAction,
             actorId: identity.id,
             outcome: AuditOutcome.success,
-            safeMetadata: {},
+            safeMetadata:
+              input.status === undefined ? {} : { status: input.status },
             targetId: form.publicId,
           });
           return form;
@@ -4733,7 +4791,7 @@ export function createApp(options: AppOptions = {}) {
       } catch (error) {
         try {
           await createFormFailureAudit({
-            action: "update_form_metadata",
+            action: auditAction,
             actorId: identity.id,
             error,
             targetId: auditTarget,
@@ -5785,13 +5843,25 @@ export function createApp(options: AppOptions = {}) {
       }
     )
     .get("/api/forms/:publicId", async ({ params, request }) => {
-      await requireIdentity(request);
+      const identity = await requireIdentity(request);
       const form = await findFormByPublicId(params.publicId);
       if (
-        form.status !== FormStatus.published ||
         !form.publishedTemplate?.objectKey ||
         !form.publishedTemplate.documentKey
       ) {
+        fail(404, "not_found", "Form was not found");
+      }
+      if (form.status === FormStatus.archived) {
+        const existingResponse = await prisma.response.findUnique({
+          select: { id: true },
+          where: {
+            formId_userId: { formId: form.id, userId: identity.id },
+          },
+        });
+        if (!existingResponse) {
+          fail(404, "not_found", "Form was not found");
+        }
+      } else if (form.status !== FormStatus.published) {
         fail(404, "not_found", "Form was not found");
       }
       return {
@@ -5823,20 +5893,24 @@ export function createApp(options: AppOptions = {}) {
       const identity = await requireIdentity(request);
       const form = await findFormByPublicId(params.publicId);
       const publishedTemplate = form.publishedTemplate;
-      if (
-        form.status !== FormStatus.published ||
-        !publishedTemplate?.objectKey ||
-        !publishedTemplate.documentKey
-      ) {
-        fail(409, "not_published", "This form has not been published");
-      }
-
       const existing = await prisma.response.findUnique({
         include: { prefillSnapshot: true, submission: true },
         where: {
           formId_userId: { formId: form.id, userId: identity.id },
         },
       });
+      if (
+        !publishedTemplate?.objectKey ||
+        !publishedTemplate.documentKey ||
+        (form.status !== FormStatus.published &&
+          !(form.status === FormStatus.archived && existing))
+      ) {
+        fail(
+          409,
+          "form_unavailable",
+          "This form is not accepting new responses"
+        );
+      }
       if (existing?.status === ResponseStatus.submitted) {
         if (!existing.submission) {
           fail(500, "internal_error", "The submitted receipt is unavailable");
@@ -5901,24 +5975,43 @@ export function createApp(options: AppOptions = {}) {
 
         const response = await prisma.$transaction(
           async (tx) => {
+            const [lockedFormRow] = await tx.$queryRaw<{ id: string }[]>(
+              Prisma.sql`
+                SELECT "id"
+                FROM "forms"
+                WHERE "id" = ${form.id}::uuid
+                FOR UPDATE
+              `
+            );
+            if (!lockedFormRow) {
+              fail(404, "not_found", "The form was not found");
+            }
             const lockedForm = await tx.form.findUnique({
               include: { publishedTemplate: true },
-              where: { id: form.id },
+              where: { id: lockedFormRow.id },
             });
+            const current = await tx.response.findUnique({
+              where: {
+                formId_userId: { formId: form.id, userId: identity.id },
+              },
+            });
+            if (lockedForm?.status === FormStatus.archived && !current) {
+              fail(
+                409,
+                "form_unavailable",
+                "This form is not accepting new responses"
+              );
+            }
             if (
               !lockedForm ||
-              lockedForm.status !== FormStatus.published ||
+              (lockedForm.status !== FormStatus.published &&
+                !(lockedForm.status === FormStatus.archived && current)) ||
               lockedForm.version !== form.version ||
               !lockedForm.publishedTemplate ||
               lockedForm.publishedTemplate.id !== publishedTemplate.id
             ) {
               fail(409, "stale_form", "The form was published while starting");
             }
-            const current = await tx.response.findUnique({
-              where: {
-                formId_userId: { formId: form.id, userId: identity.id },
-              },
-            });
             if (current?.status === ResponseStatus.submitted) {
               fail(
                 409,

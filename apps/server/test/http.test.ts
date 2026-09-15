@@ -2347,6 +2347,10 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(
     await prisma.response.count({ where: { formId, userId: user.id } })
   ).toBe(1);
+  const existingResponseId = concurrentStartBodies[0]?.response?.id;
+  if (!existingResponseId) {
+    throw new Error("The concurrent response was not created");
+  }
   const publishedContractBefore = await prisma.publishedTemplate.findUnique({
     include: {
       manifest: { include: { fields: { orderBy: { tag: "asc" } } } },
@@ -2768,6 +2772,138 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       title: secretFormTitle,
     },
   });
+  const archivedNoResponseEmail = `ticket-14-archived-new-${crypto.randomUUID()}@example.com`;
+  await createCredentialFixture({
+    email: archivedNoResponseEmail,
+    name: "Ticket 14 Archived New User",
+    password,
+  });
+  const archivedNoResponseBearer = await bearerFor(
+    archivedNoResponseEmail,
+    password
+  );
+  const mixedLifecycleUpdate = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
+      body: JSON.stringify({
+        status: "archived",
+        title: "must not mix lifecycle and metadata",
+      }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "PATCH",
+    })
+  );
+  expect(mixedLifecycleUpdate.status).toBe(400);
+  expect(await mixedLifecycleUpdate.json()).toMatchObject({
+    error: "invalid_request",
+  });
+  const unauthorizedArchive = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
+      body: JSON.stringify({ status: "archived" }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${userBearer}` },
+      method: "PATCH",
+    })
+  );
+  expect(unauthorizedArchive.status).toBe(403);
+  const [archiveResponse, archivedExistingStart] = await Promise.all([
+    app.handle(
+      new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
+        body: JSON.stringify({ status: "archived" }),
+        headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+        method: "PATCH",
+      })
+    ),
+    app.handle(
+      new Request(`http://test.local/api/forms/${formPublicId}/start`, {
+        headers: { Authorization: `Bearer ${userBearer}` },
+        method: "POST",
+      })
+    ),
+  ]);
+  expect(archiveResponse.status).toBe(200);
+  expect(await archiveResponse.json()).toMatchObject({
+    form: {
+      publicId: formPublicId,
+      status: "archived",
+      version: 1,
+    },
+  });
+  expect(archivedExistingStart.status).toBe(200);
+  expect(await archivedExistingStart.json()).toMatchObject({
+    response: { id: existingResponseId, status: "draft" },
+  });
+  const archivedNewMetadataResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formPublicId}`, {
+      headers: { Authorization: `Bearer ${archivedNoResponseBearer}` },
+    })
+  );
+  expect(archivedNewMetadataResponse.status).toBe(404);
+  expect(
+    JSON.stringify(await archivedNewMetadataResponse.json())
+  ).not.toContain(secretFormTitle);
+  const archivedNewStartResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formPublicId}/start`, {
+      headers: { Authorization: `Bearer ${archivedNoResponseBearer}` },
+      method: "POST",
+    })
+  );
+  expect(archivedNewStartResponse.status).toBe(409);
+  expect(await archivedNewStartResponse.json()).toMatchObject({
+    error: "form_unavailable",
+  });
+  const archivedExistingMetadataResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formPublicId}`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(archivedExistingMetadataResponse.status).toBe(200);
+  expect(await archivedExistingMetadataResponse.json()).toMatchObject({
+    form: {
+      publicId: formPublicId,
+      title: secretFormTitle,
+    },
+  });
+  const archivedFormListResponse = await app.handle(
+    new Request("http://test.local/api/admin/forms", {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  expect(archivedFormListResponse.status).toBe(200);
+  const archivedFormListBody = (await archivedFormListResponse.json()) as {
+    forms?: {
+      activeDraftCount: number;
+      publicId: string;
+      status: string;
+      submissionCount: number;
+    }[];
+  };
+  expect(
+    archivedFormListBody.forms?.find((form) => form.publicId === formPublicId)
+  ).toMatchObject({
+    activeDraftCount: 1,
+    publicId: formPublicId,
+    status: "archived",
+    submissionCount: 0,
+  });
+  const archivedContract = await prisma.publishedTemplate.findUnique({
+    include: {
+      manifest: { include: { fields: { orderBy: { tag: "asc" } } } },
+      prefillConfiguration: {
+        include: { fields: { orderBy: { tag: "asc" } } },
+      },
+    },
+    where: { formId },
+  });
+  expect(archivedContract).toEqual(publishedContractBefore);
+  expect(
+    await prisma.auditEvent.findFirst({
+      orderBy: { createdAt: "desc" },
+      where: {
+        action: "archive_form",
+        outcome: "success",
+        targetId: formPublicId,
+      },
+    })
+  ).toMatchObject({ actorId: adminId, targetId: formPublicId });
   const userDeleteFormResponse = await app.handle(
     new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
       headers: { Authorization: `Bearer ${userBearer}` },
@@ -3501,6 +3637,73 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(await readObject(stableSubmissionBeforeConversion.objectKey)).toEqual(
     submissionDocument
   );
+  const unarchiveResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
+      body: JSON.stringify({ status: "published" }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "PATCH",
+    })
+  );
+  expect(unarchiveResponse.status).toBe(200);
+  expect(await unarchiveResponse.json()).toMatchObject({
+    form: {
+      publicId: formPublicId,
+      status: "published",
+      version: 1,
+    },
+  });
+  const unarchivedStartResponse = await app.handle(
+    new Request(`http://test.local/api/forms/${formPublicId}/start`, {
+      headers: { Authorization: `Bearer ${archivedNoResponseBearer}` },
+      method: "POST",
+    })
+  );
+  expect(unarchivedStartResponse.status).toBe(200);
+  expect(await unarchivedStartResponse.json()).toMatchObject({
+    response: { id: expect.any(String), status: "draft" },
+  });
+  const unarchivedFormListResponse = await app.handle(
+    new Request("http://test.local/api/admin/forms", {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+    })
+  );
+  const unarchivedFormListBody = (await unarchivedFormListResponse.json()) as {
+    forms?: {
+      activeDraftCount: number;
+      publicId: string;
+      status: string;
+      submissionCount: number;
+    }[];
+  };
+  expect(
+    unarchivedFormListBody.forms?.find((form) => form.publicId === formPublicId)
+  ).toMatchObject({
+    activeDraftCount: 1,
+    publicId: formPublicId,
+    status: "published",
+    submissionCount: 1,
+  });
+  expect(
+    await prisma.auditEvent.findFirst({
+      orderBy: { createdAt: "desc" },
+      where: {
+        action: "unarchive_form",
+        outcome: "success",
+        targetId: formPublicId,
+      },
+    })
+  ).toMatchObject({ actorId: adminId, targetId: formPublicId });
+  expect(
+    await prisma.publishedTemplate.findUnique({
+      include: {
+        manifest: { include: { fields: { orderBy: { tag: "asc" } } } },
+        prefillConfiguration: {
+          include: { fields: { orderBy: { tag: "asc" } } },
+        },
+      },
+      where: { formId },
+    })
+  ).toEqual(publishedContractBefore);
   const staleOperationId = crypto.randomUUID();
   const staleStagingObjectKey = objectKey(
     "operations",
@@ -5149,7 +5352,10 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     expect(
       Object.keys(metadata ?? {}).every(
         (key) =>
-          key === "errorCode" || key === "source" || key === "sourcePublicId"
+          key === "errorCode" ||
+          key === "source" ||
+          key === "sourcePublicId" ||
+          key === "status"
       )
     ).toBe(true);
   }
