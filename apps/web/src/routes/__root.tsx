@@ -10,11 +10,40 @@ import { useEffect, useState } from "react";
 import { Button, Notice, Spinner } from "@/components/ui";
 import { safeReturnPath } from "@/lib/api";
 import { AuthProvider, useAuth } from "@/lib/auth";
+import {
+  SESSION_WARNING_WINDOW_MS,
+  createDeferred,
+  shouldWarnBeforeSessionExpiry,
+} from "@/lib/form-lifecycle";
 
 import "@/index.css";
 
-const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const MAX_TIMEOUT_MS = 2_147_483_647;
+interface ReauthenticationRequestDetail {
+  handled: boolean;
+  resolve: (allowed: boolean) => void;
+}
+
+const requestEditorSave = (): Promise<boolean> => {
+  const result = createDeferred<boolean>();
+  const detail: ReauthenticationRequestDetail = {
+    handled: false,
+    resolve: result.resolve,
+  };
+  window.dispatchEvent(
+    new CustomEvent("folio:before-reauth", {
+      detail,
+    })
+  );
+  return detail.handled ? result.promise : Promise.resolve(true);
+};
+
+const currentReturnPath = () => {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  return safeReturnPath(`${window.location.pathname}${window.location.search}`);
+};
 
 const AuthGate = () => {
   const { expiresAt, loading, signOut, user } = useAuth();
@@ -35,11 +64,13 @@ const AuthGate = () => {
     let timeoutId: number | undefined;
     const updateWarning = () => {
       const remaining = expiresAtMs - Date.now();
-      setSessionExpiringSoon(remaining > 0 && remaining <= FIVE_MINUTES_MS);
-      if (remaining > FIVE_MINUTES_MS) {
+      setSessionExpiringSoon(
+        shouldWarnBeforeSessionExpiry(expiresAt ?? undefined, Date.now())
+      );
+      if (remaining > SESSION_WARNING_WINDOW_MS) {
         timeoutId = window.setTimeout(
           updateWarning,
-          Math.min(remaining - FIVE_MINUTES_MS, MAX_TIMEOUT_MS)
+          Math.min(remaining - SESSION_WARNING_WINDOW_MS, MAX_TIMEOUT_MS)
         );
       }
     };
@@ -58,8 +89,11 @@ const AuthGate = () => {
     }
     setReauthenticating(true);
     setReauthenticationFailed(false);
-    const returnTo = safeReturnPath(pathname) ?? undefined;
     try {
+      if (!(await requestEditorSave())) {
+        return;
+      }
+      const returnTo = currentReturnPath() ?? undefined;
       await signOut();
       await navigate({
         replace: true,
@@ -91,7 +125,7 @@ const AuthGate = () => {
     return (
       <Navigate
         to="/login"
-        search={{ returnTo: safeReturnPath(pathname) ?? undefined }}
+        search={{ returnTo: currentReturnPath() ?? undefined }}
         replace
       />
     );
@@ -105,7 +139,7 @@ const AuthGate = () => {
     return (
       <Navigate
         to="/change-password"
-        search={{ returnTo: safeReturnPath(pathname) ?? undefined }}
+        search={{ returnTo: currentReturnPath() ?? undefined }}
         replace
       />
     );

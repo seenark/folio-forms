@@ -44,6 +44,12 @@ interface EditorConfig {
   [key: string]: unknown;
 }
 
+interface DirtyStateBridgeMessage {
+  bridgeId: string;
+  dirty: boolean;
+  source: "form-bridge";
+  type: "dirty-state";
+}
 interface BridgeReadyMessage {
   bridgeId: string;
   source: "form-bridge";
@@ -101,6 +107,18 @@ const isBridgeReadyMessage = (
   value.bridgeId === bridgeId &&
   value.source === "form-bridge" &&
   value.type === "bridge-ready";
+
+const parseDirtyStateMessage = (
+  value: unknown,
+  bridgeId: string
+): DirtyStateBridgeMessage | null =>
+  isRecord(value) &&
+  value.bridgeId === bridgeId &&
+  typeof value.dirty === "boolean" &&
+  value.source === "form-bridge" &&
+  value.type === "dirty-state"
+    ? (value as unknown as DirtyStateBridgeMessage)
+    : null;
 
 const parseCapabilityRequest = (
   value: unknown,
@@ -197,6 +215,7 @@ interface EditorOperationBridgeMessage {
 }
 
 export type EditorBridgeMessage =
+  | DirtyStateBridgeMessage
   | EditorOperationBridgeMessage
   | FieldSelectionBridgeMessage;
 
@@ -233,24 +252,33 @@ declare global {
 }
 
 export const OnlyOfficeEditor = ({
+  clearDirtyRequest = 0,
   configUrl,
   onBridgeMessage,
+  onDirtyChange,
   onStateChange,
   revision = 0,
+  saveRequest = 0,
   title,
 }: {
+  clearDirtyRequest?: number;
   configUrl?: string;
   onBridgeMessage?: (message: EditorBridgeMessage) => void | Promise<void>;
+  onDirtyChange?: (dirty: boolean) => void;
   onStateChange?: (state: OnlyOfficeEditorState) => void;
   revision?: number;
+  saveRequest?: number;
   title: string;
 }) => {
   const hostRef = useRef<HTMLDivElement>(null);
   const feedbackRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<{ destroyEditor?: () => void } | null>(null);
   const onBridgeMessageRef = useRef(onBridgeMessage);
+  const onDirtyChangeRef = useRef(onDirtyChange);
   const onStateChangeRef = useRef(onStateChange);
   const pinnedSourceRef = useRef<MessageEventSource | null>(null);
+  const lastClearDirtyRequestRef = useRef(0);
+  const lastSaveRequestRef = useRef(0);
   const terminalOperationIdsRef = useRef(new Set<string>());
   const editorId = useId().replaceAll(":", "");
   const leaseRef = useRef<EditorLease | null>(null);
@@ -260,6 +288,7 @@ export const OnlyOfficeEditor = ({
   const [editorState, setEditorState] =
     useState<OnlyOfficeEditorState>("loading");
   const [retryToken, setRetryToken] = useState(0);
+  const [bridgeReadyVersion, setBridgeReadyVersion] = useState(0);
 
   const reportState = useCallback((nextState: OnlyOfficeEditorState) => {
     setEditorState(nextState);
@@ -351,8 +380,41 @@ export const OnlyOfficeEditor = ({
 
   useEffect(() => {
     onBridgeMessageRef.current = onBridgeMessage;
+    onDirtyChangeRef.current = onDirtyChange;
     onStateChangeRef.current = onStateChange;
-  }, [onBridgeMessage, onStateChange]);
+  }, [onBridgeMessage, onDirtyChange, onStateChange]);
+  useEffect(() => {
+    const bridgeId = config?.bridge?.id;
+    const pluginOrigin = config?.bridge?.pluginOrigin;
+    const source = pinnedSourceRef.current;
+    if (
+      !source ||
+      typeof bridgeId !== "string" ||
+      !bridgeId ||
+      typeof pluginOrigin !== "string" ||
+      !pluginOrigin
+    ) {
+      return;
+    }
+    const postCommand = (message: Record<string, unknown>) => {
+      try {
+        (source as Window).postMessage(
+          { ...message, bridgeId, source: "folio-parent" },
+          pluginOrigin
+        );
+      } catch {
+        // The editor may close while a command is in flight.
+      }
+    };
+    if (saveRequest > lastSaveRequestRef.current) {
+      lastSaveRequestRef.current = saveRequest;
+      postCommand({ action: "save-draft", type: "run-action" });
+    }
+    if (clearDirtyRequest > lastClearDirtyRequestRef.current) {
+      lastClearDirtyRequestRef.current = clearDirtyRequest;
+      postCommand({ type: "clear-dirty" });
+    }
+  }, [bridgeReadyVersion, clearDirtyRequest, config, saveRequest]);
 
   useEffect(() => {
     let cancelled = false;
@@ -532,6 +594,7 @@ export const OnlyOfficeEditor = ({
         }
         pinnedSourceRef.current = event.source;
         acknowledgeBridge(event.source, pluginOrigin, bridgeId);
+        setBridgeReadyVersion((value) => value + 1);
         return;
       }
 
@@ -548,6 +611,11 @@ export const OnlyOfficeEditor = ({
       const fieldSelection = parseFieldSelectionMessage(data, bridgeId);
       if (fieldSelection) {
         onBridgeMessageRef.current?.(fieldSelection);
+        return;
+      }
+      const dirtyMessage = parseDirtyStateMessage(data, bridgeId);
+      if (dirtyMessage) {
+        onDirtyChangeRef.current?.(dirtyMessage.dirty);
         return;
       }
       const message = parseOperationMessage(data, bridgeId);

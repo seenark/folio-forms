@@ -408,6 +408,130 @@ const selectedControl = (
   },
 });
 
+test("reports dirty state after a document content change", () => {
+  const harness = createHarness();
+  acknowledgeBridge(harness);
+
+  harness.emitEditorEvent("onChangeContentControl");
+
+  expect(harness.messages.at(-1)).toEqual({
+    message: {
+      bridgeId: harness.bridgeId,
+      dirty: true,
+      source: "form-bridge",
+      type: "dirty-state",
+    },
+    targetOrigin: harness.parentOrigin,
+  });
+});
+
+test("clears dirty state after successful save and submit actions", async () => {
+  const harness = createHarness({
+    action: "draft",
+    capabilityResponses: ["save-draft-capability", "submit-capability"],
+    responses: [{ ok: true }, { ok: true }],
+  });
+  acknowledgeBridge(harness);
+
+  harness.emitEditorEvent("onChangeContentControl");
+  await expect(
+    harness.window.FormBridge.runAction("save-draft")
+  ).resolves.toMatchObject({ ok: true });
+  harness.emitEditorEvent("onChangeContentControl");
+  await expect(
+    harness.window.FormBridge.runAction("submit")
+  ).resolves.toMatchObject({ ok: true });
+
+  expect(
+    harness.messages
+      .filter(({ message }) => message.type === "dirty-state")
+      .map(({ message }) => message.dirty)
+  ).toEqual([true, false, true, false]);
+});
+
+test("accepts only authenticated parent dirty commands", async () => {
+  const harness = createHarness({
+    action: "draft",
+    capabilityResponses: ["save-draft-capability"],
+    responses: [{ ok: true }],
+  });
+  acknowledgeBridge(harness);
+  harness.emitEditorEvent("onChangeContentControl");
+
+  const validRunAction = {
+    bridgeId: harness.bridgeId,
+    source: "folio-parent",
+    type: "run-action",
+    action: "save-draft",
+  };
+  const invalidEvents = [
+    {
+      data: validRunAction,
+      origin: "https://wrong.example.test",
+      source: harness.parentWindow,
+    },
+    {
+      data: validRunAction,
+      origin: harness.parentOrigin,
+      source: {},
+    },
+    {
+      data: { ...validRunAction, bridgeId: "wrong-bridge" },
+      origin: harness.parentOrigin,
+      source: harness.parentWindow,
+    },
+    {
+      data: { ...validRunAction, action: "submit" },
+      origin: harness.parentOrigin,
+      source: harness.parentWindow,
+    },
+    {
+      data: {
+        bridgeId: harness.bridgeId,
+        source: "attacker",
+        type: "clear-dirty",
+      },
+      origin: harness.parentOrigin,
+      source: harness.parentWindow,
+    },
+  ];
+
+  for (const event of invalidEvents) {
+    harness.dispatch(event);
+  }
+  await flushPlugin();
+  expect(harness.requests).toHaveLength(0);
+  expect(
+    harness.messages
+      .filter(({ message }) => message.type === "dirty-state")
+      .map(({ message }) => message.dirty)
+  ).toEqual([true]);
+
+  harness.dispatch({
+    data: {
+      bridgeId: harness.bridgeId,
+      source: "folio-parent",
+      type: "clear-dirty",
+    },
+    origin: harness.parentOrigin,
+    source: harness.parentWindow,
+  });
+  harness.emitEditorEvent("onChangeContentControl");
+  harness.dispatch({
+    data: validRunAction,
+    origin: harness.parentOrigin,
+    source: harness.parentWindow,
+  });
+  await flushPlugin();
+
+  expect(harness.requests).toHaveLength(1);
+  expect(
+    harness.messages
+      .filter(({ message }) => message.type === "dirty-state")
+      .map(({ message }) => message.dirty)
+  ).toEqual([true, false, true, false]);
+});
+
 test("extracts scalar form values with plugin contract semantics", async () => {
   const control = ({
     checkbox = false,

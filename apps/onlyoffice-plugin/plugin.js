@@ -63,6 +63,9 @@ const BRIDGE_READY_TYPE = "bridge-ready";
 const BRIDGE_ACK_TYPE = "bridge-ack";
 const CAPABILITY_REQUEST_TYPE = "capability-request";
 const CAPABILITY_RESPONSE_TYPE = "capability-response";
+const DIRTY_STATE_TYPE = "dirty-state";
+const RUN_ACTION_TYPE = "run-action";
+const CLEAR_DIRTY_TYPE = "clear-dirty";
 const OPERATION_MESSAGE_TYPE = "operation";
 
 const CAPABILITY_REQUEST_TIMEOUT_MS = 5000;
@@ -75,6 +78,7 @@ const MAX_SCHEMA_PAGES = 50;
 
 let runtimeOptions = {};
 let actionInFlight = false;
+let documentDirty = false;
 let panelElements = {};
 let panelEventsAttached = false;
 let panelSelectionEventAttached = false;
@@ -2084,6 +2088,21 @@ function postBridgeMessage(message) {
     parentOrigin
   );
 }
+function setDirtyState(dirty) {
+  if (documentDirty === dirty) {
+    return;
+  }
+  documentDirty = dirty;
+  try {
+    postBridgeMessage({
+      dirty,
+      source: BRIDGE_MESSAGE_SOURCE,
+      type: DIRTY_STATE_TYPE,
+    });
+  } catch {
+    // The editor can run without a host frame.
+  }
+}
 function settleCapabilityRequest(requestId, settle, value) {
   const pending = pendingCapabilityRequests.get(requestId);
   if (!pending) {
@@ -2157,7 +2176,9 @@ function handleParentMessage(event) {
     message.source !== PARENT_MESSAGE_SOURCE ||
     message.bridgeId !== runtimeOptions.bridgeId ||
     (message.type !== BRIDGE_ACK_TYPE &&
-      message.type !== CAPABILITY_RESPONSE_TYPE)
+      message.type !== CAPABILITY_RESPONSE_TYPE &&
+      message.type !== RUN_ACTION_TYPE &&
+      message.type !== CLEAR_DIRTY_TYPE)
   ) {
     return;
   }
@@ -2183,6 +2204,20 @@ function handleParentMessage(event) {
   }
 
   if (!bridgeAcknowledged) {
+    return;
+  }
+
+  if (message.type === CLEAR_DIRTY_TYPE) {
+    setDirtyState(false);
+    return;
+  }
+
+  if (message.type === RUN_ACTION_TYPE) {
+    if (message.action !== ACTIONS.SAVE_DRAFT) {
+      return;
+    }
+
+    void runAction(ACTIONS.SAVE_DRAFT);
     return;
   }
 
@@ -2704,6 +2739,10 @@ async function runAction(action) {
       completedPayload || response
     );
 
+    if (action === ACTIONS.SAVE_DRAFT || action === ACTIONS.SUBMIT) {
+      setDirtyState(false);
+    }
+
     return {
       ok: true,
       operationId: operationId || null,
@@ -2815,6 +2854,12 @@ function startInitializationWhenReady() {
     plugin.attachEditorEvent("onDocumentContentReady", () => {
       startInitializationTasks();
     });
+    plugin.attachEditorEvent("onDocumentContentChanged", () => {
+      setDirtyState(true);
+    });
+    plugin.attachEditorEvent("onChangeContentControl", () => {
+      setDirtyState(true);
+    });
   }
 
   window.setTimeout(startInitializationTasks, 3000);
@@ -2871,6 +2916,9 @@ window.FormBridge = Object.assign(window.FormBridge || {}, {
  */
 window.Asc = window.Asc || {};
 window.Asc.plugin = window.Asc.plugin || {};
+window.Asc.plugin.event_onChangeContentControl = () => {
+  setDirtyState(true);
+};
 window.Asc.plugin.init = function init() {
   const start = () => {
     const options = window.Asc.plugin.info?.options;

@@ -119,7 +119,16 @@ export const clearToken = () => {
   localStorage.removeItem(SESSION_KEY);
 };
 const AUTH_ROUTE_PREFIXES = ["/login", "/change-password"] as const;
+const SAFE_RETURN_QUERY_KEYS = new Set(["responseid"]);
 const RETURN_PATH_MAX_LENGTH = 2048;
+const hasSafeReturnQuery = (url: URL): boolean => {
+  for (const key of url.searchParams.keys()) {
+    if (!SAFE_RETURN_QUERY_KEYS.has(key.toLowerCase())) {
+      return false;
+    }
+  }
+  return true;
+};
 
 const containsControlCharacter = (value: string): boolean => {
   for (const character of value) {
@@ -182,11 +191,17 @@ export const safeReturnPath = (value: unknown): string | null => {
   if (parsed.origin !== origin) {
     return null;
   }
+  if (!hasSafeReturnQuery(parsed)) {
+    return null;
+  }
 
-  const { pathname } = parsed;
+  const { pathname, search } = parsed;
   let decodedPathname: string;
   try {
     decodedPathname = decodeURIComponent(pathname);
+    if (containsControlCharacter(decodeURIComponent(search))) {
+      return null;
+    }
   } catch {
     return null;
   }
@@ -208,7 +223,7 @@ export const safeReturnPath = (value: unknown): string | null => {
   ) {
     return null;
   }
-  return pathname;
+  return `${pathname}${search}`;
 };
 
 const request = async <T>(path: string, init: RequestInit = {}): Promise<T> => {

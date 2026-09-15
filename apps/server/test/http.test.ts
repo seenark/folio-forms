@@ -3265,6 +3265,50 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       },
     ],
   });
+  const draftResponseBeforeExport = await prisma.response.findUnique({
+    select: { draftData: true, draftObjectKey: true },
+    where: { id: responseId },
+  });
+  if (!draftResponseBeforeExport?.draftObjectKey) {
+    throw new Error("The Draft export fixture was not created");
+  }
+  const draftJsonExport = await app.handle(
+    new Request(`http://test.local/api/responses/${responseId}/draft/json`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(draftJsonExport.status).toBe(200);
+  expect(draftJsonExport.headers.get("content-type")).toBe(
+    "application/json; charset=utf-8"
+  );
+  expect(draftJsonExport.headers.get("content-disposition")).toBe(
+    `attachment; filename="response-${responseId}.json"`
+  );
+  expect(JSON.parse(await draftJsonExport.text())).toEqual(savedDraftData);
+  const draftDocxExport = await app.handle(
+    new Request(`http://test.local/api/responses/${responseId}/draft/docx`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(draftDocxExport.status).toBe(200);
+  expect(draftDocxExport.headers.get("content-type")).toBe(DOCX_CONTENT_TYPE);
+  expect(draftDocxExport.headers.get("content-disposition")).toBe(
+    `attachment; filename="response-${responseId}.docx"`
+  );
+  expect(new Uint8Array(await draftDocxExport.arrayBuffer())).toEqual(
+    Uint8Array.from(await readObject(draftResponseBeforeExport.draftObjectKey))
+  );
+  const draftPdfExport = await app.handle(
+    new Request(`http://test.local/api/responses/${responseId}/draft/pdf`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(draftPdfExport.status).toBe(200);
+  expect(draftPdfExport.headers.get("content-type")).toBe("application/pdf");
+  expect(draftPdfExport.headers.get("content-disposition")).toBe(
+    `attachment; filename="response-${responseId}.pdf"`
+  );
+  expect(await draftPdfExport.text()).toBe("%PDF-test");
 
   const stableBeforeFailure = await prisma.response.findUnique({
     select: { draftData: true, draftObjectKey: true },
@@ -3659,9 +3703,93 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     })
   );
   expect(unarchivedStartResponse.status).toBe(200);
-  expect(await unarchivedStartResponse.json()).toMatchObject({
-    response: { id: expect.any(String), status: "draft" },
+  const unarchivedStartBody = (await unarchivedStartResponse.json()) as {
+    response?: { id?: string };
+  };
+  const discardedResponseId = unarchivedStartBody.response?.id;
+  if (!discardedResponseId) {
+    throw new Error("The discard fixture was not created");
+  }
+  const discardResponseBefore = await prisma.response.findUnique({
+    select: { draftObjectKey: true },
+    where: { id: discardedResponseId },
   });
+  if (!discardResponseBefore?.draftObjectKey) {
+    throw new Error("The discard Draft document was not created");
+  }
+  const discardEditorConfigResponse = await app.handle(
+    new Request(
+      `http://test.local/api/forms/${formPublicId}/editor-config?responseId=${discardedResponseId}&action=draft`,
+      { headers: { Authorization: `Bearer ${archivedNoResponseBearer}` } }
+    )
+  );
+  expect(discardEditorConfigResponse.status).toBe(200);
+  const unauthorizedDiscard = await app.handle(
+    new Request(`http://test.local/api/responses/${discardedResponseId}`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(unauthorizedDiscard.status).toBe(403);
+  const discardResponse = await app.handle(
+    new Request(`http://test.local/api/responses/${discardedResponseId}`, {
+      headers: { Authorization: `Bearer ${archivedNoResponseBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(discardResponse.status).toBe(200);
+  expect(await discardResponse.json()).toEqual({ discarded: true });
+  expect(
+    await prisma.response.findUnique({ where: { id: discardedResponseId } })
+  ).toBeNull();
+  expect(
+    await prisma.editorLease.count({
+      where: {
+        targetId: discardedResponseId,
+        targetType: "response",
+      },
+    })
+  ).toBe(0);
+  expect(
+    await prisma.operation.count({ where: { responseId: discardedResponseId } })
+  ).toBe(0);
+  expect(await objectExists(discardResponseBefore.draftObjectKey)).toBe(false);
+  const repeatedDiscardResponse = await app.handle(
+    new Request(`http://test.local/api/responses/${discardedResponseId}`, {
+      headers: { Authorization: `Bearer ${archivedNoResponseBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(repeatedDiscardResponse.status).toBe(200);
+  expect(await repeatedDiscardResponse.json()).toEqual({ discarded: true });
+  const responsesAfterDiscard = await app.handle(
+    new Request("http://test.local/api/responses/me", {
+      headers: { Authorization: `Bearer ${archivedNoResponseBearer}` },
+    })
+  );
+  expect(await responsesAfterDiscard.json()).toEqual({ responses: [] });
+  const restartAfterDiscard = await app.handle(
+    new Request(`http://test.local/api/forms/${formPublicId}/start`, {
+      headers: { Authorization: `Bearer ${archivedNoResponseBearer}` },
+      method: "POST",
+    })
+  );
+  expect(restartAfterDiscard.status).toBe(200);
+  const restartAfterDiscardBody = (await restartAfterDiscard.json()) as {
+    response?: { id?: string };
+  };
+  const restartedResponseId = restartAfterDiscardBody.response?.id;
+  if (!restartedResponseId) {
+    throw new Error("The response was not restartable after discard");
+  }
+  expect(restartedResponseId).not.toBe(discardedResponseId);
+  const discardRestartResponse = await app.handle(
+    new Request(`http://test.local/api/responses/${restartedResponseId}`, {
+      headers: { Authorization: `Bearer ${archivedNoResponseBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(discardRestartResponse.status).toBe(200);
   const unarchivedFormListResponse = await app.handle(
     new Request("http://test.local/api/admin/forms", {
       headers: { Authorization: `Bearer ${adminBearer}` },
@@ -3678,7 +3806,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(
     unarchivedFormListBody.forms?.find((form) => form.publicId === formPublicId)
   ).toMatchObject({
-    activeDraftCount: 1,
+    activeDraftCount: 0,
     publicId: formPublicId,
     status: "published",
     submissionCount: 1,

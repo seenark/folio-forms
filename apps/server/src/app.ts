@@ -4764,7 +4764,7 @@ export function createApp(options: AppOptions = {}) {
               ...(Object.hasOwn(input, "description")
                 ? { description: input.description }
                 : {}),
-              ...(input.status !== undefined ? { status: input.status } : {}),
+              ...(input.status === undefined ? {} : { status: input.status }),
             },
             include: { publishedTemplate: true, templateDraft: true },
             where: { id: current.id },
@@ -6139,6 +6139,167 @@ export function createApp(options: AppOptions = {}) {
         ),
       };
     })
+    .get(
+      "/api/responses/:id/draft/:format",
+      async ({ request, params, set }) => {
+        const identity = await requireIdentity(request);
+        validateId(params.id, "Response");
+        if (
+          params.format !== "json" &&
+          params.format !== "docx" &&
+          params.format !== "pdf"
+        ) {
+          fail(404, "not_found", "Draft export was not found");
+        }
+        const response = await prisma.response.findUnique({
+          where: { id: params.id },
+        });
+        if (!response) {
+          fail(404, "not_found", "Response was not found");
+        }
+        if (response.userId !== identity.id) {
+          fail(403, "forbidden", "You may only export your own Draft");
+        }
+        if (response.status !== ResponseStatus.draft) {
+          fail(409, "draft_unavailable", "Only a Draft can be exported");
+        }
+        if (await activeOperationForResponse(response.id)) {
+          fail(409, "operation_in_progress", "The Draft is still being saved");
+        }
+        if (params.format === "json") {
+          return Response.json(jsonRecord(response.draftData ?? {}), {
+            headers: {
+              "Content-Disposition": `attachment; filename="response-${response.id}.json"`,
+              "Content-Type": "application/json; charset=utf-8",
+            },
+          });
+        }
+        if (!response.draftDocumentKey || !response.draftObjectKey) {
+          fail(409, "document_unavailable", "Draft document is unavailable");
+        }
+        if (!(await objectExists(response.draftObjectKey))) {
+          fail(404, "document_unavailable", "Draft document is unavailable");
+        }
+        if (params.format === "docx") {
+          return new Response(streamObject(response.draftObjectKey), {
+            headers: {
+              "Content-Disposition": `attachment; filename="response-${response.id}.docx"`,
+              "Content-Type": DOCX_CONTENT_TYPE,
+            },
+          });
+        }
+        const pdf = await onlyOffice.convertDocxToPdf(
+          response.draftDocumentKey
+        );
+        set.headers["Content-Disposition"] =
+          `attachment; filename="response-${response.id}.pdf"`;
+        set.headers["Content-Type"] = "application/pdf";
+        return pdf;
+      }
+    )
+    .delete("/api/responses/:id", async ({ request, params }) => {
+      const identity = await requireIdentity(request);
+      validateId(params.id, "Response");
+      const objectKeys: string[] = [];
+      const discarded = await prisma.$transaction(async (tx) => {
+        const response = await tx.response.findUnique({
+          select: { formId: true },
+          where: { id: params.id },
+        });
+        if (!response) {
+          return false;
+        }
+        const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
+          Prisma.sql`
+            SELECT "id"
+            FROM "forms"
+            WHERE "id" = ${response.formId}::uuid
+            FOR UPDATE
+          `
+        );
+        if (!lockedForm) {
+          return false;
+        }
+        const current = await tx.response.findUnique({
+          include: { submission: true },
+          where: { id: params.id },
+        });
+        if (!current) {
+          return false;
+        }
+        if (current.userId !== identity.id) {
+          fail(403, "forbidden", "You may only discard your own Draft");
+        }
+        if (current.status !== ResponseStatus.draft || current.submission) {
+          fail(409, "draft_unavailable", "Only a Draft can be discarded");
+        }
+        const operations = await tx.operation.findMany({
+          select: {
+            metadata: true,
+            stagingObjectKey: true,
+          },
+          where: { responseId: current.id },
+        });
+        const activeOperation = await tx.operation.findFirst({
+          select: { id: true },
+          where: {
+            responseId: current.id,
+            status: {
+              in: [OperationStatus.pending, OperationStatus.processing],
+            },
+          },
+        });
+        if (activeOperation) {
+          fail(409, "operation_in_progress", "The Draft is still being saved");
+        }
+        objectKeys.push(current.draftObjectKey ?? "");
+        for (const operation of operations) {
+          objectKeys.push(operation.stagingObjectKey ?? "");
+          try {
+            const metadata = operationMetadata(operation.metadata);
+            objectKeys.push(
+              metadata.finalObjectKey,
+              metadata.stagedObjectKey,
+              ...(metadata.cleanupObjectKeys ?? [])
+            );
+          } catch {
+            // The operation row is deleted below; no trusted object key exists.
+          }
+        }
+        const cleanupKeys = uniqueObjectKeys(objectKeys);
+        if (cleanupKeys.length > 0) {
+          await tx.objectCleanupIntent.createMany({
+            data: cleanupKeys.map((objectKeyValue) => ({
+              objectKey: objectKeyValue,
+            })),
+            skipDuplicates: true,
+          });
+        }
+        await tx.editorLease.deleteMany({
+          where: {
+            targetId: current.id,
+            targetType: OperationTargetType.response,
+          },
+        });
+        await tx.operation.deleteMany({ where: { responseId: current.id } });
+        await tx.response.delete({ where: { id: current.id } });
+        await tx.auditEvent.create({
+          data: {
+            action: "discard_response",
+            actorId: identity.id,
+            outcome: AuditOutcome.success,
+            safeMetadata: jsonValue({}),
+            targetId: current.id,
+            targetType: "response",
+          },
+        });
+        return true;
+      });
+      if (discarded) {
+        await drainObjectCleanupIntents(objectKeys);
+      }
+      return { discarded: true };
+    })
     .post(
       "/api/forms/:publicId/draft",
       async ({ request, params, body, set }) => {
@@ -6567,6 +6728,7 @@ export function createApp(options: AppOptions = {}) {
             events: [
               "onToolbarMenuClick",
               "onDocumentContentReady",
+              "onChangeContentControl",
               "onTargetPositionChanged",
             ],
             initData: "",
