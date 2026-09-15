@@ -42,7 +42,7 @@ const createHarness = ({
       },
       append(...children) {
         for (const child of children) {
-          this.appendChild(child);
+          this.append(child);
         }
       },
       appendChild(child) {
@@ -62,8 +62,8 @@ const createHarness = ({
         const dispatched = {
           ...event,
           currentTarget: this,
-          target: event.target || this,
           preventDefault: event.preventDefault || (() => {}),
+          target: event.target || this,
         };
         for (const callback of callbacks) {
           callback(dispatched);
@@ -80,7 +80,7 @@ const createHarness = ({
       },
       removeChild(child) {
         const index = this.children.indexOf(child);
-        if (index >= 0) {
+        if (index !== -1) {
           this.children.splice(index, 1);
           child.parentNode = undefined;
         }
@@ -651,6 +651,42 @@ test("skips native picture controls during prefill without mutating them", async
     skipped: ["photo"],
   });
   expect(mutationCount).toBe(0);
+});
+test("locks available Prefill and leaves missing values editable", async () => {
+  const controls = ["trusted", "missing"].map((tag) => {
+    let lock;
+    let text = "";
+    return {
+      AddText: (value) => {
+        text += value;
+      },
+      GetClassType: () => "inlineLvlSdt",
+      GetRange: () => ({ GetText: () => text }),
+      GetTag: () => tag,
+      RemoveAllElements: () => {
+        text = "";
+      },
+      SetLock: (value) => {
+        lock = value;
+      },
+      read: () => ({ lock, text }),
+    };
+  });
+  const harness = createHarness({ controls });
+  await expect(
+    harness.window.FormBridge.applyPrefill({
+      editableFields: { trusted: false },
+      values: { trusted: "Trusted value" },
+    })
+  ).resolves.toEqual({
+    applied: ["trusted"],
+    failed: [],
+    skipped: ["missing"],
+  });
+  expect(controls.map((control) => control.read())).toEqual([
+    { lock: "sdtContentLocked", text: "Trusted value" },
+    { lock: undefined, text: "" },
+  ]);
 });
 test("applies a saved scalar response and reports Thai action status", async () => {
   const createMutableControl = ({ kind, tag, items = [] }) => {

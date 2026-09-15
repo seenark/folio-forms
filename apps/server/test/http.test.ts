@@ -1,10 +1,15 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 // oxlint-disable no-await-in-loop complexity -- The end-to-end journey deliberately keeps sequential transitions in one test.
 import { createHash } from "node:crypto";
 
 import { auth, ensureBootstrapAdmin } from "@onlyoffice/auth";
 import { prisma } from "@onlyoffice/db";
 import { strToU8, zipSync } from "fflate";
+import {
+  createInProcessFolioConnector,
+  deterministicExternalRecord,
+  startPrefillMock,
+} from "prefill-mock/mock";
 
 import {
   createApp,
@@ -45,6 +50,13 @@ const app = createApp({
     forceSave: () => Promise.resolve(false),
   },
   requestIp: (request) => request.headers.get("x-test-ip"),
+});
+
+let externalMock: ReturnType<typeof startPrefillMock> | undefined;
+
+afterEach(() => {
+  externalMock?.close();
+  externalMock = undefined;
 });
 const jsonHeaders = { "Content-Type": "application/json" };
 const maxTemplateUploadBytes = 25 * 1024 * 1024;
@@ -1492,7 +1504,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         body: JSON.stringify({
           documentKey: templateDocumentKey,
           prefillPointer: selectedPointer,
-          prefillPolicy: "editable",
+          prefillPolicy: "lock-when-available",
           previousTag: "ticket-09-renamed",
           required: true,
           tag: "full_name",
@@ -1506,7 +1518,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(await restoredRuleResponse.json()).toEqual({
     rule: {
       prefillPointer: selectedPointer,
-      prefillPolicy: "editable",
+      prefillPolicy: "lock-when-available",
       required: true,
       tag: "full_name",
     },
@@ -2105,7 +2117,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       pictureMaxBytes: null,
       pictureMaxHeight: null,
       pictureMaxWidth: null,
-      prefillPolicy: "editable",
+      prefillPolicy: "lock_when_available",
       required: true,
       tag: "full_name",
       type: "text",
@@ -2128,7 +2140,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       configurationId: expect.any(String),
       id: expect.any(String),
       pointer: selectedPointer,
-      policy: "editable",
+      policy: "lock_when_available",
       tag: "full_name",
     },
   ]);
@@ -2833,11 +2845,32 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   if (!formRecord) {
     throw new Error("The published test form was not found");
   }
-  const prefillHandoffSecret = process.env.EDITOR_CAPABILITY_SECRET ?? "";
+  const prefillHandoffSecret = process.env.PREFILL_HANDOFF_SECRET ?? "";
+  const mock = startPrefillMock({
+    connector: createInProcessFolioConnector(
+      (request) => app.handle(request),
+      prefillHandoffSecret
+    ),
+    folioOrigin: "http://test.local",
+  });
+  externalMock = mock;
+  const schemaResponse = await fetch(`${mock.url}/schema?q=person`);
+  expect(schemaResponse.status).toBe(200);
+  const schemaBody = (await schemaResponse.json()) as {
+    items?: { pointer: string; type: string }[];
+  };
+  expect(schemaBody.items).toContainEqual({
+    pointer: "/person/name",
+    type: "string",
+  });
   const handoffExternalReference = `ticket-17-reference-${crypto.randomUUID()}`;
   const handoffCandidateValues = {
-    account: { active: true },
-    person: { name: "Ticket 17 Prefill" },
+    ...deterministicExternalRecord,
+    account: { ...deterministicExternalRecord.account, active: true },
+    person: {
+      ...deterministicExternalRecord.person,
+      name: "Ticket 17 Prefill",
+    },
     [selectedPointer]: selectedPointer.endsWith("/active")
       ? true
       : "Ticket 17 Prefill",
@@ -2871,21 +2904,16 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(await invalidHandoffSecret.json()).toMatchObject({
     error: "handoff_unavailable",
   });
-  const handoffCreateResponse = await app.handle(
-    new Request("http://test.local/api/integrations/prefill/handoffs", {
-      body: JSON.stringify({
-        email: ` ${userEmail.toUpperCase()} `,
-        externalReference: handoffExternalReference,
-        publicId: formRecord.publicId,
-        values: handoffCandidateValues,
-      }),
-      headers: {
-        ...jsonHeaders,
-        "X-Prefill-Handoff-Secret": prefillHandoffSecret,
-      },
-      method: "POST",
-    })
-  );
+  const handoffCreateResponse = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: ` ${userEmail.toUpperCase()} `,
+      externalReference: handoffExternalReference,
+      publicId: formRecord.publicId,
+      values: handoffCandidateValues,
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
   expect(handoffCreateResponse.status).toBe(200);
   const handoffCreateBody = (await handoffCreateResponse.json()) as {
     code?: string;
@@ -2922,10 +2950,29 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(getLaunchResponse.status).toBe(405);
+  const launchPageResponse = await fetch(`${mock.url}/launch`, {
+    body: new URLSearchParams({ code: handoffCreateBody.code }),
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    method: "POST",
+  });
+  expect(launchPageResponse.status).toBe(200);
+  const launchPage = await launchPageResponse.text();
+  expect(launchPage).toContain('action="http://test.local/prefill/handoff"');
+  expect(launchPage).not.toContain("?code=");
+  const launchCode = /name="code" value="(?<code>[^"]+)"/u.exec(launchPage)
+    ?.groups?.code;
+  expect(launchCode).toBe(handoffCreateBody.code);
+  if (!launchCode) {
+    throw new Error("The external mock did not render a handoff code");
+  }
   const launchResponse = await app.handle(
     new Request("http://test.local/prefill/handoff", {
-      body: new URLSearchParams({ code: handoffCreateBody.code }),
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ code: launchCode }),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+      },
       method: "POST",
     })
   );
@@ -2958,12 +3005,18 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(redeemedStartResponse.status).toBe(200);
   const redeemedStartBody = (await redeemedStartResponse.json()) as {
     editorConfigUrl?: string;
-    prefill?: { data?: Record<string, unknown> };
+    prefill?: {
+      data?: Record<string, unknown>;
+      editableFields?: Record<string, unknown>;
+    };
     response?: { id?: string };
   };
   expect(redeemedStartBody.editorConfigUrl).toContain("action=fill");
   expect(redeemedStartBody.prefill?.data).toEqual({
     full_name: selectedPointer.endsWith("/active") ? true : "Ticket 17 Prefill",
+  });
+  expect(redeemedStartBody.prefill?.editableFields).toEqual({
+    full_name: false,
   });
   const handoffResponseId = redeemedStartBody.response?.id;
   if (!handoffResponseId) {
@@ -2975,6 +3028,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(redeemedSnapshot.values).toEqual({
     full_name: selectedPointer.endsWith("/active") ? true : "Ticket 17 Prefill",
   });
+  expect(redeemedSnapshot.lockedFields).toEqual({ full_name: true });
   expect(
     await prisma.response.findUniqueOrThrow({
       select: { externalReferenceDigest: true },
@@ -3003,6 +3057,529 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   });
   expect(redeemedHandoffRecord.status).toBe("consumed");
   expect(redeemedHandoffRecord.responseId).toBe(handoffResponseId);
+  const reentryExternalReference = `ticket-18-reentry-${crypto.randomUUID()}`;
+  const reentryCreateResponse = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: userEmail,
+      externalReference: reentryExternalReference,
+      publicId: formRecord.publicId,
+      values: {
+        ...handoffCandidateValues,
+        [selectedPointer]: "A newer external value",
+      },
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(reentryCreateResponse.status).toBe(200);
+  const reentryCode = ((await reentryCreateResponse.json()) as { code: string })
+    .code;
+  const reentryPage = await fetch(`${mock.url}/launch`, {
+    body: new URLSearchParams({ code: reentryCode }),
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    method: "POST",
+  });
+  const reentryPageHtml = await reentryPage.text();
+  const reentryLaunchCode = /name="code" value="(?<code>[^"]+)"/u.exec(
+    reentryPageHtml
+  )?.groups?.code;
+  if (!reentryLaunchCode) {
+    throw new Error("The reentry mock did not render a launch form");
+  }
+  const reentryLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: reentryLaunchCode }),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+      },
+      method: "POST",
+    })
+  );
+  const reentryCookie = reentryLaunch.headers
+    .get("set-cookie")
+    ?.split(";", 1)[0];
+  if (!reentryCookie) {
+    throw new Error("The reentry handoff did not set a pending claim cookie");
+  }
+  const reentryHandoff = await prisma.handoff.findFirstOrThrow({
+    where: {
+      externalReferenceDigest: createHash("sha256")
+        .update(reentryExternalReference)
+        .digest("hex"),
+    },
+  });
+  const reentryReservedAt = reentryHandoff.reservedAt;
+  if (!reentryReservedAt) {
+    throw new Error("The reentry handoff was not reserved");
+  }
+  const lateApp = createApp({
+    clock: () => new Date(reentryReservedAt.getTime() + 121_000),
+    prefillHandoffSecret,
+  });
+  const stableReentryStart = await lateApp.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: {
+        Authorization: `Bearer ${userBearer}`,
+        Cookie: reentryCookie,
+      },
+      method: "POST",
+    })
+  );
+  expect(stableReentryStart.status).toBe(200);
+  expect(await stableReentryStart.json()).toMatchObject({
+    prefill: {
+      data: {
+        full_name: selectedPointer.endsWith("/active")
+          ? true
+          : "Ticket 17 Prefill",
+      },
+      editableFields: { full_name: false },
+    },
+    response: { id: handoffResponseId },
+  });
+  const stableReentrySnapshot = await prisma.prefillSnapshot.findUniqueOrThrow({
+    where: { responseId: handoffResponseId },
+  });
+  expect(stableReentrySnapshot).toMatchObject({
+    lockedFields: { full_name: true },
+    values: {
+      full_name: selectedPointer.endsWith("/active")
+        ? true
+        : "Ticket 17 Prefill",
+    },
+  });
+  expect(
+    await prisma.response.findUniqueOrThrow({
+      select: { externalReferenceDigest: true },
+      where: { id: handoffResponseId },
+    })
+  ).toEqual({
+    externalReferenceDigest: createHash("sha256")
+      .update(handoffExternalReference)
+      .digest("hex"),
+  });
+  const missingValueEmail = `ticket-18-missing-${crypto.randomUUID()}@example.com`;
+  const missingValueUser = await createCredentialFixture({
+    email: missingValueEmail,
+    name: "Ticket 18 Missing Value User",
+    password,
+  });
+  const missingValueBearer = await bearerFor(missingValueEmail, password);
+  const missingValueReference = `ticket-18-missing-${crypto.randomUUID()}`;
+  const missingValueCreate = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: missingValueEmail,
+      externalReference: missingValueReference,
+      publicId: formRecord.publicId,
+      values: { account: { active: true } },
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(missingValueCreate.status).toBe(200);
+  const missingValueCode = (
+    (await missingValueCreate.json()) as { code: string }
+  ).code;
+  const missingValueLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: missingValueCode }),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+      },
+      method: "POST",
+    })
+  );
+  const missingValueCookie = missingValueLaunch.headers
+    .get("set-cookie")
+    ?.split(";", 1)[0];
+  if (!missingValueCookie) {
+    throw new Error("The missing-value handoff did not set a cookie");
+  }
+  const missingValueStart = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: {
+        Authorization: `Bearer ${missingValueBearer}`,
+        Cookie: missingValueCookie,
+      },
+      method: "POST",
+    })
+  );
+  expect(missingValueStart.status).toBe(200);
+  expect(await missingValueStart.json()).toMatchObject({
+    prefill: { data: {}, editableFields: {} },
+  });
+  const missingValueResponse = await prisma.response.findUniqueOrThrow({
+    include: { prefillSnapshot: true },
+    where: {
+      formId_userId: { formId, userId: missingValueUser.id },
+    },
+  });
+  expect(missingValueResponse.prefillSnapshot).toMatchObject({
+    lockedFields: {},
+    values: {},
+  });
+  const discardedMissingValue = await app.handle(
+    new Request(`http://test.local/api/responses/${missingValueResponse.id}`, {
+      headers: { Authorization: `Bearer ${missingValueBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(discardedMissingValue.status).toBe(200);
+  const malformedValueCreate = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: ` ${missingValueEmail.toUpperCase()} `,
+      externalReference: `ticket-18-malformed-${crypto.randomUUID()}`,
+      publicId: formRecord.publicId,
+      values: {
+        account: {
+          address: { city: 42 },
+        },
+      },
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(malformedValueCreate.status).toBe(409);
+  expect(await malformedValueCreate.json()).toMatchObject({
+    error: "handoff_unavailable",
+  });
+  const largePrefillEmail = `ticket-18-large-${crypto.randomUUID()}@example.com`;
+  const handoffCountBeforeLargeValue = await prisma.handoff.count();
+  const responseCountBeforeLargeValue = await prisma.response.count({
+    where: { formId },
+  });
+  const largePrefillCreate = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: largePrefillEmail,
+      externalReference: `ticket-18-large-${crypto.randomUUID()}`,
+      publicId: formRecord.publicId,
+      values: {
+        ...handoffCandidateValues,
+        [selectedPointer]: "x".repeat(10_001),
+      },
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(largePrefillCreate.status).toBe(409);
+  expect(await largePrefillCreate.json()).toMatchObject({
+    error: "handoff_unavailable",
+  });
+  expect(await prisma.handoff.count()).toBe(handoffCountBeforeLargeValue);
+  expect(
+    await prisma.response.count({
+      where: { formId },
+    })
+  ).toBe(responseCountBeforeLargeValue);
+  const mandatoryEmail = `ticket-17-password-${crypto.randomUUID()}@example.com`;
+  const mandatoryUser = await createCredentialFixture({
+    email: mandatoryEmail,
+    mustChangePassword: true,
+    name: "Ticket 17 Password User",
+    password,
+  });
+  const mandatoryHandoffCreate = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: mandatoryEmail,
+      externalReference: `ticket-17-password-${crypto.randomUUID()}`,
+      publicId: formRecord.publicId,
+      values: handoffCandidateValues,
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  const mandatoryHandoffCode = (
+    (await mandatoryHandoffCreate.json()) as { code: string }
+  ).code;
+  const mandatoryHandoffLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: mandatoryHandoffCode }),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+      },
+      method: "POST",
+    })
+  );
+  expect(mandatoryHandoffLaunch.status).toBe(303);
+  const mandatoryCookie = mandatoryHandoffLaunch.headers
+    .get("set-cookie")
+    ?.split(";", 1)[0];
+  if (!mandatoryCookie) {
+    throw new Error("The mandatory-password handoff did not set a cookie");
+  }
+  const mandatoryBearer = await bearerFor(mandatoryEmail, password);
+  const passwordChangeResponse = await app.handle(
+    new Request("http://test.local/api/account/password", {
+      body: JSON.stringify({
+        currentPassword: password,
+        newPassword: "Ticket17-new-password",
+      }),
+      headers: {
+        ...jsonHeaders,
+        Authorization: `Bearer ${mandatoryBearer}`,
+        Cookie: mandatoryCookie,
+      },
+      method: "POST",
+    })
+  );
+  expect(passwordChangeResponse.status).toBe(200);
+  const freshMandatoryBearer = await bearerFor(
+    mandatoryEmail,
+    "Ticket17-new-password"
+  );
+  const passwordContinuation = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: {
+        Authorization: `Bearer ${freshMandatoryBearer}`,
+        Cookie: mandatoryCookie,
+      },
+      method: "POST",
+    })
+  );
+  expect(passwordContinuation.status).toBe(200);
+  const passwordContinuationBody = await passwordContinuation.json();
+  expect(passwordContinuationBody).toMatchObject({
+    response: { id: expect.any(String) },
+  });
+  const passwordResponseRecord = await prisma.response.findFirstOrThrow({
+    select: { id: true, userId: true },
+    where: { formId, userId: mandatoryUser.id },
+  });
+  expect(passwordResponseRecord.userId).toBe(mandatoryUser.id);
+  const emailMismatchCreate = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: userEmail,
+      externalReference: `ticket-17-email-mismatch-${crypto.randomUUID()}`,
+      publicId: formRecord.publicId,
+      values: handoffCandidateValues,
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  const emailMismatchCode = (
+    (await emailMismatchCreate.json()) as {
+      code: string;
+    }
+  ).code;
+  const emailMismatchLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: emailMismatchCode }),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+      },
+      method: "POST",
+    })
+  );
+  const emailMismatchCookie = emailMismatchLaunch.headers
+    .get("set-cookie")
+    ?.split(";", 1)[0];
+  if (!emailMismatchCookie) {
+    throw new Error("The email-mismatch handoff did not set a cookie");
+  }
+  const emailMismatchStart = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: {
+        Authorization: `Bearer ${missingValueBearer}`,
+        Cookie: emailMismatchCookie,
+      },
+      method: "POST",
+    })
+  );
+  expect(emailMismatchStart.status).toBe(409);
+  expect(await emailMismatchStart.json()).toMatchObject({
+    error: "handoff_unavailable",
+  });
+
+  const formMismatchCreate = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: userEmail,
+      externalReference: `ticket-17-form-mismatch-${crypto.randomUUID()}`,
+      publicId: formRecord.publicId,
+      values: handoffCandidateValues,
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  const formMismatchCode = (
+    (await formMismatchCreate.json()) as {
+      code: string;
+    }
+  ).code;
+  const formMismatchLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: formMismatchCode }),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+      },
+      method: "POST",
+    })
+  );
+  const formMismatchCookie = formMismatchLaunch.headers
+    .get("set-cookie")
+    ?.split(";", 1)[0];
+  if (!formMismatchCookie) {
+    throw new Error("The Form-mismatch handoff did not set a cookie");
+  }
+  const formMismatchStart = await app.handle(
+    new Request(`http://test.local/api/forms/${secondFormPublicId}/start`, {
+      headers: {
+        Authorization: `Bearer ${userBearer}`,
+        Cookie: formMismatchCookie,
+      },
+      method: "POST",
+    })
+  );
+  expect(formMismatchStart.status).toBe(409);
+  expect(await formMismatchStart.json()).toMatchObject({
+    error: "handoff_unavailable",
+  });
+
+  const configMismatchCreate = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: mandatoryEmail,
+      externalReference: `ticket-17-config-mismatch-${crypto.randomUUID()}`,
+      publicId: formRecord.publicId,
+      values: handoffCandidateValues,
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  const configMismatchCode = (
+    (await configMismatchCreate.json()) as {
+      code: string;
+    }
+  ).code;
+  const configMismatchLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: configMismatchCode }),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+      },
+      method: "POST",
+    })
+  );
+  const configMismatchCookie = configMismatchLaunch.headers
+    .get("set-cookie")
+    ?.split(";", 1)[0];
+  if (!configMismatchCookie) {
+    throw new Error("The config-mismatch handoff did not set a cookie");
+  }
+  const configMismatchHandoff = await prisma.handoff.findFirstOrThrow({
+    where: {
+      codeDigest: createHash("sha256").update(configMismatchCode).digest("hex"),
+    },
+  });
+  await prisma.handoff.update({
+    data: { configurationHash: "0".repeat(64) },
+    where: { id: configMismatchHandoff.id },
+  });
+  const configMismatchStart = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: {
+        Authorization: `Bearer ${freshMandatoryBearer}`,
+        Cookie: configMismatchCookie,
+      },
+      method: "POST",
+    })
+  );
+  expect(configMismatchStart.status).toBe(409);
+  expect(await configMismatchStart.json()).toMatchObject({
+    error: "handoff_unavailable",
+  });
+  const discardedMandatory = await app.handle(
+    new Request(
+      `http://test.local/api/responses/${passwordResponseRecord.id}`,
+      {
+        headers: { Authorization: `Bearer ${freshMandatoryBearer}` },
+        method: "DELETE",
+      }
+    )
+  );
+  expect(discardedMandatory.status).toBe(200);
+
+  const expiredCreate = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: userEmail,
+      externalReference: `ticket-17-expired-${crypto.randomUUID()}`,
+      publicId: formRecord.publicId,
+      values: handoffCandidateValues,
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  const expiredCode = ((await expiredCreate.json()) as { code: string }).code;
+  const expiredRecord = await prisma.handoff.findFirstOrThrow({
+    orderBy: { createdAt: "desc" },
+    where: {
+      codeDigest: createHash("sha256").update(expiredCode).digest("hex"),
+    },
+  });
+  await prisma.handoff.update({
+    data: {
+      expiresAt: new Date(expiredRecord.createdAt.getTime() + 1),
+    },
+    where: { id: expiredRecord.id },
+  });
+  const expiredApp = createApp({
+    clock: () => new Date(expiredRecord.createdAt.getTime() + 2),
+    prefillHandoffSecret,
+  });
+  const expiredLaunch = await expiredApp.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: expiredCode }),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+      },
+      method: "POST",
+    })
+  );
+  expect(expiredLaunch.status).toBe(303);
+  expect(expiredLaunch.headers.get("location")).toBe(
+    "/handoff?error=handoff_unavailable"
+  );
+  const malformedLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: JSON.stringify({ code: handoffCreateBody.code }),
+      headers: {
+        "Content-Type": "application/json",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+      },
+      method: "POST",
+    })
+  );
+  expect(malformedLaunch.status).toBe(303);
+  expect(malformedLaunch.headers.get("location")).toBe(
+    "/handoff?error=handoff_unavailable"
+  );
+  const nonNavigationLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: handoffCreateBody.code }),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Mode": "cors",
+      },
+      method: "POST",
+    })
+  );
+  expect(nonNavigationLaunch.status).toBe(303);
+  expect(nonNavigationLaunch.headers.get("location")).toBe(
+    "/handoff?error=handoff_unavailable"
+  );
   const raceUserEmail = `ticket-17-race-${crypto.randomUUID()}@example.com`;
   await createCredentialFixture({
     email: raceUserEmail,
@@ -3379,18 +3956,15 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(deletePublishedDuplicate.status).toBe(200);
   expect(await objectExists(duplicatePublishedObjectKey)).toBe(false);
   expect(await objectExists(publishedContractBefore.objectKey)).toBe(true);
-  expect(
-    (
-      await app.handle(
-        new Request(
-          `http://test.local/api/admin/forms/${duplicatePublishedPublicId}`,
-          {
-            headers: { Authorization: `Bearer ${adminBearer}` },
-          }
-        )
-      )
-    ).status
-  ).toBe(404);
+  const duplicateDeleteLookupResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${duplicatePublishedPublicId}`,
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      }
+    )
+  );
+  expect(duplicateDeleteLookupResponse.status).toBe(404);
 
   const draftDuplicateSourceResponse = await app.handle(
     formCreationRequest({
@@ -3451,33 +4025,24 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     Buffer.from(await readObject(draftDuplicateSource.templateDraft.objectKey))
   );
   const draftDuplicateObjectKey = draftDuplicate.templateDraft.objectKey;
-  expect(
-    (
-      await app.handle(
-        new Request(
-          `http://test.local/api/admin/forms/${draftDuplicatePublicId}`,
-          {
-            headers: { Authorization: `Bearer ${adminBearer}` },
-            method: "DELETE",
-          }
-        )
-      )
-    ).status
-  ).toBe(200);
+  const draftDuplicateDeleteResponse = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${draftDuplicatePublicId}`, {
+      headers: { Authorization: `Bearer ${adminBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(draftDuplicateDeleteResponse.status).toBe(200);
   expect(await objectExists(draftDuplicateObjectKey)).toBe(false);
-  expect(
-    (
-      await app.handle(
-        new Request(
-          `http://test.local/api/admin/forms/${draftDuplicateSourcePublicId}`,
-          {
-            headers: { Authorization: `Bearer ${adminBearer}` },
-            method: "DELETE",
-          }
-        )
-      )
-    ).status
-  ).toBe(200);
+  const draftDuplicateSourceDeleteResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${draftDuplicateSourcePublicId}`,
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+        method: "DELETE",
+      }
+    )
+  );
+  expect(draftDuplicateSourceDeleteResponse.status).toBe(200);
   const draftMetadataCreateResponse = await app.handle(
     formCreationRequest({
       authorization: adminBearer,
@@ -3911,8 +4476,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     { data: { accept_terms: "true" }, status: 422 },
     { data: { department: "not-an-option" }, status: 422 },
     { data: { start_date: "2026-02-30" }, status: 422 },
-    { data: { full_name: "x".repeat(10_001) }, status: 422 },
-    { data: { full_name: "🙂".repeat(100_000) }, status: 413 },
+    { data: { description_1: "🙂".repeat(100_000) }, status: 413 },
   ];
   for (const invalidDraftCase of invalidDraftCases) {
     const invalidDraftResponse = await draftRequest(invalidDraftCase.data);
@@ -3924,12 +4488,64 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         : "invalid_response_data"
     );
   }
+  const trustedPrefillValue = selectedPointer.endsWith("/active")
+    ? true
+    : "Ticket 17 Prefill";
+  const lockedSnapshotCases = [
+    { error: "invalid_response_data", status: 422, value: "x".repeat(10_001) },
+    { error: "response_too_large", status: 413, value: "🙂".repeat(100_000) },
+    { error: "invalid_response_data", status: 422, value: true },
+  ];
+  for (const lockedSnapshotCase of lockedSnapshotCases) {
+    await prisma.prefillSnapshot.update({
+      data: { values: { full_name: lockedSnapshotCase.value } },
+      where: { responseId },
+    });
+    const invalidTrustedValueResponse = await draftRequest({
+      full_name: "client value",
+    });
+    expect(invalidTrustedValueResponse.status).toBe(lockedSnapshotCase.status);
+    expect(await invalidTrustedValueResponse.json()).toMatchObject({
+      error: lockedSnapshotCase.error,
+    });
+  }
+  await prisma.prefillSnapshot.update({
+    data: { values: { full_name: trustedPrefillValue } },
+    where: { responseId },
+  });
+  const oversizedClientValueResponse = await draftRequest({
+    full_name: "x".repeat(10_001),
+  });
+  expect(oversizedClientValueResponse.status).toBe(202);
+  const oversizedClientValueBody =
+    (await oversizedClientValueResponse.json()) as {
+      operationCapability?: string;
+      operationId?: string;
+    };
+  if (
+    !oversizedClientValueBody.operationCapability ||
+    !oversizedClientValueBody.operationId
+  ) {
+    throw new Error("The locked client value operation was not created");
+  }
+  const oversizedClientValueOperation = await waitForOperation(
+    oversizedClientValueBody.operationId,
+    { "X-Editor-Capability": oversizedClientValueBody.operationCapability }
+  );
+  expect(oversizedClientValueOperation.status).toBe("completed");
+  const normalizedClientTamperResponse = await prisma.response.findUniqueOrThrow({
+    select: { draftData: true },
+    where: { id: responseId },
+  });
+  expect(normalizedClientTamperResponse.draftData).toEqual({
+    full_name: trustedPrefillValue,
+  });
   const savedDraftData = {
     accept_terms: true,
     department: "engineering",
     description_1: "line one\nline two",
     description_2: "",
-    full_name: "Ada Lovelace",
+    full_name: selectedPointer.endsWith("/active") ? true : "Ticket 17 Prefill",
     start_date: "2026-09-15",
   };
   const submitRequest = (data: Record<string, unknown>, targetApp = app) =>
@@ -3945,7 +4561,6 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       })
     );
   const invalidSubmitCases = [
-    { ...savedDraftData, full_name: "" },
     { ...savedDraftData, accept_terms: false },
     { ...savedDraftData, department: "not-an-option" },
     { ...savedDraftData, start_date: "2026-02-30" },
@@ -4134,13 +4749,10 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   if (!retrySaveBody.operationCapability || !retrySaveBody.operationId) {
     throw new Error("The retry draft operation was not created");
   }
-  expect(
-    (
-      await waitForOperation(retrySaveBody.operationId, {
-        "X-Editor-Capability": retrySaveBody.operationCapability,
-      })
-    ).status
-  ).toBe("completed");
+  const retrySaveOperation = await waitForOperation(retrySaveBody.operationId, {
+    "X-Editor-Capability": retrySaveBody.operationCapability,
+  });
+  expect(retrySaveOperation.status).toBe("completed");
   const stableBeforeSubmitFailure = await prisma.response.findUnique({
     select: { draftData: true, draftObjectKey: true, status: true },
     where: { id: responseId },
@@ -4221,6 +4833,58 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       status: "submitted",
       submissionId: completedSubmissionId,
     },
+    submissionId: completedSubmissionId,
+  });
+  expect(
+    await prisma.response.count({
+      where: { formId, userId },
+    })
+  ).toBe(1);
+  const postSubmitHandoffCreate = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: userEmail,
+      externalReference: `ticket-17-post-submit-${crypto.randomUUID()}`,
+      publicId: formRecord.publicId,
+      values: handoffCandidateValues,
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  const postSubmitCode = (
+    (await postSubmitHandoffCreate.json()) as {
+      code: string;
+    }
+  ).code;
+  const postSubmitLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: postSubmitCode }),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+      },
+      method: "POST",
+    })
+  );
+  const postSubmitCookie = postSubmitLaunch.headers
+    .get("set-cookie")
+    ?.split(";", 1)[0];
+  if (!postSubmitCookie) {
+    throw new Error("The post-submit handoff did not set a cookie");
+  }
+  const postSubmitStart = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: {
+        Authorization: `Bearer ${userBearer}`,
+        Cookie: postSubmitCookie,
+      },
+      method: "POST",
+    })
+  );
+  expect(postSubmitStart.status).toBe(200);
+  expect(await postSubmitStart.json()).toMatchObject({
+    receiptUrl: `/receipt/${completedSubmissionId}`,
+    response: { id: responseId, status: "submitted" },
     submissionId: completedSubmissionId,
   });
   expect(

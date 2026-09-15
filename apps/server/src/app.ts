@@ -485,6 +485,7 @@ interface CallbackPayload {
 }
 
 export interface AppOptions {
+  clock?: () => Date;
   onlyOffice?: OnlyOfficeClient;
   onlyOfficeCallbackOrigins?: readonly string[];
   onlyOfficeCallbackMaxBytes?: number;
@@ -1125,6 +1126,17 @@ function handoffCreateInput(input: JsonRecord): PrefillHandoffCreateInput {
   };
 }
 
+function requireTopLevelNavigation(request: Request): void {
+  const fetchMode = request.headers.get("sec-fetch-mode");
+  const fetchDestination = request.headers.get("sec-fetch-dest");
+  if (
+    (fetchMode !== null && fetchMode !== "navigate") ||
+    (fetchDestination !== null && fetchDestination !== "document")
+  ) {
+    fail(400, "invalid_request", "The handoff must be a top-level navigation");
+  }
+}
+
 async function readPrefillHandoffCode(request: Request): Promise<string> {
   const contentType =
     request.headers
@@ -1132,9 +1144,11 @@ async function readPrefillHandoffCode(request: Request): Promise<string> {
       ?.split(";", 1)[0]
       ?.trim()
       .toLowerCase() ?? "";
-  if (contentType === "" || contentType === "application/json") {
-    const body = await readJsonRecord(request, prefillHandoffBodyMaximumBytes);
-    return handoffCode(body.code);
+  if (
+    contentType !== "application/x-www-form-urlencoded" &&
+    contentType !== "multipart/form-data"
+  ) {
+    fail(415, "invalid_request", "The handoff code body format is unsupported");
   }
   const bytes = await readRequestBytes(
     request,
@@ -1250,12 +1264,13 @@ function filteredPrefillValues(
   const filtered: JsonRecord = {};
   for (const field of fields) {
     const value = externalValueAtPointer(values, field.pointer);
-    if (
-      value !== undefined &&
-      externalValueMatchesSchema(field.pointer, value)
-    ) {
-      filtered[field.tag] = value;
+    if (value === undefined) {
+      continue;
     }
+    if (!externalValueMatchesSchema(field.pointer, value)) {
+      handoffUnavailable();
+    }
+    filtered[field.tag] = value;
   }
   return filtered;
 }
@@ -3520,6 +3535,51 @@ function validateResponsePictureControls(
     }
   }
 }
+function manifestFieldValueMatches(
+  field: { options: unknown; type: FieldType },
+  value: unknown
+): boolean {
+  if (field.type === FieldType.checkbox) {
+    return typeof value === "boolean";
+  }
+  if (field.type === FieldType.dropdown) {
+    const optionValues = Array.isArray(field.options)
+      ? field.options.flatMap((option) => {
+          if (!option || typeof option !== "object" || Array.isArray(option)) {
+            return [];
+          }
+          const optionValue = (option as Record<string, unknown>).value;
+          return typeof optionValue === "string" ? [optionValue] : [];
+        })
+      : [];
+    return typeof value === "string" && optionValues.includes(value);
+  }
+  if (field.type === FieldType.date) {
+    return typeof value === "string" && isValidDateFieldValue(value);
+  }
+  if (field.type === FieldType.combo || field.type === FieldType.text) {
+    return typeof value === "string" && value.length <= maxResponseTextLength;
+  }
+  return false;
+}
+
+function validatePrefillValuesAgainstManifest(
+  values: JsonRecord,
+  fields: readonly { options: unknown; tag: string; type: FieldType }[]
+): void {
+  const serialized = JSON.stringify(values);
+  if (new TextEncoder().encode(serialized).byteLength > maxResponseDataBytes) {
+    handoffUnavailable();
+  }
+  const fieldsByTag = new Map(fields.map((field) => [field.tag, field]));
+  for (const [tag, value] of Object.entries(values)) {
+    const field = fieldsByTag.get(tag);
+    if (!field || !manifestFieldValueMatches(field, value)) {
+      handoffUnavailable();
+    }
+  }
+}
+
 async function normalizeResponseData(
   form: FormWithDocuments,
   response: ResponseWithSnapshot,
@@ -3527,9 +3587,15 @@ async function normalizeResponseData(
   requireRequired = false
 ): Promise<JsonRecord> {
   let data: JsonRecord = { ...jsonRecord(inputData) };
-  const serialized = JSON.stringify(data);
-  if (new TextEncoder().encode(serialized).byteLength > maxResponseDataBytes) {
-    fail(413, "response_too_large", "Response data exceeds the size limit");
+  const snapshot = response.prefillSnapshot;
+  if (snapshot) {
+    const snapshotData = jsonRecord(snapshot.values);
+    const lockedFields = jsonRecord(snapshot.lockedFields);
+    for (const [field, value] of Object.entries(snapshotData)) {
+      if (lockedFields[field] === true) {
+        data[field] = value;
+      }
+    }
   }
   const publishedTemplate = form.publishedTemplate;
   if (!publishedTemplate?.objectKey) {
@@ -3563,62 +3629,19 @@ async function normalizeResponseData(
   data = Object.fromEntries(
     Object.entries(data).filter(([fieldTag]) => !pictureTags.has(fieldTag))
   );
+  const serialized = JSON.stringify(data);
+  if (new TextEncoder().encode(serialized).byteLength > maxResponseDataBytes) {
+    fail(413, "response_too_large", "Response data exceeds the size limit");
+  }
 
   for (const [fieldTag, value] of Object.entries(data)) {
     const field = fieldsByTag.get(fieldTag);
-    if (!field || value === null) {
-      continue;
-    }
-    let valid = false;
-    if (field.type === FieldType.checkbox) {
-      valid = typeof value === "boolean";
-    } else if (field.type === FieldType.dropdown) {
-      const optionValues = new Set(
-        Array.isArray(field.options)
-          ? field.options.flatMap((option) => {
-              if (
-                !option ||
-                typeof option !== "object" ||
-                Array.isArray(option)
-              ) {
-                return [];
-              }
-              const optionValue = (option as Record<string, unknown>).value;
-              return typeof optionValue === "string" ? [optionValue] : [];
-            })
-          : []
-      );
-      valid = typeof value === "string" && optionValues.has(value);
-    } else if (field.type === FieldType.date) {
-      valid = typeof value === "string" && isValidDateFieldValue(value);
-    } else if (
-      field.type === FieldType.combo ||
-      field.type === FieldType.picture ||
-      field.type === FieldType.text
-    ) {
-      valid =
-        typeof value === "string" &&
-        ((field.type !== FieldType.combo && field.type !== FieldType.text) ||
-          value.length <= maxResponseTextLength);
-    } else {
-      valid = false;
-    }
-    if (!valid) {
+    if (field && value !== null && !manifestFieldValueMatches(field, value)) {
       fail(
         422,
         "invalid_response_data",
         `${fieldTag} does not match the published Field Manifest`
       );
-    }
-  }
-  const snapshot = response.prefillSnapshot;
-  if (snapshot) {
-    const snapshotData = jsonRecord(snapshot.values);
-    const lockedFields = jsonRecord(snapshot.lockedFields);
-    for (const [field, value] of Object.entries(snapshotData)) {
-      if (lockedFields[field] === true && !pictureTags.has(field)) {
-        data[field] = value;
-      }
     }
   }
   if (requireRequired) {
@@ -4885,7 +4908,10 @@ async function createPrefillHandoff(
   const form = await prisma.form.findUnique({
     include: {
       publishedTemplate: {
-        include: { prefillConfiguration: { include: { fields: true } } },
+        include: {
+          manifest: { include: { fields: true } },
+          prefillConfiguration: { include: { fields: true } },
+        },
       },
     },
     where: { publicId: input.publicId },
@@ -4901,6 +4927,14 @@ async function createPrefillHandoff(
     input.values,
     configuration.fields
   );
+  const manifest = form.publishedTemplate?.manifest;
+  if (
+    !manifest ||
+    manifest.configurationHash !== configuration.configurationHash
+  ) {
+    handoffUnavailable();
+  }
+  validatePrefillValuesAgainstManifest(filteredValues, manifest.fields);
   const code = randomBytes(32).toString("base64url");
   const codeDigest = tokenDigest(code);
   const externalReferenceDigest = tokenDigest(input.externalReference);
@@ -4977,9 +5011,9 @@ async function createPrefillHandoff(
   }
   return { code, launchPath: "/prefill/handoff" };
 }
-
 async function launchPrefillHandoff(
-  code: string
+  code: string,
+  clock: () => Date = () => new Date()
 ): Promise<PrefillHandoffLaunch> {
   const codeDigest = tokenDigest(code);
   let auditTargetId: string | null = null;
@@ -5015,7 +5049,7 @@ async function launchPrefillHandoff(
         auditTargetId =
           form && publicIdPattern.test(form.publicId) ? form.publicId : null;
         const configuration = publishedPrefillConfiguration(form);
-        const now = new Date();
+        const now = clock();
         if (
           !handoff ||
           !form ||
@@ -5026,18 +5060,23 @@ async function launchPrefillHandoff(
           handoffUnavailable();
         }
         const claimToken = randomBytes(32).toString("base64url");
+        const claimExpiresAt = new Date(
+          now.getTime() + pendingClaimLifetimeSeconds * 1000
+        );
         await tx.pendingClaim.create({
           data: {
             claimDigest: tokenDigest(claimToken),
-            expiresAt: new Date(
-              now.getTime() + pendingClaimLifetimeSeconds * 1000
-            ),
+            expiresAt: claimExpiresAt,
             handoff: { connect: { id: handoff.id } },
             id: crypto.randomUUID(),
           },
         });
         const reserved = await tx.handoff.updateMany({
-          data: { reservedAt: now, status: HandoffStatus.reserved },
+          data: {
+            expiresAt: claimExpiresAt,
+            reservedAt: now,
+            status: HandoffStatus.reserved,
+          },
           where: {
             expiresAt: { gt: now },
             id: handoff.id,
@@ -5077,7 +5116,8 @@ async function launchPrefillHandoff(
 async function redeemPrefillHandoff(
   form: FormWithDocuments,
   identity: Identity,
-  claimToken: string
+  claimToken: string,
+  clock: () => Date = () => new Date()
 ): Promise<PrefillHandoffRedeemResult> {
   const responseHint = await prisma.response.findUnique({
     select: { id: true, status: true },
@@ -5106,6 +5146,7 @@ async function redeemPrefillHandoff(
   await putObject(draftObjectKey, document, DOCX_CONTENT_TYPE);
   const claimDigest = tokenDigest(claimToken);
   let oldDraftObjectKey: string | null = null;
+  let unusedDraftObjectKey: string | null = null;
   try {
     const response = await prisma.$transaction(
       async (tx) => {
@@ -5155,7 +5196,7 @@ async function redeemPrefillHandoff(
           where: { id: lockedClaim.id },
         });
         const handoff = pendingClaim?.handoff;
-        const now = new Date();
+        const now = clock();
         if (
           !pendingClaim ||
           !handoff ||
@@ -5175,7 +5216,7 @@ async function redeemPrefillHandoff(
           handoffUnavailable();
         }
         const currentResponse = await tx.response.findUnique({
-          include: { submission: true },
+          include: { prefillSnapshot: true, submission: true },
           where: {
             formId_userId: { formId: currentForm.id, userId: identity.id },
           },
@@ -5196,6 +5237,11 @@ async function redeemPrefillHandoff(
         ) {
           handoffUnavailable();
         }
+        const reuseExistingDraft =
+          currentResponse?.status === ResponseStatus.draft &&
+          currentResponse.publishedVersion === currentForm.version &&
+          currentResponse.draftDocumentKey !== null &&
+          currentResponse.draftObjectKey !== null;
         const storedValues = jsonRecord(
           handoff.filteredValues,
           "The prefill handoff values are invalid"
@@ -5204,71 +5250,76 @@ async function redeemPrefillHandoff(
         const lockedFields: JsonRecord = {};
         for (const field of configuration.fields) {
           const value = storedValues[field.tag];
-          if (
-            value !== undefined &&
-            externalValueMatchesSchema(field.pointer, value)
-          ) {
-            values[field.tag] = value;
-            lockedFields[field.tag] =
-              field.policy === PrefillPolicy.lock_when_available;
+          if (value === undefined) {
+            continue;
           }
+          if (!externalValueMatchesSchema(field.pointer, value)) {
+            handoffUnavailable();
+          }
+          values[field.tag] = value;
+          lockedFields[field.tag] =
+            field.policy === PrefillPolicy.lock_when_available;
         }
         const responseTargetId = currentResponse?.id ?? responseId;
-        oldDraftObjectKey = currentResponse?.draftObjectKey ?? null;
-        if (currentResponse) {
-          await tx.editorLease.deleteMany({
-            where: {
-              targetId: currentResponse.id,
-              targetType: OperationTargetType.response,
-            },
-          });
-          await tx.operation.deleteMany({
-            where: { responseId: currentResponse.id },
-          });
-          await tx.prefillSnapshot.deleteMany({
-            where: { responseId: currentResponse.id },
-          });
-          await tx.response.update({
-            data: {
-              draftData: Prisma.DbNull,
-              draftDocumentKey,
-              draftObjectKey,
-              externalReferenceDigest: handoff.externalReferenceDigest,
-              publishedTemplateId: currentForm.publishedTemplate.id,
-              publishedVersion: currentForm.version,
-              status: ResponseStatus.draft,
-              updatedAt: now,
-            },
-            where: { id: responseTargetId },
-          });
+        if (reuseExistingDraft) {
+          unusedDraftObjectKey = draftObjectKey;
         } else {
-          await tx.response.create({
-            data: {
-              draftData: Prisma.DbNull,
-              draftDocumentKey,
-              draftObjectKey,
-              externalReferenceDigest: handoff.externalReferenceDigest,
-              form: { connect: { id: currentForm.id } },
-              id: responseTargetId,
-              owner: { connect: { id: identity.id } },
-              publishedTemplate: {
-                connect: { id: currentForm.publishedTemplate.id },
+          oldDraftObjectKey = currentResponse?.draftObjectKey ?? null;
+          if (currentResponse) {
+            await tx.editorLease.deleteMany({
+              where: {
+                targetId: currentResponse.id,
+                targetType: OperationTargetType.response,
               },
-              publishedVersion: currentForm.version,
-              status: ResponseStatus.draft,
+            });
+            await tx.operation.deleteMany({
+              where: { responseId: currentResponse.id },
+            });
+            await tx.prefillSnapshot.deleteMany({
+              where: { responseId: currentResponse.id },
+            });
+            await tx.response.update({
+              data: {
+                draftData: Prisma.DbNull,
+                draftDocumentKey,
+                draftObjectKey,
+                externalReferenceDigest: handoff.externalReferenceDigest,
+                publishedTemplateId: currentForm.publishedTemplate.id,
+                publishedVersion: currentForm.version,
+                status: ResponseStatus.draft,
+                updatedAt: now,
+              },
+              where: { id: responseTargetId },
+            });
+          } else {
+            await tx.response.create({
+              data: {
+                draftData: Prisma.DbNull,
+                draftDocumentKey,
+                draftObjectKey,
+                externalReferenceDigest: handoff.externalReferenceDigest,
+                form: { connect: { id: currentForm.id } },
+                id: responseTargetId,
+                owner: { connect: { id: identity.id } },
+                publishedTemplate: {
+                  connect: { id: currentForm.publishedTemplate.id },
+                },
+                publishedVersion: currentForm.version,
+                status: ResponseStatus.draft,
+              },
+            });
+          }
+          await tx.prefillSnapshot.create({
+            data: {
+              form: { connect: { id: currentForm.id } },
+              id: crypto.randomUUID(),
+              lockedFields: jsonValue(lockedFields),
+              owner: { connect: { id: identity.id } },
+              response: { connect: { id: responseTargetId } },
+              values: jsonValue(values),
             },
           });
         }
-        await tx.prefillSnapshot.create({
-          data: {
-            form: { connect: { id: currentForm.id } },
-            id: crypto.randomUUID(),
-            lockedFields: jsonValue(lockedFields),
-            owner: { connect: { id: identity.id } },
-            response: { connect: { id: responseTargetId } },
-            values: jsonValue(values),
-          },
-        });
         const consumedClaim = await tx.pendingClaim.updateMany({
           data: { consumedAt: now },
           where: {
@@ -5303,10 +5354,12 @@ async function redeemPrefillHandoff(
           safeMetadata: {},
           targetId: currentForm.publicId,
         });
-        const created = await tx.response.findUnique({
-          include: { prefillSnapshot: true },
-          where: { id: responseTargetId },
-        });
+        const created = reuseExistingDraft
+          ? currentResponse
+          : await tx.response.findUnique({
+              include: { prefillSnapshot: true },
+              where: { id: responseTargetId },
+            });
         if (!created) {
           fail(500, "start_failed", "Unable to redeem prefill handoff");
         }
@@ -5315,7 +5368,10 @@ async function redeemPrefillHandoff(
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
     );
     return {
-      cleanupObjectKeys: uniqueObjectKeys([oldDraftObjectKey]),
+      cleanupObjectKeys: uniqueObjectKeys([
+        oldDraftObjectKey,
+        unusedDraftObjectKey,
+      ]),
       response,
     };
   } catch (error) {
@@ -5464,7 +5520,8 @@ export function createApp(options: AppOptions = {}) {
   const callbackMaximumBytes =
     options.onlyOfficeCallbackMaxBytes ?? maxCallbackDocumentBytes;
   const prefillHandoffSecret =
-    options.prefillHandoffSecret ?? env.EDITOR_CAPABILITY_SECRET;
+    options.prefillHandoffSecret ?? env.PREFILL_HANDOFF_SECRET;
+  const handoffClock = options.clock ?? (() => new Date());
   return new Elysia()
     .onError(({ error, set }) => {
       if (error instanceof HttpError) {
@@ -5541,8 +5598,10 @@ export function createApp(options: AppOptions = {}) {
       "/prefill/handoff",
       async ({ request }) => {
         try {
+          requireTopLevelNavigation(request);
           const launch = await launchPrefillHandoff(
-            await readPrefillHandoffCode(request)
+            await readPrefillHandoffCode(request),
+            handoffClock
           );
           return new Response(null, {
             headers: {
@@ -7217,6 +7276,9 @@ export function createApp(options: AppOptions = {}) {
         (form.status !== FormStatus.published &&
           !(form.status === FormStatus.archived && existing))
       ) {
+        if (pendingClaimToken) {
+          handoffUnavailable();
+        }
         fail(
           409,
           "form_unavailable",
@@ -7251,7 +7313,8 @@ export function createApp(options: AppOptions = {}) {
           const redeemed = await redeemPrefillHandoff(
             form,
             identity,
-            pendingClaimToken
+            pendingClaimToken,
+            handoffClock
           );
           await deleteObjects(redeemed.cleanupObjectKeys);
           set.headers["Set-Cookie"] = pendingClaimCookie("", 0);

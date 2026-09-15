@@ -6,11 +6,7 @@
     "build": "tsdown",
     "check-types": "tsc -b",
     "compile": "bun build --compile --minify --sourcemap --bytecode ./src/index.ts --outfile server",
-    "db:migrate": "bun run --cwd ../../packages/db db:migrate",
-    "dev": "bun run --hot src/index.ts",
-    "start": "bun run dist/index.mjs",
-    "test:http": "test -n \"$DATABASE_URL\" || (echo 'DATABASE_URL must point to an isolated PostgreSQL database' >&2; exit 1); bun test --timeout 120000 test/http.test.ts",
-    "test:storage": "bun test test/storage.test.ts"
+    "test:http": "test -n \"$DATABASE_URL\" || (echo 'DATABASE_URL must point to an isolated PostgreSQL database' >&2; exit 1); bun run --cwd ../prefill-mock build && bun test --timeout 120000 test/http.test.ts"
   },
   "dependencies": {
     "@elysiajs/cors": "^1.4.2",
@@ -28,6 +24,7 @@
   "devDependencies": {
     "@onlyoffice/config": "workspace:*",
     "@types/bun": "catalog:",
+    "prefill-mock": "workspace:*",
     "tsdown": "^0.22.14",
     "typescript": "catalog:"
   }

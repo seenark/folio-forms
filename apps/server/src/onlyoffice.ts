@@ -35,11 +35,12 @@ const capabilityStringFields = [
 const trustBoundarySecrets = [
   env.BETTER_AUTH_SECRET,
   env.EDITOR_CAPABILITY_SECRET,
+  env.PREFILL_HANDOFF_SECRET,
   env.ONLYOFFICE_JWT_SECRET,
-];
+] as const;
 if (new Set(trustBoundarySecrets).size !== trustBoundarySecrets.length) {
   throw new Error(
-    "BETTER_AUTH_SECRET, EDITOR_CAPABILITY_SECRET, and ONLYOFFICE_JWT_SECRET must be distinct"
+    "BETTER_AUTH_SECRET, EDITOR_CAPABILITY_SECRET, PREFILL_HANDOFF_SECRET, and ONLYOFFICE_JWT_SECRET must be distinct"
   );
 }
 
