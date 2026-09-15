@@ -24,6 +24,7 @@ const createHarness = ({
   const editorEvents = new Map();
   const elements = new Map();
   const requests = [];
+  const methodCalls = [];
   const timers = [];
   const queuedCapabilityResponses = [...capabilityResponses];
   const queuedResponses = [...responses];
@@ -42,7 +43,11 @@ const createHarness = ({
       },
       append(...children) {
         for (const child of children) {
-          this.append(child);
+          if (!child) {
+            continue;
+          }
+          child.parentNode = this;
+          this.children.push(child);
         }
       },
       appendChild(child) {
@@ -198,6 +203,7 @@ const createHarness = ({
       done(JSON.stringify({ name: "Ada", value: "example" }));
     },
     executeMethod(method, ...args) {
+      methodCalls.push(method);
       const done = args.at(-1);
       if (typeof done !== "function") {
         return;
@@ -364,6 +370,7 @@ const createHarness = ({
       }
     },
     messages,
+    methodCalls,
     parentOrigin,
     parentWindow,
     requests,
@@ -533,6 +540,50 @@ test("accepts only authenticated parent dirty commands", async () => {
   ).toEqual([true, false, true, false]);
 });
 
+test("runs correction saves with a reason and correction endpoint", async () => {
+  const harness = createHarness({
+    action: "correction",
+    capabilityResponses: ["save-correction-capability", "poll-capability"],
+    responses: [
+      {
+        operationCapability: "poll-capability",
+        operationId: "correction-operation",
+      },
+      completedOperation({ correctionId: "correction-1", revision: 1 }),
+    ],
+  });
+  expect(harness.methodCalls).toContain("SetEditingRestrictions");
+  const restrictionsBeforeReady = harness.methodCalls.filter(
+    (method) => method === "SetEditingRestrictions"
+  ).length;
+  harness.emitEditorEvent("onDocumentContentReady");
+  await flushPlugin();
+  expect(
+    harness.methodCalls.filter((method) => method === "SetEditingRestrictions")
+      .length
+  ).toBeGreaterThan(restrictionsBeforeReady);
+  acknowledgeBridge(harness);
+
+  await expect(
+    harness.window.FormBridge.runAction("save-correction", "แก้ไขตามเอกสารต้นฉบับ")
+  ).resolves.toMatchObject({ ok: true });
+
+  expect(harness.requests.map(({ method, url }) => [method, url])).toEqual([
+    [
+      "POST",
+      "https://api.example.test/api/admin/results/response-id/correction",
+    ],
+    ["GET", "https://api.example.test/api/operations/correction-operation"],
+  ]);
+  expect(JSON.parse(harness.requests[0].body)).toEqual({
+    data: {},
+    documentKey: "document-key",
+    reason: "แก้ไขตามเอกสารต้นฉบับ",
+  });
+  expect(harness.requests[0].headers.get("x-editor-capability")).toBe(
+    "save-correction-capability"
+  );
+});
 test("extracts scalar form values with plugin contract semantics", async () => {
   const control = ({
     checkbox = false,

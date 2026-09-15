@@ -177,6 +177,9 @@ const DashboardRoute = () => {
                     {submitted
                       ? `ส่งเมื่อ ${formatDate(row.submittedAt ?? row.createdAt)}`
                       : `บันทึกล่าสุด ${formatDate(row.updatedAt ?? row.createdAt)}`}
+                    {submitted && row.latestCorrectionNumber
+                      ? ` · แก้ไขครั้งที่ ${row.latestCorrectionNumber}`
+                      : ""}
                   </p>
                 </div>
                 <div className="flex items-center gap-3">

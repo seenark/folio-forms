@@ -18,12 +18,14 @@ const editorCapabilityActions = new Set<unknown>([
   "publish",
   "save-draft",
   "submit",
+  "save-correction",
   "configure-fields",
   "poll-operation",
 ]);
 const editorCapabilityTargets = new Set<unknown>([
   "template-draft",
   "response",
+  "correction",
 ]);
 const userRoles = new Set<unknown>(["admin", "user"]);
 const capabilityStringFields = [
@@ -43,16 +45,24 @@ if (new Set(trustBoundarySecrets).size !== trustBoundarySecrets.length) {
     "BETTER_AUTH_SECRET, EDITOR_CAPABILITY_SECRET, PREFILL_HANDOFF_SECRET, and ONLYOFFICE_JWT_SECRET must be distinct"
   );
 }
-
 export type EditorCapabilityAction =
   | "save-template"
   | "publish"
   | "save-draft"
   | "submit"
+  | "save-correction"
   | "configure-fields"
   | "poll-operation";
-export type EditorCapabilityTarget = "template-draft" | "response";
-type PluginAction = "template-edit" | "fill" | "draft" | "submit";
+export type EditorCapabilityTarget =
+  | "template-draft"
+  | "response"
+  | "correction";
+type PluginAction =
+  | "template-edit"
+  | "fill"
+  | "draft"
+  | "submit"
+  | "correction";
 type UserRole = "admin" | "user";
 type JsonRecord = Record<string, unknown>;
 

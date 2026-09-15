@@ -6,6 +6,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { cors } from "@elysiajs/cors";
 import { auth } from "@onlyoffice/auth";
@@ -62,6 +63,7 @@ type PrefillSnapshot =
 type PublishedTemplate =
   Prisma.PublishedTemplateGetPayload<Prisma.PublishedTemplateDefaultArgs>;
 type Response = Prisma.ResponseGetPayload<Prisma.ResponseDefaultArgs>;
+type Correction = Prisma.CorrectionGetPayload<Prisma.CorrectionDefaultArgs>;
 type Submission = Prisma.SubmissionGetPayload<Prisma.SubmissionDefaultArgs>;
 type TemplateDraft =
   Prisma.TemplateDraftGetPayload<Prisma.TemplateDraftDefaultArgs>;
@@ -119,6 +121,7 @@ const loginFailureLimit = 5;
 const loginFailureWindowMs = 15 * 60_000;
 const passwordMinimumLength = 12;
 const passwordMaximumLength = 128;
+const correctionReasonMaximumLength = 2000;
 const maxResponseDataBytes = 256 * 1024;
 const maxResponseTextLength = 10_000;
 const fieldRuleBodyMaximumBytes = 8 * 1024;
@@ -210,6 +213,16 @@ interface EditorCapabilityScope {
 interface ClaimedEditorLease {
   expiresAt: Date;
   id: string;
+  workspaceBaseDocumentKey?: string;
+  workspaceBaseRevision?: number;
+  workspaceDocumentKey?: string;
+  workspaceObjectKey?: string;
+}
+interface CorrectionWorkspaceInput {
+  baseDocumentKey: string;
+  baseRevision: number;
+  documentKey: string;
+  objectKey: string;
 }
 interface EditorLeaseGrant extends ClaimedEditorLease {
   proof: string;
@@ -399,9 +412,15 @@ function schemaPage(
       nextOffset < matching.length ? schemaCursor(query, nextOffset) : null,
   };
 }
-type OperationAction = "save-template" | "publish" | "save-draft" | "submit";
+type OperationAction =
+  | "save-template"
+  | "publish"
+  | "save-draft"
+  | "submit"
+  | "save-correction";
 const operationTypeForAction: Record<OperationAction, OperationType> = {
   publish: "publish_form",
+  "save-correction": "save_correction",
   "save-draft": "save_draft",
   "save-template": "save_template_draft",
   submit: "submit_response",
@@ -414,7 +433,8 @@ type OperationErrorCode =
   | "force_save_failed"
   | "invalid_template"
   | "onlyoffice_document_error"
-  | "operation_timeout";
+  | "operation_timeout"
+  | "pdf_conversion_failed";
 type FormSource = "blank" | "upload";
 type FormAuditAction =
   | "archive_form"
@@ -452,6 +472,7 @@ type FormAuditErrorCode =
   | "onlyoffice_document_error"
   | "operation_in_progress"
   | "operation_timeout"
+  | "pdf_conversion_failed"
   | "payload_too_large"
   | "published_immutable"
   | "stale_document"
@@ -463,22 +484,28 @@ interface FormAuditMetadata {
   sourcePublicId?: string;
   status?: FormStatus;
 }
-type OperationMetadata = JsonRecord & {
+interface OperationMetadata extends JsonRecord {
   action: OperationAction;
+  baseDocumentKey?: string;
+  baseRevision?: number;
   cleanupObjectKeys?: string[];
-  formId: string;
-  responseId?: string;
-  submissionId?: string;
-  publicId?: string;
-  publishedVersion?: number;
-  publishedKey?: string;
-  submissionDocumentKey?: string;
-  stagedObjectKey: string;
-  finalObjectKey: string;
-  nextDocumentKey?: string;
+  correctionId?: string;
   data?: JsonRecord;
+  finalObjectKey: string;
+  formId: string;
+  nextDocumentKey?: string;
+  publicId?: string;
+  publishedKey?: string;
+  publishedVersion?: number;
+  reason?: string;
+  responseId?: string;
   result?: JsonRecord;
-};
+  stagedObjectKey: string;
+  submissionDocumentKey?: string;
+  workspaceDocumentKey?: string;
+  workspaceObjectKey?: string;
+  submissionId?: string;
+}
 
 interface OperationCompletion {
   cleanupObjectKeys: string[];
@@ -714,6 +741,33 @@ async function readDocumentKeyInput(request: Request): Promise<string> {
 
   return requiredString(input, "documentKey");
 }
+interface CorrectionInput {
+  data: JsonRecord;
+  documentKey: string;
+  reason: string;
+}
+
+function correctionInput(body: unknown): CorrectionInput {
+  const input = asRecord(body);
+  const keys = Object.keys(input);
+  if (
+    keys.length !== 3 ||
+    !keys.includes("data") ||
+    !keys.includes("documentKey") ||
+    !keys.includes("reason")
+  ) {
+    fail(400, "invalid_request", "documentKey, data, and reason are required");
+  }
+  const reason = requiredString(input, "reason");
+  if (reason.length > correctionReasonMaximumLength) {
+    fail(400, "invalid_request", "reason is too long");
+  }
+  return {
+    data: jsonRecord(input.data),
+    documentKey: requiredString(input, "documentKey"),
+    reason,
+  };
+}
 interface FormMetadataInput {
   description?: string | null;
   status?: FormStatus;
@@ -790,19 +844,30 @@ function jsonRecord(
 
 function operationMetadata(value: unknown): OperationMetadata {
   const metadata = asRecord(value, "Operation metadata is invalid");
-  const { action, cleanupObjectKeys, finalObjectKey, formId, stagedObjectKey } =
-    metadata;
+  const {
+    action,
+    cleanupObjectKeys,
+    finalObjectKey,
+    formId,
+    stagedObjectKey,
+    workspaceDocumentKey,
+    workspaceObjectKey,
+  } = metadata;
   if (
     (action !== "save-template" &&
       action !== "publish" &&
       action !== "save-draft" &&
-      action !== "submit") ||
+      action !== "submit" &&
+      action !== "save-correction") ||
     typeof formId !== "string" ||
     typeof stagedObjectKey !== "string" ||
     typeof finalObjectKey !== "string" ||
     (cleanupObjectKeys !== undefined &&
       (!Array.isArray(cleanupObjectKeys) ||
-        cleanupObjectKeys.some((key) => typeof key !== "string")))
+        cleanupObjectKeys.some((key) => typeof key !== "string"))) ||
+    (workspaceDocumentKey !== undefined &&
+      typeof workspaceDocumentKey !== "string") ||
+    (workspaceObjectKey !== undefined && typeof workspaceObjectKey !== "string")
   ) {
     fail(500, "invalid_operation", "Operation metadata is invalid");
   }
@@ -882,21 +947,16 @@ async function drainObjectCleanupIntents(
     },
   });
   for (const intent of intents) {
-    try {
-      await deleteObject(intent.objectKey);
-      await prisma.objectCleanupIntent.deleteMany({
-        where: { id: intent.id, objectKey: intent.objectKey },
-      });
-    } catch (error) {
-      console.error(
-        `Could not drain object cleanup intent ${intent.id}`,
-        error
-      );
+    if (!(await deleteObjectUnlessCanonical(intent.objectKey))) {
+      continue;
     }
+    await prisma.objectCleanupIntent.deleteMany({
+      where: { id: intent.id, objectKey: intent.objectKey },
+    });
   }
 }
 
-async function deleteObjectUnlessCanonical(key: string): Promise<void> {
+async function deleteObjectUnlessCanonical(key: string): Promise<boolean> {
   try {
     const references = await Promise.all([
       prisma.templateDraft.findFirst({
@@ -915,12 +975,23 @@ async function deleteObjectUnlessCanonical(key: string): Promise<void> {
         select: { id: true },
         where: { objectKey: key },
       }),
+      prisma.correction.findFirst({
+        select: { id: true },
+        where: { objectKey: key },
+      }),
+      prisma.editorLease.findFirst({
+        select: { id: true },
+        where: { workspaceObjectKey: key },
+      }),
     ]);
-    if (references.every((reference) => reference === null)) {
-      await deleteObjects([key]);
+    if (references.some((reference) => reference !== null)) {
+      return false;
     }
+    await deleteObject(key);
+    return true;
   } catch (error) {
     console.error(`Could not verify whether object ${key} is canonical`, error);
+    return false;
   }
 }
 
@@ -942,6 +1013,15 @@ async function cleanupTerminalOperationObjects(
   }
   await deleteObjects([metadata.stagedObjectKey]);
   await deleteObjectUnlessCanonical(metadata.finalObjectKey);
+  if (metadata.action === "save-correction" && metadata.workspaceDocumentKey) {
+    const workspaceLease = await prisma.editorLease.findUnique({
+      select: { workspaceObjectKey: true },
+      where: { workspaceDocumentKey: metadata.workspaceDocumentKey },
+    });
+    if (!workspaceLease && metadata.workspaceObjectKey) {
+      await deleteObjectUnlessCanonical(metadata.workspaceObjectKey);
+    }
+  }
 }
 
 function jsonValue(value: unknown): Prisma.InputJsonValue {
@@ -1563,8 +1643,11 @@ function operationEditorCapability(
 function editorLeaseTargetType(
   targetType: EditorCapabilityTarget
 ): OperationTargetType {
-  return targetType === "template-draft"
-    ? OperationTargetType.template_draft
+  if (targetType === "template-draft") {
+    return OperationTargetType.template_draft;
+  }
+  return targetType === "correction"
+    ? OperationTargetType.correction
     : OperationTargetType.response;
 }
 
@@ -1612,7 +1695,8 @@ async function claimEditorLease(
   identity: Identity,
   targetType: EditorCapabilityTarget,
   targetId: string,
-  formId: string
+  formId: string,
+  workspace?: CorrectionWorkspaceInput
 ): Promise<EditorLeaseGrant> {
   const now = new Date();
   const expiresAt = nextEditorLeaseExpiry(identity, now);
@@ -1651,7 +1735,11 @@ async function claimEditorLease(
           "capability_digest" AS "capabilityDigest",
           "expires_at" AS "expiresAt",
           "holder_session_id" AS "holderSessionId",
-          "holder_user_id" AS "holderUserId"
+          "holder_user_id" AS "holderUserId",
+          "workspace_base_document_key" AS "workspaceBaseDocumentKey",
+          "workspace_base_revision" AS "workspaceBaseRevision",
+          "workspace_document_key" AS "workspaceDocumentKey",
+          "workspace_object_key" AS "workspaceObjectKey"
         FROM "editor_leases"
         WHERE
           "target_type" = CAST(${databaseTargetType} AS "OperationTargetType")
@@ -1687,6 +1775,10 @@ async function claimEditorLease(
           "holder_user_id",
           "capability_digest",
           "expires_at",
+          "workspace_base_document_key",
+          "workspace_base_revision",
+          "workspace_document_key",
+          "workspace_object_key",
           "renewed_at"
         )
         VALUES (
@@ -1697,6 +1789,10 @@ async function claimEditorLease(
           ${identity.id},
           ${capabilityDigest},
           ${expiresAt},
+          ${workspace?.baseDocumentKey ?? null},
+          ${workspace?.baseRevision ?? null},
+          ${workspace?.documentKey ?? null},
+          ${workspace?.objectKey ?? null},
           ${now}
         )
         ON CONFLICT ("target_type", "target_id") DO UPDATE SET
@@ -1708,6 +1804,34 @@ async function claimEditorLease(
           "holder_user_id" = EXCLUDED."holder_user_id",
           "capability_digest" = EXCLUDED."capability_digest",
           "expires_at" = EXCLUDED."expires_at",
+          "workspace_base_document_key" = CASE
+            WHEN "editor_leases"."expires_at" <= ${now}
+              OR "editor_leases"."holder_session_id" <> ${identity.sessionId}
+              OR "editor_leases"."holder_user_id" <> ${identity.id}
+              THEN EXCLUDED."workspace_base_document_key"
+            ELSE "editor_leases"."workspace_base_document_key"
+          END,
+          "workspace_base_revision" = CASE
+            WHEN "editor_leases"."expires_at" <= ${now}
+              OR "editor_leases"."holder_session_id" <> ${identity.sessionId}
+              OR "editor_leases"."holder_user_id" <> ${identity.id}
+              THEN EXCLUDED."workspace_base_revision"
+            ELSE "editor_leases"."workspace_base_revision"
+          END,
+          "workspace_document_key" = CASE
+            WHEN "editor_leases"."expires_at" <= ${now}
+              OR "editor_leases"."holder_session_id" <> ${identity.sessionId}
+              OR "editor_leases"."holder_user_id" <> ${identity.id}
+              THEN EXCLUDED."workspace_document_key"
+            ELSE "editor_leases"."workspace_document_key"
+          END,
+          "workspace_object_key" = CASE
+            WHEN "editor_leases"."expires_at" <= ${now}
+              OR "editor_leases"."holder_session_id" <> ${identity.sessionId}
+              OR "editor_leases"."holder_user_id" <> ${identity.id}
+              THEN EXCLUDED."workspace_object_key"
+            ELSE "editor_leases"."workspace_object_key"
+          END,
           "created_at" = CASE
             WHEN "editor_leases"."expires_at" <= ${now}
               THEN EXCLUDED."created_at"
@@ -1720,7 +1844,13 @@ async function claimEditorLease(
             "editor_leases"."holder_session_id" = ${identity.sessionId}
             AND "editor_leases"."holder_user_id" = ${identity.id}
           )
-        RETURNING "id", "expires_at" AS "expiresAt"
+        RETURNING
+          "id",
+          "expires_at" AS "expiresAt",
+          "workspace_base_document_key" AS "workspaceBaseDocumentKey",
+          "workspace_base_revision" AS "workspaceBaseRevision",
+          "workspace_document_key" AS "workspaceDocumentKey",
+          "workspace_object_key" AS "workspaceObjectKey"
       `
     );
     return claimed ?? null;
@@ -1756,15 +1886,64 @@ async function releaseEditorLease(
   identity: Identity,
   leaseId: string
 ): Promise<void> {
-  const released = await prisma.editorLease.deleteMany({
-    where: {
-      holderSessionId: identity.sessionId,
-      holderUserId: identity.id,
-      id: leaseId,
-    },
+  const workspaceObjectKey = await prisma.$transaction(async (tx) => {
+    const [lease] = await tx.$queryRaw<
+      {
+        targetId: string;
+        targetType: OperationTargetType;
+        workspaceObjectKey: string | null;
+      }[]
+    >(
+      Prisma.sql`
+        SELECT
+          "target_id" AS "targetId",
+          "target_type" AS "targetType",
+          "workspace_object_key" AS "workspaceObjectKey"
+        FROM "editor_leases"
+        WHERE
+          "id" = ${leaseId}::uuid
+          AND "holder_session_id" = ${identity.sessionId}
+          AND "holder_user_id" = ${identity.id}
+        FOR UPDATE
+      `
+    );
+    if (!lease) {
+      fail(
+        409,
+        "editor_lease_inactive",
+        "The editor lease is no longer active"
+      );
+    }
+    const activeOperation =
+      lease.targetType === OperationTargetType.correction
+        ? await tx.operation.findFirst({
+            select: { id: true },
+            where: {
+              status: {
+                in: [OperationStatus.pending, OperationStatus.processing],
+              },
+              targetId: lease.targetId,
+              targetType: OperationTargetType.correction,
+            },
+          })
+        : null;
+    if (activeOperation) {
+      return null;
+    }
+    const released = await tx.editorLease.deleteMany({
+      where: { id: leaseId },
+    });
+    if (released.count !== 1) {
+      fail(
+        409,
+        "editor_lease_inactive",
+        "The editor lease is no longer active"
+      );
+    }
+    return lease.workspaceObjectKey;
   });
-  if (released.count !== 1) {
-    fail(409, "editor_lease_inactive", "The editor lease is no longer active");
+  if (workspaceObjectKey) {
+    await drainObjectCleanupIntents([workspaceObjectKey]);
   }
 }
 
@@ -2214,10 +2393,17 @@ async function createFormFailureAudit({
     },
   });
 }
-type ResponseAuditAction = "export_response" | "view_response";
-type ResponseAuditTargetType = "response" | "submission";
+type ResponseAuditAction =
+  | "create_correction"
+  | "export_correction"
+  | "export_response"
+  | "view_correction"
+  | "view_response";
+type ResponseAuditTargetType = "correction" | "response" | "submission";
 interface ResponseAuditMetadata {
+  errorCode?: OperationErrorCode;
   format?: "docx" | "json" | "pdf";
+  revision?: number;
   state: "draft" | "submitted";
 }
 
@@ -2276,6 +2462,7 @@ function responseSummary(
   extra: {
     formPublicId?: string;
     formTitle?: string;
+    latestCorrectionNumber?: number | null;
     submissionId?: string | null;
     submittedAt?: Date | null;
   } = {}
@@ -2286,6 +2473,7 @@ function responseSummary(
     formTitle: extra.formTitle,
     hasDraft: Boolean(response.draftObjectKey && response.draftData),
     id: response.id,
+    latestCorrectionNumber: extra.latestCorrectionNumber,
     publishedVersion: response.publishedVersion,
     status: response.status,
     submissionId: extra.submissionId,
@@ -3804,6 +3992,17 @@ async function normalizeResponseData(
   }
   return data;
 }
+function changedResponseData(
+  previous: JsonRecord,
+  next: JsonRecord
+): JsonRecord {
+  const keys = new Set([...Object.keys(previous), ...Object.keys(next)]);
+  return Object.fromEntries(
+    [...keys]
+      .filter((key) => !isDeepStrictEqual(previous[key], next[key]))
+      .map((key) => [key, next[key] ?? null])
+  );
+}
 
 async function activeAfterRecovery(
   operation: Operation | null
@@ -3974,6 +4173,22 @@ async function updateOperationFailed(
         targetId,
       });
     }
+    if (
+      metadata.action === "save-correction" &&
+      metadata.responseId &&
+      current.actorId
+    ) {
+      await tx.auditEvent.create({
+        data: {
+          action: "create_correction",
+          actorId: current.actorId,
+          outcome: AuditOutcome.failure,
+          safeMetadata: jsonValue({ errorCode, state: "submitted" }),
+          targetId: metadata.responseId,
+          targetType: "response",
+        },
+      });
+    }
     if (metadata.action === "submit" && metadata.responseId) {
       await tx.response.updateMany({
         data: { status: ResponseStatus.draft, updatedAt: new Date() },
@@ -4096,6 +4311,7 @@ export async function reconcileRecoverableState(): Promise<void> {
         { expiresAt: { lte: now } },
         { holderSession: { expiresAt: { lte: now } } },
       ],
+      targetType: { not: OperationTargetType.correction },
     },
   });
   const staleOperations = await prisma.operation.findMany({
@@ -4108,9 +4324,39 @@ export async function reconcileRecoverableState(): Promise<void> {
   for (const operation of staleOperations) {
     await updateOperationFailed(operation.id, "operation_timeout", staleBefore);
   }
+  const expiredCorrectionLeases = await prisma.editorLease.findMany({
+    select: { id: true, targetId: true, workspaceObjectKey: true },
+    where: {
+      OR: [
+        { expiresAt: { lte: now } },
+        { holderSession: { expiresAt: { lte: now } } },
+      ],
+      targetType: OperationTargetType.correction,
+    },
+  });
+  for (const lease of expiredCorrectionLeases) {
+    const activeOperation = await prisma.operation.findFirst({
+      select: { id: true },
+      where: {
+        status: { in: [OperationStatus.pending, OperationStatus.processing] },
+        targetId: lease.targetId,
+        targetType: OperationTargetType.correction,
+      },
+    });
+    if (activeOperation) {
+      continue;
+    }
+    const deleted = await prisma.editorLease.deleteMany({
+      where: { id: lease.id },
+    });
+    if (deleted.count === 1 && lease.workspaceObjectKey) {
+      await deleteObjectUnlessCanonical(lease.workspaceObjectKey);
+    }
+  }
   await prisma.callbackClaim.deleteMany({
     where: { expiresAt: { lte: now } },
   });
+  await drainObjectCleanupIntents();
 }
 
 function launchForceSave(
@@ -4229,6 +4475,20 @@ async function operationDocumentKey(
   });
   if (response?.draftObjectKey) {
     return response.draftObjectKey;
+  }
+  const correctionWorkspace = await prisma.editorLease.findUnique({
+    select: { workspaceObjectKey: true },
+    where: { workspaceDocumentKey: documentKey },
+  });
+  if (correctionWorkspace?.workspaceObjectKey) {
+    return correctionWorkspace.workspaceObjectKey;
+  }
+  const correction = await prisma.correction.findUnique({
+    select: { objectKey: true },
+    where: { documentKey },
+  });
+  if (correction) {
+    return correction.objectKey;
   }
   const submission = await prisma.submission.findUnique({
     select: { objectKey: true },
@@ -4778,6 +5038,155 @@ async function completeSubmitOperation(
   );
   return { cleanupObjectKeys };
 }
+async function completeCorrectionOperation(
+  operation: Operation,
+  metadata: OperationMetadata,
+  bytes: Uint8Array
+): Promise<OperationCompletion> {
+  const { documentKey } = operation;
+  const {
+    baseDocumentKey,
+    baseRevision,
+    data,
+    nextDocumentKey,
+    reason,
+    responseId,
+    submissionId,
+  } = metadata;
+  const actorId = operation.actorId;
+  if (
+    !documentKey ||
+    !responseId ||
+    !submissionId ||
+    !data ||
+    typeof baseDocumentKey !== "string" ||
+    typeof baseRevision !== "number" ||
+    !nextDocumentKey ||
+    !reason ||
+    !actorId
+  ) {
+    fail(500, "invalid_operation", "Correction metadata is incomplete");
+  }
+  const response = await prisma.response.findUnique({
+    include: { submission: true },
+    where: { id: responseId },
+  });
+  const submission = response?.submission;
+  if (
+    !response ||
+    response.status !== ResponseStatus.submitted ||
+    !submission ||
+    submission.id !== submissionId
+  ) {
+    fail(409, "stale_operation", "The Submission is no longer correctable");
+  }
+  await validateResponseDocument(response.publishedTemplateId, bytes, true);
+  const cleanupObjectKeys = [
+    metadata.stagedObjectKey,
+    metadata.workspaceObjectKey,
+  ].filter((key): key is string => Boolean(key));
+  await prisma.$transaction(
+    async (tx) => {
+      const [lockedResponse] = await tx.$queryRaw<{ id: string }[]>(
+        Prisma.sql`
+          SELECT "id"
+          FROM "responses"
+          WHERE "id" = ${response.id}::uuid
+          FOR UPDATE
+        `
+      );
+      if (!lockedResponse) {
+        fail(409, "stale_operation", "The Submission is no longer correctable");
+      }
+      const current = await tx.response.findUnique({
+        include: {
+          corrections: {
+            orderBy: { revision: "desc" },
+            take: 1,
+          },
+          submission: true,
+        },
+        where: { id: response.id },
+      });
+      const currentSubmission = current?.submission;
+      const latest = current?.corrections[0];
+      const currentRevision = latest?.revision ?? 0;
+      const currentDocumentKey =
+        latest?.documentKey ?? currentSubmission?.documentKey;
+      if (
+        !current ||
+        current.status !== ResponseStatus.submitted ||
+        !currentSubmission ||
+        currentSubmission.id !== submissionId ||
+        currentRevision !== baseRevision ||
+        currentDocumentKey !== baseDocumentKey
+      ) {
+        fail(409, "stale_operation", "A newer Correction is already effective");
+      }
+      const previousData = jsonRecord(latest?.data ?? currentSubmission.data);
+      const correction = await tx.correction.create({
+        data: {
+          actorId,
+          changedData: jsonValue(changedResponseData(previousData, data)),
+          data: jsonValue(data),
+          documentKey: nextDocumentKey,
+          objectKey: metadata.finalObjectKey,
+          reason,
+          responseId: current.id,
+          revision: currentRevision + 1,
+          submissionId,
+        },
+      });
+      await tx.response.update({
+        data: { updatedAt: new Date() },
+        where: { id: current.id },
+      });
+      await tx.editorLease.updateMany({
+        data: {
+          workspaceBaseDocumentKey: null,
+          workspaceBaseRevision: null,
+          workspaceDocumentKey: null,
+          workspaceObjectKey: null,
+        },
+        where: {
+          targetId: current.id,
+          targetType: OperationTargetType.correction,
+          workspaceDocumentKey: metadata.workspaceDocumentKey,
+        },
+      });
+      const completedResult = {
+        correctionId: correction.id,
+        publicId: metadata.publicId,
+        responseId: current.id,
+        revision: correction.revision,
+        submissionId,
+      };
+      await markOperationCompleted(
+        tx,
+        operation.id,
+        completedResult,
+        metadata,
+        cleanupObjectKeys
+      );
+      await tx.auditEvent.create({
+        data: {
+          action: "create_correction",
+          actorId,
+          outcome: AuditOutcome.success,
+          safeMetadata: jsonValue({
+            revision: correction.revision,
+            state: "submitted",
+          }),
+          targetId: correction.id,
+          targetType: "correction",
+        },
+      });
+      return completedResult;
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+  );
+  return { cleanupObjectKeys };
+}
 
 async function finalizeCallback(
   operationId: string,
@@ -4852,6 +5261,12 @@ async function finalizeCallback(
       completion = await completePublishOperation(operation, metadata, bytes);
     } else if (metadata.action === "save-draft") {
       completion = await completeDraftOperation(operation, metadata, bytes);
+    } else if (metadata.action === "save-correction") {
+      completion = await completeCorrectionOperation(
+        operation,
+        metadata,
+        bytes
+      );
     } else {
       completion = await completeSubmitOperation(operation, metadata, bytes);
     }
@@ -5869,6 +6284,309 @@ function canReadSubmission(identity: Identity, submission: Submission): void {
   if (submission.userId !== identity.id) {
     fail(403, "forbidden", "You may only access your own submission");
   }
+}
+function lockedPrefillForSnapshot(
+  snapshot: PrefillSnapshot | null
+): { data: JsonRecord; editableFields: JsonRecord } | undefined {
+  if (!snapshot) {
+    return;
+  }
+  const values = jsonRecord(snapshot.values);
+  const lockedFields = jsonRecord(snapshot.lockedFields);
+  const data = Object.fromEntries(
+    Object.entries(values).filter(([tag]) => lockedFields[tag] === true)
+  );
+  return Object.keys(data).length > 0
+    ? { data, editableFields: editableFieldsForSnapshot(snapshot) }
+    : undefined;
+}
+
+async function correctionEditorConfig(
+  responseId: string,
+  identity: Identity
+): Promise<Record<string, unknown>> {
+  validateId(responseId, "Response");
+  const response = await prisma.response.findUnique({
+    include: {
+      corrections: {
+        orderBy: { revision: "desc" },
+        take: 1,
+      },
+      prefillSnapshot: true,
+      submission: true,
+    },
+    where: { id: responseId },
+  });
+  if (
+    !response ||
+    response.status !== ResponseStatus.submitted ||
+    !response.submission
+  ) {
+    fail(404, "not_found", "Submitted Response was not found");
+  }
+  const form = await prisma.form.findUnique({
+    include: { publishedTemplate: true, templateDraft: true },
+    where: { id: response.formId },
+  });
+  if (!form) {
+    fail(404, "not_found", "Form was not found");
+  }
+  const latest = response.corrections[0];
+  const baseRevision = latest?.revision ?? 0;
+  const baseDocumentKey =
+    latest?.documentKey ?? response.submission.documentKey;
+  const sourceObjectKey = latest?.objectKey ?? response.submission.objectKey;
+  if (!(await objectExists(sourceObjectKey))) {
+    fail(409, "document_unavailable", "Response document is unavailable");
+  }
+
+  const now = new Date();
+  const priorLease = await prisma.editorLease.findFirst({
+    select: {
+      expiresAt: true,
+      id: true,
+      workspaceBaseDocumentKey: true,
+      workspaceBaseRevision: true,
+      workspaceDocumentKey: true,
+      workspaceObjectKey: true,
+    },
+    where: {
+      holderSessionId: identity.sessionId,
+      holderUserId: identity.id,
+      targetId: response.id,
+      targetType: OperationTargetType.correction,
+    },
+  });
+  let lease: EditorLeaseGrant;
+  if (
+    priorLease &&
+    priorLease.expiresAt > now &&
+    priorLease.workspaceBaseDocumentKey === baseDocumentKey &&
+    priorLease.workspaceBaseRevision === baseRevision &&
+    priorLease.workspaceDocumentKey &&
+    priorLease.workspaceObjectKey &&
+    (await objectExists(priorLease.workspaceObjectKey))
+  ) {
+    const renewed = await renewEditorLease(identity, priorLease.id);
+    lease = {
+      ...renewed,
+      proof: editorLeaseProof(identity, "correction", response.id),
+      workspaceBaseDocumentKey: priorLease.workspaceBaseDocumentKey,
+      workspaceBaseRevision: priorLease.workspaceBaseRevision,
+      workspaceDocumentKey: priorLease.workspaceDocumentKey,
+      workspaceObjectKey: priorLease.workspaceObjectKey,
+    };
+  } else {
+    if (priorLease) {
+      await releaseEditorLease(identity, priorLease.id);
+    }
+    const workspace: CorrectionWorkspaceInput = {
+      baseDocumentKey,
+      baseRevision,
+      documentKey: `correction-workspace-${response.id}-${crypto.randomUUID()}`,
+      objectKey: objectKey(
+        "responses",
+        response.id,
+        "correction-workspaces",
+        crypto.randomUUID(),
+        "docx"
+      ),
+    };
+    const workspaceCleanupAfter = new Date(Date.now() + operationTimeoutMs);
+    await prisma.objectCleanupIntent.upsert({
+      create: {
+        cleanupAfter: workspaceCleanupAfter,
+        objectKey: workspace.objectKey,
+      },
+      update: { cleanupAfter: workspaceCleanupAfter },
+      where: { objectKey: workspace.objectKey },
+    });
+    await putObject(
+      workspace.objectKey,
+      await readObject(sourceObjectKey),
+      DOCX_CONTENT_TYPE
+    );
+    try {
+      lease = await claimEditorLease(
+        identity,
+        "correction",
+        response.id,
+        form.id,
+        workspace
+      );
+    } catch (error) {
+      if (await deleteObjectUnlessCanonical(workspace.objectKey)) {
+        await prisma.objectCleanupIntent.deleteMany({
+          where: { objectKey: workspace.objectKey },
+        });
+      }
+      throw error;
+    }
+    if (
+      lease.workspaceDocumentKey !== workspace.documentKey ||
+      lease.workspaceObjectKey !== workspace.objectKey
+    ) {
+      if (await deleteObjectUnlessCanonical(workspace.objectKey)) {
+        await prisma.objectCleanupIntent.deleteMany({
+          where: { objectKey: workspace.objectKey },
+        });
+      }
+      fail(
+        409,
+        "editor_lease_inactive",
+        "The correction workspace is unavailable"
+      );
+    }
+    await prisma.objectCleanupIntent.deleteMany({
+      where: { objectKey: workspace.objectKey },
+    });
+    if (
+      priorLease?.workspaceObjectKey &&
+      priorLease.workspaceObjectKey !== lease.workspaceObjectKey
+    ) {
+      await deleteObjectUnlessCanonical(priorLease.workspaceObjectKey);
+    }
+  }
+  const currentRevision = await prisma.response.findUnique({
+    select: {
+      corrections: {
+        orderBy: { revision: "desc" },
+        select: {
+          documentKey: true,
+          id: true,
+          objectKey: true,
+          revision: true,
+        },
+        take: 1,
+      },
+      submission: { select: { documentKey: true, objectKey: true } },
+    },
+    where: { id: response.id },
+  });
+  const currentLatest = currentRevision?.corrections[0];
+  const currentBaseRevision = currentLatest?.revision ?? 0;
+  const currentBaseDocumentKey =
+    currentLatest?.documentKey ?? currentRevision?.submission?.documentKey;
+  const currentSourceObjectKey =
+    currentLatest?.objectKey ?? currentRevision?.submission?.objectKey;
+  if (
+    currentBaseRevision !== baseRevision ||
+    currentBaseDocumentKey !== baseDocumentKey ||
+    currentSourceObjectKey !== sourceObjectKey
+  ) {
+    await releaseEditorLease(identity, lease.id);
+    fail(
+      409,
+      "stale_document",
+      "The Response changed while the correction editor was opening"
+    );
+  }
+  await createResponseAudit({
+    action: currentLatest ? "view_correction" : "view_response",
+    actorId: identity.id,
+    outcome: AuditOutcome.success,
+    safeMetadata: { revision: currentBaseRevision, state: "submitted" },
+    targetId: currentLatest?.id ?? response.id,
+    targetType: currentLatest ? "correction" : "response",
+  });
+  const capabilityScope = {
+    documentKey: lease.workspaceDocumentKey as string,
+    formId: form.id,
+    targetId: response.id,
+    targetType: "correction",
+  } as const;
+  return editorConfig(
+    {
+      action: "correction",
+      capabilities: {
+        "save-correction": actionEditorCapability(
+          identity,
+          capabilityScope,
+          "save-correction",
+          lease
+        ),
+      },
+      documentKey: capabilityScope.documentKey,
+      lease: editorLeaseBridge(lease),
+      prefill: lockedPrefillForSnapshot(response.prefillSnapshot),
+      publicId: form.publicId,
+      responseId: response.id,
+    },
+    identity
+  );
+}
+
+interface CorrectionRevisionSummary {
+  actorEmail: string | null;
+  actorName: string | null;
+  createdAt: Date;
+  data: JsonRecord;
+  documentAvailable: boolean;
+  documentKey: string;
+  id: string | null;
+  reason: string | null;
+  revision: number;
+}
+type RevisionSelector = "original" | "latest";
+
+function revisionSelector(value: unknown): RevisionSelector {
+  if (value === undefined) {
+    return "original";
+  }
+  if (value === "original" || value === "latest") {
+    return value;
+  }
+  fail(400, "invalid_request", "revision must be original or latest");
+}
+
+function selectedSubmissionRevision(
+  submission: Submission & { corrections: Correction[] },
+  selector: RevisionSelector
+): {
+  correction: Correction | null;
+  data: JsonRecord;
+  documentKey: string;
+  objectKey: string;
+  revision: number;
+} {
+  const correction =
+    selector === "latest" ? (submission.corrections[0] ?? null) : null;
+  return {
+    correction,
+    data: jsonRecord(correction?.data ?? submission.data),
+    documentKey: correction?.documentKey ?? submission.documentKey,
+    objectKey: correction?.objectKey ?? submission.objectKey,
+    revision: correction?.revision ?? 0,
+  };
+}
+
+function correctionRevisionSummary(
+  correction: Correction,
+  actor: Pick<Actor, "email" | "name"> | undefined,
+  documentAvailable: boolean
+): CorrectionRevisionSummary {
+  return {
+    actorEmail: actor?.email ?? null,
+    actorName: actor?.name ?? null,
+    createdAt: correction.createdAt,
+    data: jsonRecord(correction.data),
+    documentAvailable,
+    documentKey: correction.documentKey,
+    id: correction.id,
+    reason: correction.reason,
+    revision: correction.revision,
+  };
+}
+
+function findSubmissionWithRevisions(id: string) {
+  return prisma.submission.findUnique({
+    include: {
+      corrections: { orderBy: { revision: "desc" } },
+      form: true,
+      owner: true,
+    },
+    where: { id },
+  });
 }
 
 async function userEditorConfig(
@@ -7782,7 +8500,15 @@ export function createApp(options: AppOptions = {}) {
         include: {
           corrections: {
             orderBy: { revision: "desc" },
-            select: { revision: true },
+            select: {
+              createdAt: true,
+              data: true,
+              documentKey: true,
+              id: true,
+              objectKey: true,
+              reason: true,
+              revision: true,
+            },
             take: 1,
           },
           form: { select: { publicId: true, title: true } },
@@ -7803,33 +8529,65 @@ export function createApp(options: AppOptions = {}) {
         fail(404, "not_found", "Response was not found");
       }
       const submitted = response.status === ResponseStatus.submitted;
+      const latestCorrection = submitted ? response.corrections[0] : undefined;
       await createResponseAudit({
         action: "view_response",
         actorId: identity.id,
         outcome: AuditOutcome.success,
-        safeMetadata: { state: submitted ? "submitted" : "draft" },
+        safeMetadata: {
+          revision: latestCorrection?.revision ?? 0,
+          state: submitted ? "submitted" : "draft",
+        },
         targetId: response.id,
         targetType: "response",
       });
+      if (latestCorrection) {
+        await createResponseAudit({
+          action: "view_correction",
+          actorId: identity.id,
+          outcome: AuditOutcome.success,
+          safeMetadata: {
+            revision: latestCorrection.revision,
+            state: "submitted",
+          },
+          targetId: latestCorrection.id,
+          targetType: "correction",
+        });
+      }
+      const documentObjectKey = submitted
+        ? (latestCorrection?.objectKey ?? response.submission?.objectKey)
+        : response.draftObjectKey;
       const documentAvailable = submitted
-        ? Boolean(
-            response.submission?.documentKey && response.submission.objectKey
-          )
+        ? Boolean(documentObjectKey && (await objectExists(documentObjectKey)))
         : Boolean(response.draftDocumentKey && response.draftObjectKey);
       return {
         result: {
+          correction: latestCorrection
+            ? {
+                createdAt: latestCorrection.createdAt,
+                reason: latestCorrection.reason,
+                revision: latestCorrection.revision,
+              }
+            : null,
           createdAt: response.createdAt,
           data: submitted
-            ? jsonRecord(response.submission?.data ?? {})
+            ? jsonRecord(
+                latestCorrection?.data ?? response.submission?.data ?? {}
+              )
             : jsonRecord(response.draftData ?? {}),
           document: {
             available: documentAvailable,
-            state: submitted ? "submission" : "draft",
+            state: latestCorrection
+              ? "correction"
+              : submitted
+                ? "submission"
+                : "draft",
           },
           formPublicId: response.form.publicId,
           formTitle: response.form.title,
           id: response.id,
-          latestCorrectionNumber: response.corrections[0]?.revision ?? null,
+          latestCorrectionNumber: latestCorrection?.revision ?? null,
+          revision: submitted ? (latestCorrection?.revision ?? 0) : null,
           state: submitted ? "submitted" : "draft",
           submissionId: response.submission?.id ?? null,
           submittedAt: response.submission?.createdAt ?? null,
@@ -7838,6 +8596,164 @@ export function createApp(options: AppOptions = {}) {
         },
       };
     })
+    .get(
+      "/api/admin/results/:id/correction/editor-config",
+      async ({ request, params }) => {
+        const identity = await requireIdentity(request);
+        requireAdmin(identity);
+        return correctionEditorConfig(params.id, identity);
+      }
+    )
+    .post(
+      "/api/admin/results/:id/correction",
+      async ({ request, params, body, set }) => {
+        const authorization = await requireActionEditorAuthorization(request);
+        const { actor: identity } = authorization;
+        requireAdmin(identity);
+        validateId(params.id, "Response");
+        const input = correctionInput(body);
+        const response = await prisma.response.findUnique({
+          include: {
+            corrections: {
+              orderBy: { revision: "desc" },
+              take: 1,
+            },
+            prefillSnapshot: true,
+            submission: true,
+          },
+          where: { id: params.id },
+        });
+        if (
+          !response ||
+          response.status !== ResponseStatus.submitted ||
+          !response.submission
+        ) {
+          fail(404, "not_found", "Submitted Response was not found");
+        }
+        const form = await prisma.form.findUnique({
+          include: { publishedTemplate: true, templateDraft: true },
+          where: { id: response.formId },
+        });
+        if (!form) {
+          fail(404, "not_found", "Form was not found");
+        }
+        const latest = response.corrections[0];
+        const currentRevision = latest?.revision ?? 0;
+        const currentDocumentKey =
+          latest?.documentKey ?? response.submission.documentKey;
+        const capabilityScope = {
+          documentKey: input.documentKey,
+          formId: form.id,
+          targetId: response.id,
+          targetType: "correction",
+        } as const;
+        requireEditorScope(authorization, {
+          ...capabilityScope,
+          action: "save-correction",
+        });
+        await requireActiveEditorLease(authorization, capabilityScope);
+        const workspaceLease = await prisma.editorLease.findFirst({
+          select: {
+            workspaceBaseDocumentKey: true,
+            workspaceBaseRevision: true,
+            workspaceDocumentKey: true,
+            workspaceObjectKey: true,
+          },
+          where: {
+            id: authorization.capability.leaseId,
+            targetId: response.id,
+            targetType: OperationTargetType.correction,
+            workspaceDocumentKey: input.documentKey,
+          },
+        });
+        if (
+          !workspaceLease?.workspaceBaseDocumentKey ||
+          workspaceLease.workspaceBaseRevision === null ||
+          workspaceLease.workspaceDocumentKey !== input.documentKey ||
+          !workspaceLease.workspaceObjectKey ||
+          workspaceLease.workspaceBaseRevision !== currentRevision ||
+          workspaceLease.workspaceBaseDocumentKey !== currentDocumentKey
+        ) {
+          fail(409, "stale_document", "The response document is stale");
+        }
+        const baseRevision = workspaceLease.workspaceBaseRevision;
+        const baseDocumentKey = workspaceLease.workspaceBaseDocumentKey;
+        const previousData = jsonRecord(
+          latest?.data ?? response.submission.data
+        );
+        const data = await normalizeResponseData(
+          form,
+          response,
+          { ...previousData, ...input.data },
+          true
+        );
+        if (await activeOperationForResponse(response.id)) {
+          fail(
+            409,
+            "operation_in_progress",
+            "Another response operation is already in progress"
+          );
+        }
+        const operationId = crypto.randomUUID();
+        const stagedObjectKey = objectKey(
+          "operations",
+          operationId,
+          "correction",
+          crypto.randomUUID(),
+          "docx"
+        );
+        const metadata: OperationMetadata = {
+          action: "save-correction",
+          baseDocumentKey,
+          baseRevision,
+          data,
+          finalObjectKey: objectKey(
+            "responses",
+            response.id,
+            "corrections",
+            crypto.randomUUID(),
+            "docx"
+          ),
+          formId: form.id,
+          nextDocumentKey: `correction-${response.id}-${crypto.randomUUID()}`,
+          publicId: form.publicId,
+          reason: input.reason,
+          responseId: response.id,
+          stagedObjectKey,
+          submissionId: response.submission.id,
+          workspaceDocumentKey: workspaceLease.workspaceDocumentKey,
+          workspaceObjectKey: workspaceLease.workspaceObjectKey,
+        };
+        const operation = await createOperation({
+          actorId: identity.id,
+          authorization,
+          capabilityScope,
+          documentKey: input.documentKey,
+          formId: form.id,
+          metadata,
+          ownerUserId: identity.id,
+          responseId: response.id,
+          stagingObjectKey: stagedObjectKey,
+          submissionId: response.submission.id,
+          targetId: response.id,
+          targetType: OperationTargetType.correction,
+          type: operationTypeForAction["save-correction"],
+        });
+        set.status = 202;
+        launchForceSave(operation, onlyOffice, allowedCallbackOrigins);
+        return {
+          correction: { baseRevision, status: operation.status },
+          operationCapability: operationEditorCapability(
+            identity,
+            capabilityScope,
+            operation.id
+          ),
+          operationId: operation.id,
+          responseId: response.id,
+          status: operation.status,
+        };
+      }
+    )
     .get("/api/forms/:publicId", async ({ params, request }) => {
       const identity = await requireIdentity(request);
       const form = await findFormByPublicId(params.publicId);
@@ -8177,7 +9093,15 @@ export function createApp(options: AppOptions = {}) {
     .get("/api/responses/me", async ({ request }) => {
       const identity = await requireIdentity(request);
       const responses = await prisma.response.findMany({
-        include: { form: true, submission: true },
+        include: {
+          corrections: {
+            orderBy: { revision: "desc" },
+            select: { revision: true },
+            take: 1,
+          },
+          form: true,
+          submission: true,
+        },
         orderBy: { updatedAt: "desc" },
         where: { userId: identity.id },
       });
@@ -8186,10 +9110,108 @@ export function createApp(options: AppOptions = {}) {
           responseSummary(response, {
             formPublicId: response.form.publicId,
             formTitle: response.form.title,
+            latestCorrectionNumber: response.corrections[0]?.revision ?? null,
             submissionId: response.submission?.id,
             submittedAt: response.submission?.createdAt,
           })
         ),
+      };
+    })
+    .get("/api/responses/:id/corrections", async ({ request, params }) => {
+      const identity = await requireIdentity(request);
+      validateId(params.id, "Response");
+      const response = await prisma.response.findUnique({
+        include: {
+          corrections: { orderBy: { revision: "desc" } },
+          submission: true,
+        },
+        where: { id: params.id },
+      });
+      if (
+        !response ||
+        response.status !== ResponseStatus.submitted ||
+        !response.submission
+      ) {
+        fail(404, "not_found", "Submitted Response was not found");
+      }
+      if (identity.role !== "admin" && response.userId !== identity.id) {
+        fail(403, "forbidden", "You may only access your own Response");
+      }
+      const actorIds = response.corrections.map(
+        (correction) => correction.actorId
+      );
+      const actors = await prisma.user.findMany({
+        select: { email: true, id: true, name: true },
+        where: { id: { in: [...new Set(actorIds)] } },
+      });
+      const actorById = new Map(
+        actors.map((actor) => [actor.id, actor] as const)
+      );
+      const originalAvailable = await objectExists(
+        response.submission.objectKey
+      );
+      const correctionSummaries = await Promise.all(
+        response.corrections
+          .toReversed()
+          .map(async (correction) =>
+            correctionRevisionSummary(
+              correction,
+              actorById.get(correction.actorId),
+              await objectExists(correction.objectKey)
+            )
+          )
+      );
+      await createResponseAudit({
+        action: "view_response",
+        actorId: identity.id,
+        outcome: AuditOutcome.success,
+        safeMetadata: { revision: 0, state: "submitted" },
+        targetId: response.submission.id,
+        targetType: "submission",
+      });
+      for (const correction of response.corrections) {
+        await createResponseAudit({
+          action: "view_correction",
+          actorId: identity.id,
+          outcome: AuditOutcome.success,
+          safeMetadata: {
+            revision: correction.revision,
+            state: "submitted",
+          },
+          targetId: correction.id,
+          targetType: "correction",
+        });
+      }
+      return {
+        latestRevision: response.corrections[0]?.revision ?? 0,
+        revisions: [
+          {
+            actorEmail: null,
+            actorName: null,
+            createdAt: response.submission.createdAt,
+            data: jsonRecord(response.submission.data),
+            document: {
+              available: originalAvailable,
+              state: "submission",
+            },
+            id: null,
+            reason: null,
+            revision: 0,
+          },
+          ...correctionSummaries.map((correction) => ({
+            actorEmail: correction.actorEmail,
+            actorName: correction.actorName,
+            createdAt: correction.createdAt,
+            data: correction.data,
+            document: {
+              available: correction.documentAvailable,
+              state: "correction",
+            },
+            id: correction.id,
+            reason: correction.reason,
+            revision: correction.revision,
+          })),
+        ],
       };
     })
     .get(
@@ -8629,7 +9651,9 @@ export function createApp(options: AppOptions = {}) {
             ? "template-draft"
             : operation.targetType === OperationTargetType.response
               ? "response"
-              : null;
+              : operation.targetType === OperationTargetType.correction
+                ? "correction"
+                : null;
         if (
           !targetType ||
           !operation.documentKey ||
@@ -8680,30 +9704,40 @@ export function createApp(options: AppOptions = {}) {
         },
       };
     })
-    .get("/api/submissions/:id/data", async ({ request, params }) => {
+    .get("/api/submissions/:id/data", async ({ request, params, query }) => {
       const identity = await requireIdentity(request);
       validateId(params.id, "Submission");
-      const submission = await prisma.submission.findUnique({
-        include: { form: true, owner: true },
-        where: { id: params.id },
-      });
+      const submission = await findSubmissionWithRevisions(params.id);
       if (!submission) {
         fail(404, "not_found", "Submission was not found");
       }
       canReadSubmission(identity, submission);
-      if (identity.role === "admin") {
-        await createResponseAudit({
-          action: "view_response",
-          actorId: identity.id,
-          outcome: AuditOutcome.success,
-          safeMetadata: { state: "submitted" },
-          targetId: submission.responseId,
-          targetType: "submission",
-        });
-      }
+      const selected = selectedSubmissionRevision(
+        submission,
+        revisionSelector(query.revision)
+      );
+      await createResponseAudit({
+        action: selected.correction ? "view_correction" : "view_response",
+        actorId: identity.id,
+        outcome: AuditOutcome.success,
+        safeMetadata: {
+          revision: selected.revision,
+          state: "submitted",
+        },
+        targetId: selected.correction?.id ?? submission.responseId,
+        targetType: selected.correction ? "correction" : "submission",
+      });
       return {
-        data: jsonRecord(submission.data),
+        correction: selected.correction
+          ? {
+              createdAt: selected.correction.createdAt,
+              reason: selected.correction.reason,
+              revision: selected.correction.revision,
+            }
+          : null,
+        data: selected.data,
         returnUrl: prefillReturnUrl,
+        revision: selected.revision,
         submission: submissionSummary(submission, {
           formPublicId: submission.form.publicId,
           formTitle: submission.form.title,
@@ -8712,89 +9746,130 @@ export function createApp(options: AppOptions = {}) {
         }),
       };
     })
-    .get("/api/submissions/:id/json", async ({ request, params }) => {
+    .get("/api/submissions/:id/json", async ({ request, params, query }) => {
       const identity = await requireIdentity(request);
       validateId(params.id, "Submission");
-      const submission = await prisma.submission.findUnique({
-        where: { id: params.id },
-      });
+      const submission = await findSubmissionWithRevisions(params.id);
       if (!submission) {
         fail(404, "not_found", "Submission was not found");
       }
       canReadSubmission(identity, submission);
-      if (identity.role === "admin") {
-        await createResponseAudit({
-          action: "export_response",
-          actorId: identity.id,
-          outcome: AuditOutcome.success,
-          safeMetadata: { format: "json", state: "submitted" },
-          targetId: submission.id,
-          targetType: "submission",
-        });
-      }
-      return Response.json(jsonRecord(submission.data), {
+      const selected = selectedSubmissionRevision(
+        submission,
+        revisionSelector(query.revision)
+      );
+      await createResponseAudit({
+        action: selected.correction ? "export_correction" : "export_response",
+        actorId: identity.id,
+        outcome: AuditOutcome.success,
+        safeMetadata: {
+          format: "json",
+          revision: selected.revision,
+          state: "submitted",
+        },
+        targetId: selected.correction?.id ?? submission.id,
+        targetType: selected.correction ? "correction" : "submission",
+      });
+      const suffix =
+        selected.revision === 0 ? "" : `-revision-${selected.revision}`;
+      return Response.json(selected.data, {
         headers: {
-          "Content-Disposition": `attachment; filename="submission-${submission.id}.json"`,
+          "Content-Disposition": `attachment; filename="submission-${submission.id}${suffix}.json"`,
           "Content-Type": "application/json; charset=utf-8",
         },
       });
     })
-    .get("/api/submissions/:id/docx", async ({ request, params }) => {
+    .get("/api/submissions/:id/docx", async ({ request, params, query }) => {
       const identity = await requireIdentity(request);
       validateId(params.id, "Submission");
-      const submission = await prisma.submission.findUnique({
-        where: { id: params.id },
-      });
+      const submission = await findSubmissionWithRevisions(params.id);
       if (!submission) {
         fail(404, "not_found", "Submission was not found");
       }
       canReadSubmission(identity, submission);
-      if (!(await objectExists(submission.objectKey))) {
+      const selected = selectedSubmissionRevision(
+        submission,
+        revisionSelector(query.revision)
+      );
+      if (!(await objectExists(selected.objectKey))) {
         fail(404, "not_found", "Submission document was not found");
       }
-      if (identity.role === "admin") {
-        await createResponseAudit({
-          action: "export_response",
-          actorId: identity.id,
-          outcome: AuditOutcome.success,
-          safeMetadata: { format: "docx", state: "submitted" },
-          targetId: submission.id,
-          targetType: "submission",
-        });
-      }
-      return new Response(streamObject(submission.objectKey), {
+      await createResponseAudit({
+        action: selected.correction ? "export_correction" : "export_response",
+        actorId: identity.id,
+        outcome: AuditOutcome.success,
+        safeMetadata: {
+          format: "docx",
+          revision: selected.revision,
+          state: "submitted",
+        },
+        targetId: selected.correction?.id ?? submission.id,
+        targetType: selected.correction ? "correction" : "submission",
+      });
+      const suffix =
+        selected.revision === 0 ? "" : `-revision-${selected.revision}`;
+      return new Response(streamObject(selected.objectKey), {
         headers: {
-          "Content-Disposition": `attachment; filename="submission-${submission.id}.docx"`,
+          "Content-Disposition": `attachment; filename="submission-${submission.id}${suffix}.docx"`,
           "Content-Type": DOCX_CONTENT_TYPE,
         },
       });
     })
-    .get("/api/submissions/:id/pdf", async ({ request, params, set }) => {
-      const identity = await requireIdentity(request);
-      validateId(params.id, "Submission");
-      const submission = await prisma.submission.findUnique({
-        where: { id: params.id },
-      });
-      if (!submission) {
-        fail(404, "not_found", "Submission was not found");
-      }
-      canReadSubmission(identity, submission);
-      const pdf = await onlyOffice.convertDocxToPdf(submission.documentKey);
-      if (identity.role === "admin") {
+    .get(
+      "/api/submissions/:id/pdf",
+      async ({ request, params, query, set }) => {
+        const identity = await requireIdentity(request);
+        validateId(params.id, "Submission");
+        const submission = await findSubmissionWithRevisions(params.id);
+        if (!submission) {
+          fail(404, "not_found", "Submission was not found");
+        }
+        canReadSubmission(identity, submission);
+        const selected = selectedSubmissionRevision(
+          submission,
+          revisionSelector(query.revision)
+        );
+        let pdf: Uint8Array;
+        try {
+          pdf = await onlyOffice.convertDocxToPdf(selected.documentKey);
+        } catch (error) {
+          await createResponseAudit({
+            action: selected.correction
+              ? "export_correction"
+              : "export_response",
+            actorId: identity.id,
+            outcome: AuditOutcome.failure,
+            safeMetadata: {
+              errorCode: "pdf_conversion_failed",
+              format: "pdf",
+              revision: selected.revision,
+              state: "submitted",
+            },
+            targetId: selected.correction?.id ?? submission.id,
+            targetType: selected.correction ? "correction" : "submission",
+          });
+          throw error;
+        }
         await createResponseAudit({
-          action: "export_response",
+          action: selected.correction ? "export_correction" : "export_response",
           actorId: identity.id,
           outcome: AuditOutcome.success,
-          safeMetadata: { format: "pdf", state: "submitted" },
-          targetId: submission.id,
-          targetType: "submission",
+          safeMetadata: {
+            format: "pdf",
+            revision: selected.revision,
+            state: "submitted",
+          },
+          targetId: selected.correction?.id ?? submission.id,
+          targetType: selected.correction ? "correction" : "submission",
         });
+        const suffix =
+          selected.revision === 0 ? "" : `-revision-${selected.revision}`;
+        set.headers["Content-Type"] = "application/pdf";
+        set.headers["Content-Disposition"] =
+          `attachment; filename="submission-${submission.id}${suffix}.pdf"`;
+        return pdf;
       }
-      set.headers["Content-Type"] = "application/pdf";
-      set.headers["Content-Disposition"] =
-        `attachment; filename="submission-${submission.id}.pdf"`;
-      return pdf;
-    })
+    )
     .get("/onlyoffice/document/:key", async ({ request, params, query }) => {
       const { key } = params;
       const token = typeof query.token === "string" ? query.token : "";

@@ -2663,6 +2663,60 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(await readObject(pictureSubmission.objectKey)).toEqual(
     nextPictureDocument
   );
+  const pictureCorrectionEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${pictureResponseId}/correction/editor-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(pictureCorrectionEditorResponse.status).toBe(200);
+  const pictureCorrectionEditor =
+    (await pictureCorrectionEditorResponse.json()) as EditorConfigBody;
+  const pictureCorrectionCapability =
+    pictureCorrectionEditor.bridge.capabilities["save-correction"];
+  if (!pictureCorrectionCapability) {
+    throw new Error("The picture correction capability was not returned");
+  }
+  const pictureCorrectionResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${pictureResponseId}/correction`,
+      {
+        body: JSON.stringify({
+          data: {},
+          documentKey: pictureCorrectionEditor.config.document.key,
+          reason: "ตรวจสอบรูปภาพ",
+        }),
+        headers: capabilityHeaders(pictureCorrectionCapability),
+        method: "POST",
+      }
+    )
+  );
+  expect(pictureCorrectionResponse.status).toBe(202);
+  const pictureCorrectionBody = (await pictureCorrectionResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (
+    !pictureCorrectionBody.operationCapability ||
+    !pictureCorrectionBody.operationId
+  ) {
+    throw new Error("The picture correction operation was not created");
+  }
+  const pictureCorrectionOperation = await waitForOperation(
+    pictureCorrectionBody.operationId,
+    {
+      "X-Editor-Capability": pictureCorrectionBody.operationCapability,
+    }
+  );
+  expect(pictureCorrectionOperation.status).toBe("completed");
+  const pictureCorrection = await prisma.correction.findFirstOrThrow({
+    select: { data: true, objectKey: true, revision: true },
+    where: { responseId: pictureResponseId },
+  });
+  expect(pictureCorrection).toMatchObject({ data: {}, revision: 1 });
+  expect(await readObject(pictureCorrection.objectKey)).toEqual(
+    nextPictureDocument
+  );
   const invalidFixtureCases = [
     {
       bytes: docxFixture("no-controls"),
@@ -5043,9 +5097,10 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     outcome: "success",
     safeMetadata: { state: "draft" },
   });
-  expect(JSON.stringify(draftViewAudit.safeMetadata)).toBe(
-    JSON.stringify({ state: "draft" })
-  );
+  expect(draftViewAudit.safeMetadata).toEqual({
+    revision: 0,
+    state: "draft",
+  });
   const draftResponseBeforeExport = await prisma.response.findUnique({
     select: { draftData: true, draftObjectKey: true },
     where: { id: responseId },
@@ -5576,6 +5631,345 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       submissionId: completedSubmissionId,
     },
   });
+  const originalSubmissionBeforeCorrection =
+    await prisma.submission.findUniqueOrThrow({
+      select: {
+        data: true,
+        documentKey: true,
+        objectKey: true,
+      },
+      where: { id: completedSubmissionId },
+    });
+  const correctionEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/correction/editor-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(correctionEditorResponse.status).toBe(200);
+  const correctionEditorConfig =
+    (await correctionEditorResponse.json()) as EditorConfigBody;
+  const correctionDocumentKey = correctionEditorConfig.config.document.key;
+  const correctionCapability =
+    correctionEditorConfig.bridge.capabilities["save-correction"];
+  if (!correctionCapability || !correctionDocumentKey) {
+    throw new Error("The correction editor capabilities were not returned");
+  }
+  expect(correctionDocumentKey).not.toBe(responseDocumentKey);
+  expect(
+    correctionEditorConfig.config.editorConfig.plugins.options[pluginGuid]
+  ).toMatchObject({
+    bridgeId: correctionEditorConfig.bridge.id,
+    publicId: formRecord.publicId,
+  });
+  const correctionClaims = verifyEditorCapability(correctionCapability);
+  expect(correctionClaims).toMatchObject({
+    action: "save-correction",
+    actorId: adminId,
+    documentKey: correctionDocumentKey,
+    formId,
+    leaseId: correctionEditorConfig.bridge.lease.id,
+    role: "admin",
+    targetId: responseId,
+    targetType: "correction",
+  });
+  const competingCorrectionEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/correction/editor-config`,
+      { headers: { Authorization: `Bearer ${competingAdminBearer}` } }
+    )
+  );
+  expect(competingCorrectionEditorResponse.status).toBe(409);
+  expect(await competingCorrectionEditorResponse.json()).toMatchObject({
+    error: "editor_in_use",
+  });
+  const correctionData = {
+    ...savedDraftData,
+    description_1: "แก้ไขข้อมูลโดยผู้ดูแล",
+  };
+  const correctionSaveResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/correction`,
+      {
+        body: JSON.stringify({
+          data: correctionData,
+          documentKey: correctionDocumentKey,
+          reason: "แก้ไขตามเอกสารต้นฉบับ",
+        }),
+        headers: capabilityHeaders(correctionCapability),
+        method: "POST",
+      }
+    )
+  );
+  expect(correctionSaveResponse.status).toBe(202);
+  const correctionSaveBody = (await correctionSaveResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (
+    !correctionSaveBody.operationCapability ||
+    !correctionSaveBody.operationId
+  ) {
+    throw new Error("The correction operation was not created");
+  }
+  const correctionOperation = await waitForOperation(
+    correctionSaveBody.operationId,
+    { "X-Editor-Capability": correctionSaveBody.operationCapability }
+  );
+  const correctionOperationRecord = await prisma.operation.findUniqueOrThrow({
+    select: { result: true },
+    where: { id: correctionSaveBody.operationId },
+  });
+  const correctionResult = correctionOperationRecord.result as
+    | { correctionId?: string; revision?: number }
+    | undefined;
+  expect(correctionOperation).toMatchObject({
+    result: { correctionId: expect.any(String), revision: 1 },
+    status: "completed",
+  });
+  if (!correctionResult?.correctionId) {
+    throw new Error("The correction result was not returned");
+  }
+  expect(correctionResult.revision).toBe(1);
+  const correctedSubmission = await prisma.submission.findUniqueOrThrow({
+    select: { data: true, documentKey: true, objectKey: true },
+    where: { id: completedSubmissionId },
+  });
+  expect(correctedSubmission).toEqual(originalSubmissionBeforeCorrection);
+  const correction = await prisma.correction.findFirstOrThrow({
+    where: { responseId, revision: 1 },
+  });
+  expect(String(correctionResult.correctionId)).toBe(correction.id);
+  expect(correction).toMatchObject({
+    actorId: adminId,
+    data: correctionData,
+    reason: "แก้ไขตามเอกสารต้นฉบับ",
+    responseId,
+    revision: 1,
+    submissionId: completedSubmissionId,
+  });
+  expect(await objectExists(correction.objectKey)).toBe(true);
+  const correctionReplayClaim = await prisma.callbackClaim.findUnique({
+    where: { operationId: correctionSaveBody.operationId },
+  });
+  if (!correctionReplayClaim) {
+    throw new Error("The correction callback claim was not persisted");
+  }
+  const correctionReplayUserdata = createCallbackUserdata({
+    documentKey: correctionDocumentKey,
+    expiresAt: Math.floor(correctionReplayClaim.expiresAt.getTime() / 1000),
+    operationId: correctionSaveBody.operationId,
+    operationType: "save_correction",
+  });
+  expect(
+    createHash("sha256").update(correctionReplayUserdata).digest("hex")
+  ).toBe(correctionReplayClaim.tokenDigest);
+  const correctionReplayPayload = {
+    key: correctionDocumentKey,
+    status: 6,
+    userdata: correctionReplayUserdata,
+  };
+  const correctionReplayResponse = await app.handle(
+    new Request("http://test.local/onlyoffice/callback", {
+      body: JSON.stringify({
+        ...correctionReplayPayload,
+        token: createOnlyOfficeBodyToken(correctionReplayPayload),
+      }),
+      headers: {
+        Authorization: createOnlyOfficeAuthorization(correctionReplayPayload),
+        ...jsonHeaders,
+      },
+      method: "POST",
+    })
+  );
+  expect(correctionReplayResponse.status).toBe(200);
+  expect(await correctionReplayResponse.json()).toEqual({ error: 0 });
+  expect(await prisma.correction.count({ where: { responseId } })).toBe(1);
+  const correctionHistoryResponse = await app.handle(
+    new Request(`http://test.local/api/responses/${responseId}/corrections`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+    })
+  );
+  expect(correctionHistoryResponse.status).toBe(200);
+  expect(await correctionHistoryResponse.json()).toMatchObject({
+    latestRevision: 1,
+    revisions: [
+      {
+        data: savedDraftData,
+        reason: null,
+        revision: 0,
+      },
+      {
+        data: correctionData,
+        reason: "แก้ไขตามเอกสารต้นฉบับ",
+        revision: 1,
+      },
+    ],
+  });
+  const latestDataResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/data?revision=latest`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(latestDataResponse.status).toBe(200);
+  expect(await latestDataResponse.json()).toMatchObject({
+    correction: { reason: "แก้ไขตามเอกสารต้นฉบับ", revision: 1 },
+    data: correctionData,
+    revision: 1,
+  });
+  const latestJsonResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/json?revision=latest`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(latestJsonResponse.headers.get("content-disposition")).toBe(
+    `attachment; filename="submission-${completedSubmissionId}-revision-1.json"`
+  );
+  expect(JSON.parse(await latestJsonResponse.text())).toEqual(correctionData);
+  const originalJsonAfterCorrection = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/json?revision=original`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(JSON.parse(await originalJsonAfterCorrection.text())).toEqual(
+    savedDraftData
+  );
+  const latestDocxResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/docx?revision=latest`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(latestDocxResponse.status).toBe(200);
+  expect(latestDocxResponse.headers.get("content-disposition")).toBe(
+    `attachment; filename="submission-${completedSubmissionId}-revision-1.docx"`
+  );
+  const latestPdfResponse = await app.handle(
+    new Request(
+      `http://test.local/api/submissions/${completedSubmissionId}/pdf?revision=latest`,
+      { headers: { Authorization: `Bearer ${userBearer}` } }
+    )
+  );
+  expect(latestPdfResponse.status).toBe(200);
+  expect(latestPdfResponse.headers.get("content-disposition")).toBe(
+    `attachment; filename="submission-${completedSubmissionId}-revision-1.pdf"`
+  );
+  expect(await latestPdfResponse.text()).toBe("%PDF-test");
+  const correctedResultsResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}?revision=latest`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(correctedResultsResponse.status).toBe(200);
+  expect(await correctedResultsResponse.json()).toMatchObject({
+    result: {
+      correction: { reason: "แก้ไขตามเอกสารต้นฉบับ", revision: 1 },
+      data: correctionData,
+      document: { available: true, state: "correction" },
+      latestCorrectionNumber: 1,
+      revision: 1,
+    },
+  });
+  const correctionAudits = await prisma.auditEvent.findMany({
+    orderBy: { createdAt: "asc" },
+    where: {
+      actorId: adminId,
+      targetId: { in: [responseId, correction.id, completedSubmissionId] },
+    },
+  });
+  for (const audit of correctionAudits) {
+    expect(JSON.stringify(audit.safeMetadata)).not.toContain(
+      "แก้ไขตามเอกสารต้นฉบับ"
+    );
+    expect(JSON.stringify(audit.safeMetadata)).not.toContain(
+      correction.objectKey
+    );
+  }
+  const externalStatusAfterCorrection = await fetch(`${mock.url}/status`, {
+    body: JSON.stringify({ externalReference: postSubmitExternalReference }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(await externalStatusAfterCorrection.json()).toMatchObject({
+    latestCorrectionNumber: 1,
+    status: "submitted",
+  });
+  const failedCorrectionEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/correction/editor-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(failedCorrectionEditorResponse.status).toBe(200);
+  const failedCorrectionEditorConfig =
+    (await failedCorrectionEditorResponse.json()) as EditorConfigBody;
+  const failedCorrectionCapability =
+    failedCorrectionEditorConfig.bridge.capabilities["save-correction"];
+  if (!failedCorrectionCapability) {
+    throw new Error("The failed correction capability was not returned");
+  }
+  const correctionFailureApp = createApp({
+    onlyOffice: {
+      convertDocxToPdf: () =>
+        Promise.resolve(new TextEncoder().encode("%PDF-test")),
+      forceSave: () =>
+        Promise.reject(
+          new Error("deterministic correction force-save failure")
+        ),
+    },
+  });
+  const failedCorrectionSaveResponse = await correctionFailureApp.handle(
+    new Request(
+      `http://test.local/api/admin/results/${responseId}/correction`,
+      {
+        body: JSON.stringify({
+          data: { description_1: "ควรไม่ถูกบันทึก" },
+          documentKey: failedCorrectionEditorConfig.config.document.key,
+          reason: "การแก้ไขที่ล้มเหลว",
+        }),
+        headers: capabilityHeaders(failedCorrectionCapability),
+        method: "POST",
+      }
+    )
+  );
+  expect(failedCorrectionSaveResponse.status).toBe(202);
+  const failedCorrectionSaveBody =
+    (await failedCorrectionSaveResponse.json()) as {
+      operationCapability?: string;
+      operationId?: string;
+    };
+  if (
+    !failedCorrectionSaveBody.operationCapability ||
+    !failedCorrectionSaveBody.operationId
+  ) {
+    throw new Error("The failed correction operation was not created");
+  }
+  const failedCorrectionOperation = await waitForOperation(
+    failedCorrectionSaveBody.operationId,
+    { "X-Editor-Capability": failedCorrectionSaveBody.operationCapability }
+  );
+  expect(failedCorrectionOperation).toMatchObject({
+    error: "force_save_failed",
+    status: "failed",
+  });
+  expect(await prisma.correction.count({ where: { responseId } })).toBe(1);
+  expect(
+    await prisma.correction.findFirstOrThrow({
+      orderBy: { revision: "desc" },
+      where: { responseId },
+    })
+  ).toMatchObject({ data: correctionData, revision: 1 });
+  const failedCorrectionReleaseResponse = await app.handle(
+    new Request(
+      `http://test.local/api/editor-leases/${failedCorrectionEditorConfig.bridge.lease.id}`,
+      { headers: { Authorization: `Bearer ${adminBearer}` }, method: "DELETE" }
+    )
+  );
+  expect(failedCorrectionReleaseResponse.status).toBe(200);
   const exportAudits = await prisma.auditEvent.findMany({
     orderBy: { createdAt: "asc" },
     where: {
@@ -5586,9 +5980,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     },
   });
   expect(exportAudits.map((audit) => audit.safeMetadata)).toEqual([
-    { format: "json", state: "submitted" },
-    { format: "docx", state: "submitted" },
-    { format: "pdf", state: "submitted" },
+    { format: "json", revision: 0, state: "submitted" },
+    { format: "docx", revision: 0, state: "submitted" },
+    { format: "pdf", revision: 0, state: "submitted" },
   ]);
   const stableSubmissionBeforeConversion = await prisma.submission.findUnique({
     select: {
@@ -5614,6 +6008,22 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     )
   );
   expect(conversionFailureResponse.status).toBe(500);
+  const failedPdfAudit = await prisma.auditEvent.findFirstOrThrow({
+    orderBy: { createdAt: "desc" },
+    where: {
+      action: "export_response",
+      actorId: userId,
+      outcome: "failure",
+      targetId: completedSubmissionId,
+      targetType: "submission",
+    },
+  });
+  expect(failedPdfAudit.safeMetadata).toEqual({
+    errorCode: "pdf_conversion_failed",
+    format: "pdf",
+    revision: 0,
+    state: "submitted",
+  });
   expect(
     await prisma.submission.findUnique({
       select: {

@@ -473,15 +473,19 @@ model CallbackClaim {
 }
 
 model EditorLease {
-  id               String              @id @default(uuid()) @db.Uuid
-  targetType       OperationTargetType @map("target_type")
-  targetId         String              @map("target_id") @db.Uuid
-  holderSessionId  String              @map("holder_session_id")
-  holderUserId     String              @map("holder_user_id")
-  capabilityDigest String              @map("capability_digest")
-  expiresAt        DateTime            @map("expires_at") @db.Timestamptz(3)
-  createdAt        DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
-  renewedAt        DateTime            @default(now()) @map("renewed_at") @db.Timestamptz(3)
+  id                   String              @id @default(uuid()) @db.Uuid
+  targetType           OperationTargetType @map("target_type")
+  targetId             String              @map("target_id") @db.Uuid
+  holderSessionId      String              @map("holder_session_id")
+  holderUserId         String              @map("holder_user_id")
+  capabilityDigest     String              @map("capability_digest")
+  expiresAt            DateTime            @map("expires_at") @db.Timestamptz(3)
+  workspaceBaseDocumentKey String?         @map("workspace_base_document_key")
+  workspaceBaseRevision    Int?            @map("workspace_base_revision")
+  workspaceDocumentKey     String?         @unique @map("workspace_document_key")
+  workspaceObjectKey       String?         @map("workspace_object_key")
+  createdAt            DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  renewedAt            DateTime            @default(now()) @map("renewed_at") @db.Timestamptz(3)
 
   holderSession Session @relation(fields: [holderSessionId], references: [id], onDelete: Cascade)
   holder        User    @relation("LeaseHolder", fields: [holderUserId], references: [id], onDelete: Cascade)

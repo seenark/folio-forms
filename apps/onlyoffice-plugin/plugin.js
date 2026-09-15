@@ -1,9 +1,11 @@
-// oxlint-disable func-style sort-keys no-implicit-globals no-unused-vars consistent-function-scoping complexity prefer-named-capture-group require-unicode-regexp avoid-new prefer-await-to-callbacks no-empty-function no-useless-return logical-assignment-operators no-useless-spread no-await-in-loop prefer-await-to-then prefer-dom-node-remove no-plusplus prefer-spread -- Plugin runs inside the constrained ONLYOFFICE host runtime.
+// oxlint-disable func-style sort-keys no-implicit-globals no-unused-vars consistent-function-scoping complexity prefer-named-capture-group require-unicode-regexp avoid-new prefer-await-to-callbacks no-empty-function no-useless-return logical-assignment-operators no-useless-spread no-await-in-loop prefer-await-to-then prefer-dom-node-remove prefer-dom-node-append no-plusplus prefer-spread -- Plugin runs inside the constrained ONLYOFFICE host runtime.
 const ACTIONS = Object.freeze({
   CONFIGURE_FIELDS: "configure-fields",
+  CORRECTION: "correction",
   DRAFT: "draft",
   FILL: "fill",
   PUBLISH: "publish",
+  SAVE_CORRECTION: "save-correction",
   SAVE_DRAFT: "save-draft",
   SAVE_TEMPLATE: "save-template",
   SUBMIT: "submit",
@@ -18,6 +20,7 @@ const BUTTON_IDS = Object.freeze({
 
 const API_ROUTES = Object.freeze({
   ADMIN_FORMS: "/api/admin/forms",
+  ADMIN_RESULTS: "/api/admin/results",
   FORMS: "/api/forms",
   OPERATIONS: "/api/operations",
 });
@@ -26,6 +29,7 @@ const CAPABILITY_ACTIONS = Object.freeze([
   ACTIONS.SAVE_TEMPLATE,
   ACTIONS.PUBLISH,
   ACTIONS.SAVE_DRAFT,
+  ACTIONS.SAVE_CORRECTION,
   ACTIONS.SUBMIT,
   ACTIONS.CONFIGURE_FIELDS,
 ]);
@@ -941,13 +945,16 @@ function hasPrefillValues(prefill) {
 }
 
 function applyPrefill(prefill) {
+  const normalizedPrefill = normalizePrefill({
+    prefill: isRecord(prefill) ? prefill : {},
+  });
   const scope = window.Asc.scope || (window.Asc.scope = {});
-  scope.formBridgePrefill = prefill;
+  scope.formBridgePrefill = normalizedPrefill;
 
   return callCommandResult(applyPrefillCommand)
     .then((result) => parseCommandResult(result))
     .finally(() => {
-      if (scope.formBridgePrefill === prefill) {
+      if (scope.formBridgePrefill === normalizedPrefill) {
         delete scope.formBridgePrefill;
       }
     });
@@ -1040,7 +1047,7 @@ function appendPanelChild(parent, child) {
   if (typeof parent.append === "function") {
     parent.append(child);
   } else if (typeof parent.appendChild === "function") {
-    parent.append(child);
+    parent.appendChild(child);
   }
 }
 
@@ -2377,11 +2384,17 @@ function handleParentMessage(event) {
   }
 
   if (message.type === RUN_ACTION_TYPE) {
-    if (message.action !== ACTIONS.SAVE_DRAFT) {
+    if (
+      message.action !== ACTIONS.SAVE_DRAFT &&
+      message.action !== ACTIONS.SAVE_CORRECTION
+    ) {
       return;
     }
 
-    void runAction(ACTIONS.SAVE_DRAFT);
+    void runAction(
+      message.action,
+      typeof message.reason === "string" ? message.reason : ""
+    );
     return;
   }
 
@@ -2528,6 +2541,9 @@ function actionLabel(action) {
     case ACTIONS.SAVE_DRAFT: {
       return "บันทึกฉบับร่าง";
     }
+    case ACTIONS.SAVE_CORRECTION: {
+      return "บันทึก Correction";
+    }
     case ACTIONS.SUBMIT: {
       return "ส่งคำตอบ";
     }
@@ -2545,6 +2561,9 @@ function toolbarActionsForMode(mode) {
     case ACTIONS.FILL:
     case ACTIONS.DRAFT: {
       return [ACTIONS.SAVE_DRAFT, ACTIONS.SUBMIT];
+    }
+    case ACTIONS.CORRECTION: {
+      return [];
     }
     case ACTIONS.SUBMIT: {
       return [ACTIONS.SUBMIT];
@@ -2637,7 +2656,7 @@ function requireOption(value, name) {
   return value;
 }
 
-function actionRequest(action, data) {
+function actionRequest(action, data, reason) {
   const documentKey = requireOption(runtimeOptions.documentKey, "documentKey");
 
   if (action === ACTIONS.SAVE_TEMPLATE || action === ACTIONS.PUBLISH) {
@@ -2673,6 +2692,20 @@ function actionRequest(action, data) {
       path: `${API_ROUTES.FORMS}/${publicId}/${
         action === ACTIONS.SAVE_DRAFT ? "draft" : "submit"
       }`,
+    };
+  }
+
+  if (action === ACTIONS.SAVE_CORRECTION) {
+    const responseId = encodeURIComponent(
+      requireOption(runtimeOptions.responseId, "responseId")
+    );
+    return {
+      body: {
+        data,
+        documentKey,
+        reason: requireOption(reason, "correction reason"),
+      },
+      path: `${API_ROUTES.ADMIN_RESULTS}/${responseId}/correction`,
     };
   }
 
@@ -2732,8 +2765,8 @@ function requestActionCapability(action) {
   });
 }
 
-async function postAction(action, data, capability) {
-  const request = actionRequest(action, data);
+async function postAction(action, data, reason, capability) {
+  const request = actionRequest(action, data, reason);
   const result = await requestJson(
     request.path,
     {
@@ -2787,7 +2820,7 @@ function operationFailureMessage(payload, operationId) {
   const operation = isRecord(payload?.operation) ? payload.operation : {};
   const detail = payload?.error ?? payload?.message ?? operation.error;
 
-  return detail ? String(detail) : `Operation ${operationId} failed`;
+  return detail ? String(detail) : `การดำเนินการ ${operationId} ไม่สำเร็จ`;
 }
 
 function wait(milliseconds) {
@@ -2811,7 +2844,7 @@ async function pollOperation(operationId, label, operationCapability) {
     const status = operationStatus(payload);
 
     if (!status) {
-      throw new Error(`Operation ${id} returned no status`);
+      throw new Error(`การดำเนินการ ${id} ไม่มีสถานะ`);
     }
 
     if (
@@ -2819,7 +2852,7 @@ async function pollOperation(operationId, label, operationCapability) {
       (status === "pending" || status === "queued" || status === "processing")
     ) {
       previousStatus = status;
-      setStatus(`${operationLabel} is processing…`, "pending");
+      setStatus(`${operationLabel} กำลังประมวลผล…`, "pending");
     }
 
     if (
@@ -2847,12 +2880,12 @@ async function pollOperation(operationId, label, operationCapability) {
     }
   }
 
-  throw new Error(`Operation ${id} did not finish in time`);
+  throw new Error(`การดำเนินการ ${id} ใช้เวลานานเกินไป`);
 }
 
-async function runAction(action) {
+async function runAction(action, reason = "") {
   if (actionInFlight || initializationPending) {
-    setStatus("A form action is already in progress", "pending");
+    setStatus("มีการดำเนินการของฟอร์มกำลังทำงานอยู่", "pending");
     return { ignored: true, ok: false };
   }
 
@@ -2860,30 +2893,42 @@ async function runAction(action) {
   let operationId;
   let completedPayload;
   let editorFrozen = false;
+  const correctionReason = typeof reason === "string" ? reason.trim() : "";
 
   try {
     const needsData =
-      action === ACTIONS.SAVE_DRAFT || action === ACTIONS.SUBMIT;
+      action === ACTIONS.SAVE_DRAFT ||
+      action === ACTIONS.SAVE_CORRECTION ||
+      action === ACTIONS.SUBMIT;
     let data;
 
     if (needsData) {
       if (
-        runtimeOptions.action === ACTIONS.FILL &&
+        (runtimeOptions.action === ACTIONS.FILL ||
+          runtimeOptions.action === ACTIONS.CORRECTION) &&
         hasPrefillValues(runtimeOptions.prefill)
       ) {
         await ensurePrefill();
-      } else if (runtimeOptions.action === ACTIONS.DRAFT) {
+      } else if (
+        runtimeOptions.action === ACTIONS.DRAFT ||
+        runtimeOptions.action === ACTIONS.CORRECTION
+      ) {
         await restrictEditorToForms();
       }
       await freezeEditor();
       editorFrozen = true;
-      setStatus(`Reading fields for ${actionLabel(action)}…`, "pending");
+      setStatus(`กำลังอ่านข้อมูลของ ${actionLabel(action)}…`, "pending");
       data = await extractFormDataPromise();
     }
 
-    setStatus(`${actionLabel(action)} is pending…`, "pending");
+    setStatus(`${actionLabel(action)} กำลังรอดำเนินการ…`, "pending");
     const capability = await requestActionCapability(action);
-    const response = await postAction(action, data, capability);
+    const response = await postAction(
+      action,
+      data,
+      correctionReason,
+      capability
+    );
     operationId = operationIdFromResponse(response);
     notifyParent(action, "pending", operationId, response);
 
@@ -2903,7 +2948,11 @@ async function runAction(action) {
       completedPayload || response
     );
 
-    if (action === ACTIONS.SAVE_DRAFT || action === ACTIONS.SUBMIT) {
+    if (
+      action === ACTIONS.SAVE_DRAFT ||
+      action === ACTIONS.SAVE_CORRECTION ||
+      action === ACTIONS.SUBMIT
+    ) {
       setDirtyState(false);
     }
 
@@ -2927,7 +2976,7 @@ async function runAction(action) {
       try {
         await restrictEditorToForms();
       } catch {
-        setStatus("Could not restore form editing", "error");
+        setStatus("ไม่สามารถคืนค่าการแก้ไขเฉพาะช่องกรอกได้", "error");
       }
     }
     actionInFlight = false;
@@ -2947,36 +2996,35 @@ function startInitializationTasks() {
   initializationStarted = true;
   const tasks = [];
   if (
-    runtimeOptions.action === ACTIONS.FILL &&
+    (runtimeOptions.action === ACTIONS.FILL ||
+      runtimeOptions.action === ACTIONS.CORRECTION) &&
     hasPrefillValues(runtimeOptions.prefill)
   ) {
     window.setTimeout(() => {
       ensurePrefill()
         .then((result) => {
           setStatus(
-            `Prefill applied (${result.applied?.length ?? 0} fields, ${
+            `เติมข้อมูลล่วงหน้าแล้ว (${result.applied?.length ?? 0} ช่อง, ข้าม ${
               result.skipped?.length ?? 0
-            } skipped)`,
+            } ช่อง)`,
             "success"
           );
         })
         .catch((error) => {
-          setStatus(`Prefill failed: ${errorMessage(error)}`, "error");
+          setStatus(`เติมข้อมูลล่วงหน้าไม่สำเร็จ: ${errorMessage(error)}`, "error");
         });
     }, 5000);
   }
   if (
     (runtimeOptions.action === ACTIONS.FILL ||
       runtimeOptions.action === ACTIONS.DRAFT ||
+      runtimeOptions.action === ACTIONS.CORRECTION ||
       runtimeOptions.action === ACTIONS.SUBMIT) &&
     !hasPrefillValues(runtimeOptions.prefill)
   ) {
     window.setTimeout(() => {
       restrictEditorToForms().catch((error) => {
-        setStatus(
-          `Could not restrict document editing: ${errorMessage(error)}`,
-          "error"
-        );
+        setStatus(`จำกัดการแก้ไขเอกสารไม่สำเร็จ: ${errorMessage(error)}`, "error");
       });
     }, 3000);
   }
@@ -2989,14 +3037,11 @@ function startInitializationTasks() {
         runtimeOptions.operationCapability
       )
         .then((result) => {
-          setStatus("Existing operation completed", "success");
+          setStatus("การดำเนินการเดิมเสร็จแล้ว", "success");
           return result;
         })
         .catch((error) => {
-          setStatus(
-            `Existing operation failed: ${errorMessage(error)}`,
-            "error"
-          );
+          setStatus(`การดำเนินการเดิมไม่สำเร็จ: ${errorMessage(error)}`, "error");
           return null;
         })
     );
@@ -3016,6 +3061,14 @@ function startInitializationWhenReady() {
   const plugin = window.Asc?.plugin;
   if (plugin && typeof plugin.attachEditorEvent === "function") {
     plugin.attachEditorEvent("onDocumentContentReady", () => {
+      if (runtimeOptions.action === ACTIONS.CORRECTION) {
+        restrictEditorToForms().catch((error) => {
+          setStatus(
+            `จำกัดการแก้ไขเอกสารไม่สำเร็จ: ${errorMessage(error)}`,
+            "error"
+          );
+        });
+      }
       startInitializationTasks();
     });
     plugin.attachEditorEvent("onDocumentContentChanged", () => {
@@ -3048,8 +3101,15 @@ function initializePlugin() {
   if (actions.length) {
     addToolbarMenuItems(actions);
     attachToolbarHandlers(actions);
+  } else if (runtimeOptions.action === ACTIONS.CORRECTION) {
+    setStatus("พร้อมแก้ไขเฉพาะช่องกรอก", "success");
   } else {
-    setStatus("No supported form action was supplied", "error");
+    setStatus("ไม่พบการทำงานของฟอร์มที่รองรับ", "error");
+  }
+  if (runtimeOptions.action === ACTIONS.CORRECTION) {
+    restrictEditorToForms().catch((error) => {
+      setStatus(`จำกัดการแก้ไขเอกสารไม่สำเร็จ: ${errorMessage(error)}`, "error");
+    });
   }
 
   startInitializationWhenReady();

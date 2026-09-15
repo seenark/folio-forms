@@ -10,8 +10,14 @@ import {
 import { useEffect, useState } from "react";
 
 import { Badge, Card, Notice, Spinner } from "@/components/ui";
-import { ApiError, apiGet, downloadArtifact, formatDate } from "@/lib/api";
-import type { Submission } from "@/lib/api";
+import {
+  ApiError,
+  apiGet,
+  downloadArtifact,
+  formatDate,
+  formatDateTime,
+} from "@/lib/api";
+import type { ResponseRevisionsResponse, Submission } from "@/lib/api";
 
 const receiptErrorMessage = (error: unknown): string => {
   if (error instanceof ApiError) {
@@ -31,10 +37,15 @@ const ReceiptRoute = () => {
   const { submissionId } = useParams({ from: "/receipt/$submissionId" });
   const [submission, setSubmission] = useState<Submission | null>(null);
   const [data, setData] = useState<Record<string, unknown> | null>(null);
+  const [revisions, setRevisions] = useState<
+    ResponseRevisionsResponse["revisions"]
+  >([]);
+  const [viewRevision, setViewRevision] = useState<"original" | "latest">(
+    "original"
+  );
   const [returnUrl, setReturnUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
   useEffect(() => {
     let cancelled = false;
     const loadReceipt = async () => {
@@ -44,8 +55,15 @@ const ReceiptRoute = () => {
           returnUrl: string;
           submission: Submission;
         }>(`/api/submissions/${submissionId}/data`);
+        if (!payload.submission.responseId) {
+          throw new Error("Response is unavailable");
+        }
+        const history = await apiGet<ResponseRevisionsResponse>(
+          `/api/responses/${payload.submission.responseId}/corrections`
+        );
         if (!cancelled) {
           setData(payload.data);
+          setRevisions(history.revisions);
           setReturnUrl(payload.returnUrl);
           setSubmission(payload.submission);
         }
@@ -92,24 +110,22 @@ const ReceiptRoute = () => {
     );
   }
 
-  const downloadJson = async () => {
+  const latestRevision = revisions.at(-1)?.revision ?? 0;
+  const selectedRevision = viewRevision === "latest" ? latestRevision : 0;
+  const displayedData =
+    revisions.find((revision) => revision.revision === selectedRevision)
+      ?.data ??
+    data ??
+    {};
+  const revisionQuery = viewRevision === "latest" ? "?revision=latest" : "";
+  const revisionSuffix =
+    viewRevision === "latest" && latestRevision > 0
+      ? `-revision-${latestRevision}`
+      : "";
+  const download = async (format: "json" | "docx" | "pdf") => {
     await downloadArtifact(
-      `/api/submissions/${submissionId}/json`,
-      `${submissionId}.json`
-    );
-  };
-
-  const downloadDocx = async () => {
-    await downloadArtifact(
-      `/api/submissions/${submissionId}/docx`,
-      `${submissionId}.docx`
-    );
-  };
-
-  const downloadPdf = async () => {
-    await downloadArtifact(
-      `/api/submissions/${submissionId}/pdf`,
-      `${submissionId}.pdf`
+      `/api/submissions/${submissionId}/${format}${revisionQuery}`,
+      `${submissionId}${revisionSuffix}.${format}`
     );
   };
 
@@ -142,30 +158,47 @@ const ReceiptRoute = () => {
               {formatDate(submission.submittedAt ?? submission.createdAt)}
             </p>
           </div>
-          <div className="flex flex-wrap gap-3 border-b border-[var(--line)] p-5">
+          <div className="flex flex-wrap items-center gap-3 border-b border-[var(--line)] p-5">
+            <span className="text-sm font-semibold">ฉบับที่ดู</span>
             <button
               type="button"
-              onClick={downloadJson}
+              aria-pressed={viewRevision === "original"}
+              onClick={() => setViewRevision("original")}
+              className="inline-flex min-h-10 items-center rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-sm font-semibold hover:border-[var(--ink)]"
+            >
+              เดิม
+            </button>
+            <button
+              type="button"
+              aria-pressed={viewRevision === "latest"}
+              onClick={() => setViewRevision("latest")}
+              className="inline-flex min-h-10 items-center rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-sm font-semibold hover:border-[var(--ink)]"
+            >
+              ล่าสุด{latestRevision > 0 ? ` (Correction ${latestRevision})` : ""}
+            </button>
+            <button
+              type="button"
+              onClick={() => download("json")}
               className="inline-flex min-h-10 items-center gap-2 rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-sm font-semibold hover:border-[var(--ink)]"
             >
               <FileJson size={15} />
-              ดาวน์โหลด JSON
+              JSON
             </button>
             <button
               type="button"
-              onClick={downloadDocx}
+              onClick={() => download("docx")}
               className="inline-flex min-h-10 items-center gap-2 rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-sm font-semibold hover:border-[var(--ink)]"
             >
               <FileText size={15} />
-              ดาวน์โหลด DOCX
+              DOCX
             </button>
             <button
               type="button"
-              onClick={downloadPdf}
+              onClick={() => download("pdf")}
               className="inline-flex min-h-10 items-center gap-2 rounded-[10px] border border-[var(--ink)] bg-[var(--ink)] px-3 text-sm font-semibold text-[var(--paper)]"
             >
               <Download size={15} />
-              ดาวน์โหลด PDF
+              PDF
             </button>
             {returnUrl ? (
               <a
@@ -176,6 +209,40 @@ const ReceiptRoute = () => {
               </a>
             ) : null}
           </div>
+          <div className="border-b border-[var(--line)] p-5 sm:p-7">
+            <h2 className="font-semibold">ประวัติ Correction</h2>
+            <ol className="mt-3 space-y-3">
+              {revisions.map((revision) => (
+                <li
+                  className="rounded-[10px] border border-[var(--line)] p-3 text-sm"
+                  key={revision.revision}
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge
+                      tone={revision.revision === 0 ? "neutral" : "warning"}
+                    >
+                      {revision.revision === 0
+                        ? "Submission เดิม"
+                        : `Correction ${revision.revision}`}
+                    </Badge>
+                    <span className="text-[var(--ink-soft)]">
+                      {formatDateTime(revision.createdAt)}
+                    </span>
+                  </div>
+                  {revision.reason ? (
+                    <p className="mt-2 text-[var(--ink-soft)]">
+                      เหตุผล: {revision.reason}
+                    </p>
+                  ) : null}
+                  {revision.actorName || revision.actorEmail ? (
+                    <p className="mt-1 text-[var(--ink-soft)]">
+                      ผู้แก้ไข: {revision.actorName ?? revision.actorEmail}
+                    </p>
+                  ) : null}
+                </li>
+              ))}
+            </ol>
+          </div>
           <div className="p-5 sm:p-7">
             <div className="mb-4 flex items-center gap-2">
               <FileJson size={17} />
@@ -183,7 +250,7 @@ const ReceiptRoute = () => {
               <Badge>อ่านอย่างเดียว</Badge>
             </div>
             <pre className="max-h-[500px] overflow-auto rounded-[10px] bg-[#eef1ed] p-4 text-sm leading-6 text-[var(--ink-soft)]">
-              {JSON.stringify(data ?? {}, null, 2)}
+              {JSON.stringify(displayedData, null, 2)}
             </pre>
           </div>
         </Card>

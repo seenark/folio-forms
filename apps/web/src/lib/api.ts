@@ -87,10 +87,28 @@ export interface Submission {
   formTitle?: string;
   userEmail?: string;
   submissionId?: string;
+  latestCorrectionNumber?: number | null;
   status?: string;
   createdAt?: string;
   submittedAt?: string;
   updatedAt?: string;
+}
+export interface ResponseRevision {
+  actorEmail: string | null;
+  actorName: string | null;
+  createdAt: string;
+  data: Record<string, unknown>;
+  document: {
+    available: boolean;
+    state: "submission" | "correction";
+  };
+  id: string | null;
+  reason: string | null;
+  revision: number;
+}
+export interface ResponseRevisionsResponse {
+  latestRevision: number;
+  revisions: ResponseRevision[];
 }
 export type AdminResultState = "draft" | "submitted";
 export interface AdminResult {
@@ -110,11 +128,17 @@ export interface AdminResultListResponse {
   results: AdminResult[];
 }
 export interface AdminResultDetail extends AdminResult {
+  correction: {
+    createdAt: string;
+    reason: string;
+    revision: number;
+  } | null;
   data: Record<string, unknown>;
   document: {
     available: boolean;
-    state: "draft" | "submission";
+    state: "draft" | "submission" | "correction";
   };
+  revision: number | null;
 }
 export interface AdminResultDetailResponse {
   result: AdminResultDetail;
@@ -133,6 +157,18 @@ export const formatDate = (value: string | Date | undefined) => {
     ? "—"
     : new Intl.DateTimeFormat("th-TH", {
         dateStyle: "medium",
+      }).format(date);
+};
+export const formatDateTime = (value: string | Date | undefined) => {
+  if (!value) {
+    return "—";
+  }
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime())
+    ? "—"
+    : new Intl.DateTimeFormat("th-TH", {
+        dateStyle: "medium",
+        timeStyle: "short",
       }).format(date);
 };
 

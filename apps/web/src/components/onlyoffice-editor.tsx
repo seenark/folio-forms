@@ -7,6 +7,7 @@ type EditorAction =
   | "save-template"
   | "publish"
   | "save-draft"
+  | "save-correction"
   | "submit"
   | "configure-fields";
 type EditorOperationAction = Exclude<EditorAction, "configure-fields">;
@@ -84,6 +85,7 @@ const isEditorOperationAction = (
   value === "save-template" ||
   value === "publish" ||
   value === "save-draft" ||
+  value === "save-correction" ||
   value === "submit";
 const isEditorAction = (value: unknown): value is EditorAction =>
   value === "configure-fields" || isEditorOperationAction(value);
@@ -258,6 +260,8 @@ export const OnlyOfficeEditor = ({
   onDirtyChange,
   onStateChange,
   revision = 0,
+  saveAction = "save-draft",
+  saveReason = "",
   saveRequest = 0,
   title,
 }: {
@@ -267,6 +271,8 @@ export const OnlyOfficeEditor = ({
   onDirtyChange?: (dirty: boolean) => void;
   onStateChange?: (state: OnlyOfficeEditorState) => void;
   revision?: number;
+  saveAction?: "save-draft" | "save-correction";
+  saveReason?: string;
   saveRequest?: number;
   title: string;
 }) => {
@@ -408,13 +414,24 @@ export const OnlyOfficeEditor = ({
     };
     if (saveRequest > lastSaveRequestRef.current) {
       lastSaveRequestRef.current = saveRequest;
-      postCommand({ action: "save-draft", type: "run-action" });
+      postCommand({
+        action: saveAction,
+        ...(saveAction === "save-correction" ? { reason: saveReason } : {}),
+        type: "run-action",
+      });
     }
     if (clearDirtyRequest > lastClearDirtyRequestRef.current) {
       lastClearDirtyRequestRef.current = clearDirtyRequest;
       postCommand({ type: "clear-dirty" });
     }
-  }, [bridgeReadyVersion, clearDirtyRequest, config, saveRequest]);
+  }, [
+    bridgeReadyVersion,
+    clearDirtyRequest,
+    config,
+    saveAction,
+    saveReason,
+    saveRequest,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
