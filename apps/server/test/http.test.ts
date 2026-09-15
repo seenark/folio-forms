@@ -85,6 +85,118 @@ const contentControlDocument = (controls: string): string =>
 
 const contentControl = ({ tag, type }: { tag: string; type: string }): string =>
   `<w:sdt><w:sdtPr><w:tag w:val="${tag}"/>${type}</w:sdtPr><w:sdtContent><w:r><w:t>fixture</w:t></w:r></w:sdtContent></w:sdt>`;
+const pictureDrawing = (relationshipId: string): string =>
+  `<w:drawing xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><a:blip r:embed="${relationshipId}"/></w:drawing>`;
+const onePixelPng = Uint8Array.from(
+  Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64"
+  )
+);
+const pngFixture = (
+  width = 1,
+  height = 1,
+  byteLength = onePixelPng.byteLength
+): Uint8Array => {
+  const bytes = new Uint8Array(byteLength);
+  bytes.set(onePixelPng.subarray(0, Math.min(onePixelPng.length, byteLength)));
+  const writeUint32 = (value: number, offset: number) => {
+    bytes[offset] = Math.floor(value / 0x1_00_00_00) % 0x1_00;
+    bytes[offset + 1] = Math.floor(value / 0x1_00_00) % 0x1_00;
+    bytes[offset + 2] = Math.floor(value / 0x1_00) % 0x1_00;
+    bytes[offset + 3] = value % 0x1_00;
+  };
+  writeUint32(width, 16);
+  writeUint32(height, 20);
+  return bytes;
+};
+const jpegFixture = (width = 1, height = 1): Uint8Array =>
+  Uint8Array.from([
+    0xff,
+    0xd8,
+    0xff,
+    0xc0,
+    0x00,
+    0x11,
+    0x08,
+    Math.floor(height / 0x1_00),
+    height % 0x1_00,
+    Math.floor(width / 0x1_00),
+    width % 0x1_00,
+    0x03,
+    0x01,
+    0x11,
+    0x00,
+    0x02,
+    0x11,
+    0x00,
+    0x03,
+    0x11,
+    0x00,
+    0xff,
+    0xd9,
+  ]);
+const gifFixture = Uint8Array.from(
+  Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64")
+);
+const pictureDocumentFixture = ({
+  images = [],
+  includeStaticImage = false,
+  showingPlaceholder = false,
+}: {
+  images?: { bytes: Uint8Array; extension: string }[];
+  includeStaticImage?: boolean;
+  showingPlaceholder?: boolean;
+} = {}): Uint8Array => {
+  const imageEntries = images.map((image, index) => ({
+    bytes: image.bytes,
+    extension: image.extension,
+    relationshipId: `rIdPicture${index + 1}`,
+  }));
+  if (includeStaticImage) {
+    imageEntries.push({
+      bytes: pngFixture(),
+      extension: "png",
+      relationshipId: "rIdStatic",
+    });
+  }
+  const relationships = imageEntries.map(
+    ({ extension, relationshipId }, index) =>
+      `<Relationship Id="${relationshipId}" Target="media/image${index + 1}.${extension}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"/>`
+  );
+  const staticDrawing = includeStaticImage ? pictureDrawing("rIdStatic") : "";
+  const pictureDrawings = imageEntries
+    .slice(0, images.length)
+    .map(({ relationshipId }) => pictureDrawing(relationshipId))
+    .join("");
+  const additionalParts: Record<string, Uint8Array> = {
+    "word/_rels/document.xml.rels": strToU8(
+      `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${relationships.join("")}</Relationships>`
+    ),
+  };
+  for (const [index, image] of imageEntries.entries()) {
+    additionalParts[`word/media/image${index + 1}.${image.extension}`] =
+      image.bytes;
+  }
+  const extensions = new Set(imageEntries.map(({ extension }) => extension));
+  const contentTypes = templateContentTypesXml.replace(
+    "</Types>",
+    `${[...extensions]
+      .map(
+        (extension) =>
+          `<Default Extension="${extension}" ContentType="image/${extension === "jpg" ? "jpeg" : extension}"/>`
+      )
+      .join("")}</Types>`
+  );
+  const pictureProperties = showingPlaceholder ? "<w:showingPlcHdr/>" : "";
+  return docxXmlFixture({
+    additionalParts,
+    contentTypes,
+    document: contentControlDocument(
+      `${staticDrawing}<w:sdt><w:sdtPr><w:tag w:val="photo"/><w:picture/>${pictureProperties}</w:sdtPr><w:sdtContent><w:r>${pictureDrawings || "<w:t>empty</w:t>"}</w:r></w:sdtContent></w:sdt>`
+    ),
+  });
+};
 
 const strictDocxFixture = (label: string): Uint8Array =>
   docxXmlFixture({
@@ -2136,6 +2248,406 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     pictureMaxWidth: 4096,
     type: "picture",
   });
+  const requiredPictureCreateResponse = await app.handle(
+    formCreationRequest({
+      authorization: adminBearer,
+      source: "upload",
+      template: {
+        bytes: pictureDocumentFixture(),
+        name: "required-picture.docx",
+      },
+      title: "Ticket 16 required picture",
+    })
+  );
+  expect(requiredPictureCreateResponse.status).toBe(200);
+  const requiredPictureCreateBody =
+    (await requiredPictureCreateResponse.json()) as {
+      form?: { publicId?: string };
+    };
+  const requiredPicturePublicId = requiredPictureCreateBody.form?.publicId;
+  if (!requiredPicturePublicId) {
+    throw new Error("The required picture form was not created");
+  }
+  const requiredPictureEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${requiredPicturePublicId}/editor-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(requiredPictureEditorResponse.status).toBe(200);
+  const requiredPictureEditor =
+    (await requiredPictureEditorResponse.json()) as EditorConfigBody;
+  const configurePictureCapability =
+    requiredPictureEditor.bridge.capabilities["configure-fields"];
+  if (!configurePictureCapability) {
+    throw new Error(
+      "The required picture configure capability was not returned"
+    );
+  }
+  const requiredPictureRuleResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${requiredPicturePublicId}/field-rules`,
+      {
+        body: JSON.stringify({
+          documentKey: requiredPictureEditor.config.document.key,
+          prefillPointer: null,
+          prefillPolicy: "editable",
+          previousTag: null,
+          required: true,
+          tag: "photo",
+        }),
+        headers: capabilityHeaders(configurePictureCapability),
+        method: "PATCH",
+      }
+    )
+  );
+  expect(requiredPictureRuleResponse.status).toBe(200);
+  const requiredPicturePublishEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${requiredPicturePublicId}/editor-config`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  const requiredPicturePublishEditor =
+    (await requiredPicturePublishEditorResponse.json()) as EditorConfigBody;
+  const requiredPicturePublishCapability =
+    requiredPicturePublishEditor.bridge.capabilities.publish;
+  if (!requiredPicturePublishCapability) {
+    throw new Error("The required picture publish capability was not returned");
+  }
+  const requiredPicturePublishResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${requiredPicturePublicId}/publish`,
+      {
+        body: JSON.stringify({
+          documentKey: requiredPicturePublishEditor.config.document.key,
+        }),
+        headers: capabilityHeaders(requiredPicturePublishCapability),
+        method: "POST",
+      }
+    )
+  );
+  expect(requiredPicturePublishResponse.status).toBe(202);
+  const requiredPicturePublishBody =
+    (await requiredPicturePublishResponse.json()) as {
+      operationCapability?: string;
+      operationId?: string;
+    };
+  if (
+    !requiredPicturePublishBody.operationCapability ||
+    !requiredPicturePublishBody.operationId
+  ) {
+    throw new Error("The required picture publish operation was not created");
+  }
+  const requiredPicturePublishOperation = await waitForOperation(
+    requiredPicturePublishBody.operationId,
+    {
+      "X-Editor-Capability": requiredPicturePublishBody.operationCapability,
+    }
+  );
+  expect(requiredPicturePublishOperation.status).toBe("completed");
+  const requiredPictureForm = await prisma.form.findUniqueOrThrow({
+    select: { id: true },
+    where: { publicId: requiredPicturePublicId },
+  });
+  const requiredPictureManifest =
+    await prisma.publishedTemplate.findUniqueOrThrow({
+      include: { manifest: { include: { fields: true } } },
+      where: { formId: requiredPictureForm.id },
+    });
+  expect(requiredPictureManifest.manifest?.fields).toContainEqual(
+    expect.objectContaining({
+      pictureMaxBytes: 10 * 1024 * 1024,
+      pictureMaxHeight: 4096,
+      pictureMaxWidth: 4096,
+      required: true,
+      tag: "photo",
+      type: "picture",
+    })
+  );
+  let nextPictureDocument = pictureDocumentFixture({
+    images: [{ bytes: pngFixture(), extension: "png" }],
+    includeStaticImage: true,
+  });
+  const pictureApp = createApp({
+    onlyOffice: {
+      convertDocxToPdf: () =>
+        Promise.resolve(new TextEncoder().encode("%PDF-picture")),
+      forceSave: async (documentKey) => {
+        const response = await prisma.response.findUnique({
+          select: { draftObjectKey: true },
+          where: { draftDocumentKey: documentKey },
+        });
+        if (!response?.draftObjectKey) {
+          throw new Error("The picture response document was not found");
+        }
+        await putObject(
+          response.draftObjectKey,
+          nextPictureDocument,
+          DOCX_CONTENT_TYPE
+        );
+        return false;
+      },
+    },
+  });
+  const pictureStartResponse = await pictureApp.handle(
+    new Request(
+      `http://test.local/api/forms/${requiredPicturePublicId}/start`,
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+        method: "POST",
+      }
+    )
+  );
+  expect(pictureStartResponse.status).toBe(200);
+  const pictureStartBody = (await pictureStartResponse.json()) as {
+    response?: { id?: string };
+  };
+  const pictureResponseId = pictureStartBody.response?.id;
+  if (!pictureResponseId) {
+    throw new Error("The picture response was not started");
+  }
+  const pictureEditorResponse = await pictureApp.handle(
+    new Request(
+      `http://test.local/api/forms/${requiredPicturePublicId}/editor-config?responseId=${pictureResponseId}&action=draft`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(pictureEditorResponse.status).toBe(200);
+  const pictureEditor =
+    (await pictureEditorResponse.json()) as EditorConfigBody;
+  const pictureDocumentKey = pictureEditor.config.document.key;
+  const pictureSaveCapability = pictureEditor.bridge.capabilities["save-draft"];
+  const pictureSubmitCapability = pictureEditor.bridge.capabilities.submit;
+  if (!pictureSaveCapability || !pictureSubmitCapability) {
+    throw new Error("The picture response capabilities were not returned");
+  }
+  const pictureDraftRequest = (data: Record<string, unknown>) =>
+    pictureApp.handle(
+      new Request(
+        `http://test.local/api/forms/${requiredPicturePublicId}/draft`,
+        {
+          body: JSON.stringify({
+            data,
+            documentKey: pictureDocumentKey,
+            responseId: pictureResponseId,
+          }),
+          headers: capabilityHeaders(pictureSaveCapability),
+          method: "POST",
+        }
+      )
+    );
+  const pictureSubmitRequest = (data: Record<string, unknown>) =>
+    pictureApp.handle(
+      new Request(
+        `http://test.local/api/forms/${requiredPicturePublicId}/submit`,
+        {
+          body: JSON.stringify({
+            data,
+            documentKey: pictureDocumentKey,
+            responseId: pictureResponseId,
+          }),
+          headers: capabilityHeaders(pictureSubmitCapability),
+          method: "POST",
+        }
+      )
+    );
+  const savePicture = async (
+    document: Uint8Array,
+    data: Record<string, unknown>
+  ) => {
+    nextPictureDocument = document;
+    const response = await pictureDraftRequest(data);
+    expect(response.status).toBe(202);
+    const body = (await response.json()) as {
+      operationCapability?: string;
+      operationId?: string;
+    };
+    if (!body.operationCapability || !body.operationId) {
+      throw new Error("The picture draft operation was not created");
+    }
+    return waitForOperation(body.operationId, {
+      "X-Editor-Capability": body.operationCapability,
+    });
+  };
+  const validPictureDocument = nextPictureDocument;
+  const validPictureSave = await savePicture(validPictureDocument, {
+    photo: "scalar data must be omitted",
+  });
+  expect(validPictureSave.status).toBe("completed");
+  const savedPictureResponse = await prisma.response.findUniqueOrThrow({
+    select: { draftData: true, draftObjectKey: true, status: true },
+    where: { id: pictureResponseId },
+  });
+  expect(savedPictureResponse).toMatchObject({
+    draftData: {},
+    status: "draft",
+  });
+  if (!savedPictureResponse.draftObjectKey) {
+    throw new Error("The saved picture draft object was not persisted");
+  }
+  expect(await readObject(savedPictureResponse.draftObjectKey)).toEqual(
+    validPictureDocument
+  );
+  const resumedPictureStartResponse = await pictureApp.handle(
+    new Request(
+      `http://test.local/api/forms/${requiredPicturePublicId}/start`,
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+        method: "POST",
+      }
+    )
+  );
+  expect(await resumedPictureStartResponse.json()).toMatchObject({
+    response: { id: pictureResponseId, status: "draft" },
+  });
+  const pictureDocxExport = await pictureApp.handle(
+    new Request(
+      `http://test.local/api/responses/${pictureResponseId}/draft/docx`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(new Uint8Array(await pictureDocxExport.arrayBuffer())).toEqual(
+    Uint8Array.from(validPictureDocument)
+  );
+  const picturePdfExport = await pictureApp.handle(
+    new Request(
+      `http://test.local/api/responses/${pictureResponseId}/draft/pdf`,
+      { headers: { Authorization: `Bearer ${adminBearer}` } }
+    )
+  );
+  expect(await picturePdfExport.text()).toBe("%PDF-picture");
+  const missingPictureDraft = await savePicture(pictureDocumentFixture(), {});
+  expect(missingPictureDraft.status).toBe("completed");
+  expect(
+    await prisma.submission.count({ where: { responseId: pictureResponseId } })
+  ).toBe(0);
+  const invalidPictureDocuments = [
+    pictureDocumentFixture({
+      images: [{ bytes: gifFixture, extension: "gif" }],
+    }),
+    pictureDocumentFixture({
+      images: [
+        { bytes: pngFixture(), extension: "png" },
+        { bytes: jpegFixture(), extension: "jpg" },
+      ],
+    }),
+    pictureDocumentFixture({
+      images: [
+        {
+          bytes: pngFixture(1, 1, 10 * 1024 * 1024 + 1),
+          extension: "png",
+        },
+      ],
+    }),
+    pictureDocumentFixture({
+      images: [{ bytes: pngFixture(4097, 1), extension: "png" }],
+    }),
+  ];
+  for (const invalidPictureDocument of invalidPictureDocuments) {
+    const invalidPictureSave = await savePicture(invalidPictureDocument, {});
+    expect(invalidPictureSave.status).toBe("failed");
+    expect(
+      await prisma.submission.count({
+        where: { responseId: pictureResponseId },
+      })
+    ).toBe(0);
+  }
+  const placeholderPictureDocument = pictureDocumentFixture({
+    images: [{ bytes: pngFixture(), extension: "png" }],
+    showingPlaceholder: true,
+  });
+  const placeholderPictureDraft = await savePicture(
+    placeholderPictureDocument,
+    {}
+  );
+  expect(placeholderPictureDraft.status).toBe("completed");
+  nextPictureDocument = placeholderPictureDocument;
+  const placeholderPictureSubmitResponse = await pictureSubmitRequest({});
+  expect(placeholderPictureSubmitResponse.status).toBe(202);
+  const placeholderPictureSubmitBody =
+    (await placeholderPictureSubmitResponse.json()) as {
+      operationCapability?: string;
+      operationId?: string;
+    };
+  if (
+    !placeholderPictureSubmitBody.operationCapability ||
+    !placeholderPictureSubmitBody.operationId
+  ) {
+    throw new Error("The placeholder picture submit operation was not created");
+  }
+  const placeholderPictureSubmitOperation = await waitForOperation(
+    placeholderPictureSubmitBody.operationId,
+    { "X-Editor-Capability": placeholderPictureSubmitBody.operationCapability }
+  );
+  expect(placeholderPictureSubmitOperation).toMatchObject({
+    error: "invalid_template",
+    status: "failed",
+  });
+  expect(
+    await prisma.submission.count({ where: { responseId: pictureResponseId } })
+  ).toBe(0);
+  nextPictureDocument = pictureDocumentFixture();
+  const missingPictureSubmitResponse = await pictureSubmitRequest({});
+  expect(missingPictureSubmitResponse.status).toBe(202);
+  const missingPictureSubmitBody =
+    (await missingPictureSubmitResponse.json()) as {
+      operationCapability?: string;
+      operationId?: string;
+    };
+  if (
+    !missingPictureSubmitBody.operationCapability ||
+    !missingPictureSubmitBody.operationId
+  ) {
+    throw new Error("The missing picture submit operation was not created");
+  }
+  const missingPictureSubmitOperation = await waitForOperation(
+    missingPictureSubmitBody.operationId,
+    { "X-Editor-Capability": missingPictureSubmitBody.operationCapability }
+  );
+  expect(missingPictureSubmitOperation).toMatchObject({
+    error: "invalid_template",
+    status: "failed",
+  });
+  expect(
+    await prisma.response.findUnique({
+      select: { status: true },
+      where: { id: pictureResponseId },
+    })
+  ).toMatchObject({ status: "draft" });
+  expect(
+    await prisma.submission.count({ where: { responseId: pictureResponseId } })
+  ).toBe(0);
+  nextPictureDocument = pictureDocumentFixture({
+    images: [{ bytes: jpegFixture(), extension: "jpg" }],
+  });
+  const pictureSubmitResponse = await pictureSubmitRequest({
+    photo: "scalar data must be omitted",
+  });
+  expect(pictureSubmitResponse.status).toBe(202);
+  const pictureSubmitBody = (await pictureSubmitResponse.json()) as {
+    operationCapability?: string;
+    operationId?: string;
+  };
+  if (
+    !pictureSubmitBody.operationCapability ||
+    !pictureSubmitBody.operationId
+  ) {
+    throw new Error("The picture submit operation was not created");
+  }
+  const pictureSubmitOperation = await waitForOperation(
+    pictureSubmitBody.operationId,
+    { "X-Editor-Capability": pictureSubmitBody.operationCapability }
+  );
+  expect(pictureSubmitOperation.status).toBe("completed");
+  const pictureSubmission = await prisma.submission.findUniqueOrThrow({
+    select: { data: true, objectKey: true, responseId: true },
+    where: { responseId: pictureResponseId },
+  });
+  expect(pictureSubmission.data).toEqual({});
+  expect(await readObject(pictureSubmission.objectKey)).toEqual(
+    nextPictureDocument
+  );
   const invalidFixtureCases = [
     {
       bytes: docxFixture("no-controls"),

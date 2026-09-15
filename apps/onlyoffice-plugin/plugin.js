@@ -47,6 +47,7 @@ const PANEL_IDS = Object.freeze({
   nextPage: "field-schema-next",
   panel: "field-panel",
   policyForm: "field-policy-form",
+  pictureHelp: "field-picture-help",
   policySelect: "field-prefill-policy",
   query: "field-schema-query",
   required: "field-required",
@@ -84,7 +85,7 @@ let panelEventsAttached = false;
 let panelSelectionEventAttached = false;
 let selectionSequence = 0;
 let schemaRequestSequence = 0;
-let fieldPanelState = {
+const fieldPanelState = {
   currentPointer: null,
   prefillPolicy: "editable",
   required: false,
@@ -122,6 +123,36 @@ function extractFormDataCommand() {
   const doc = Api.GetDocument();
   const controls = doc.GetAllContentControls();
   const data = {};
+  function isPictureControlInsideCommand(control) {
+    if (typeof control.IsPicture === "function") {
+      try {
+        if (control.IsPicture()) {
+          return true;
+        }
+      } catch {
+        // Fall through to the normalized form type.
+      }
+    }
+
+    if (typeof control.GetFormType === "function") {
+      try {
+        const formType = control.GetFormType();
+        if (typeof formType === "string") {
+          const normalized = formType.toLowerCase().replaceAll(/[\s_-]+/g, "");
+          return (
+            normalized === "picture" ||
+            normalized === "pictureform" ||
+            normalized === "picturecontentcontrol" ||
+            normalized === "image"
+          );
+        }
+      } catch {
+        // Treat controls with an unavailable form type as scalar candidates.
+      }
+    }
+
+    return false;
+  }
 
   function getInlineTextInsideCommand(control) {
     return control
@@ -165,6 +196,10 @@ function extractFormDataCommand() {
     const tag = control.GetTag();
 
     if (!tag) {
+      continue;
+    }
+
+    if (isPictureControlInsideCommand(control)) {
       continue;
     }
 
@@ -271,6 +306,36 @@ function applyPrefillCommand() {
   const skipped = [];
   const failed = [];
   const hasOwn = Object.prototype.hasOwnProperty;
+  function isPictureControl(control) {
+    if (typeof control.IsPicture === "function") {
+      try {
+        if (control.IsPicture()) {
+          return true;
+        }
+      } catch {
+        // Fall through to the normalized form type.
+      }
+    }
+
+    if (typeof control.GetFormType === "function") {
+      try {
+        const formType = control.GetFormType();
+        if (typeof formType === "string") {
+          const normalized = formType.toLowerCase().replaceAll(/[\s_-]+/g, "");
+          return (
+            normalized === "picture" ||
+            normalized === "pictureform" ||
+            normalized === "picturecontentcontrol" ||
+            normalized === "image"
+          );
+        }
+      } catch {
+        // Treat controls with an unavailable form type as scalar candidates.
+      }
+    }
+
+    return false;
+  }
 
   function setControlText(control, text) {
     const classType =
@@ -431,11 +496,17 @@ function applyPrefillCommand() {
   for (const control of controls) {
     const tag = control.GetTag();
 
-    if (!tag || !hasOwn.call(values, tag)) {
-      if (tag) {
-        skipped.push(tag);
-      }
+    if (!tag) {
+      continue;
+    }
 
+    if (isPictureControl(control)) {
+      skipped.push(tag);
+      continue;
+    }
+
+    if (!hasOwn.call(values, tag)) {
+      skipped.push(tag);
       continue;
     }
 
@@ -884,7 +955,11 @@ function applyPrefill(prefill) {
 async function applyPrefillWhenReady(prefill) {
   for (let attempt = 0; attempt < PREFILL_MAX_ATTEMPTS; attempt += 1) {
     const result = await applyPrefill(prefill);
-    if (result.applied?.length || result.failed?.length) {
+    if (
+      result.applied?.length ||
+      result.failed?.length ||
+      result.skipped?.length
+    ) {
       return result;
     }
     await wait(500);
@@ -920,7 +995,7 @@ function panelElement(id) {
   }
 
   if (typeof document.getElementById === "function") {
-    const element = document.getElementById(id);
+    const element = document.querySelector(`#${id}`);
     if (element) {
       return element;
     }
@@ -965,7 +1040,7 @@ function appendPanelChild(parent, child) {
   if (typeof parent.append === "function") {
     parent.append(child);
   } else if (typeof parent.appendChild === "function") {
-    parent.appendChild(child);
+    parent.append(child);
   }
 }
 
@@ -990,34 +1065,46 @@ function clearPanelChildren(element) {
 
 function typeLabel(controlType) {
   switch (controlType) {
-    case "checkbox":
+    case "checkbox": {
       return "ช่องทำเครื่องหมาย";
-    case "date":
+    }
+    case "date": {
       return "วันที่";
-    case "dropdown":
+    }
+    case "dropdown": {
       return "รายการเลือก";
-    case "combo":
+    }
+    case "combo": {
       return "รายการเลือกแบบพิมพ์ได้";
-    case "picture":
+    }
+    case "picture": {
       return "รูปภาพ";
-    case "text":
+    }
+    case "text": {
       return "ข้อความ";
-    default:
+    }
+    default: {
       return "ไม่รองรับ";
+    }
   }
 }
 function schemaTypeLabel(schemaType) {
   switch (schemaType) {
-    case "boolean":
+    case "boolean": {
       return "จริง/เท็จ";
-    case "number":
+    }
+    case "number": {
       return "ตัวเลข";
-    case "null":
+    }
+    case "null": {
       return "ค่าว่าง";
-    case "string":
+    }
+    case "string": {
       return "ข้อความ";
-    default:
+    }
+    default: {
       return "ไม่รองรับ";
+    }
   }
 }
 
@@ -1203,8 +1290,7 @@ async function readCurrentSelection(hint) {
         const fallback = normalizeSelectionSnapshot(
           parseCommandResult(
             await callCommandResult(getCurrentContentControlCommand)
-          ),
-          undefined
+          )
         );
         if (fallback) {
           return fallback;
@@ -1231,7 +1317,7 @@ async function readCurrentSelection(hint) {
 
   try {
     const fallback = await callCommandResult(getCurrentContentControlCommand);
-    return normalizeSelectionSnapshot(parseCommandResult(fallback), undefined);
+    return normalizeSelectionSnapshot(parseCommandResult(fallback));
   } catch {
     return null;
   }
@@ -1287,6 +1373,23 @@ function publishFieldSelection(selection) {
 function sameSelectionControl(left, right) {
   return Boolean(left && right && left.controlKey === right.controlKey);
 }
+function isPictureSelection(selection = fieldPanelState.selection) {
+  return selection?.controlType === "picture";
+}
+
+function picturePrefillStatus() {
+  return "ฟิลด์รูปภาพไม่รองรับการเติมข้อมูลล่วงหน้า";
+}
+
+function clearPicturePrefillState() {
+  if (!isPictureSelection()) {
+    return;
+  }
+
+  fieldPanelState.currentPointer = null;
+  fieldPanelState.prefillPolicy = "editable";
+  fieldPanelState.selectedPointer = null;
+}
 
 function applyDefaultPolicyState() {
   fieldPanelState.currentPointer = null;
@@ -1334,6 +1437,7 @@ function setSelectionState(snapshot) {
   if (!sameControl) {
     applyDefaultPolicyState();
   }
+  clearPicturePrefillState();
   updateFieldPanel();
   return !sameControl;
 }
@@ -1385,7 +1489,7 @@ async function refreshSelection(hint) {
 }
 
 function renderSchemaItems() {
-  const list = panelElements.list;
+  const { list } = panelElements;
   clearPanelChildren(list);
   if (
     !list ||
@@ -1394,6 +1498,7 @@ function renderSchemaItems() {
   ) {
     return;
   }
+  const pictureSelection = isPictureSelection();
 
   for (const item of fieldPanelState.schemaItems) {
     const row = document.createElement("li");
@@ -1408,6 +1513,7 @@ function renderSchemaItems() {
     pointerButton.type = "button";
     pointerButton.textContent = item.pointer;
     pointerButton.title = "เลือกตัวชี้";
+    pointerButton.disabled = pictureSelection;
     pointerButton.addEventListener?.("click", () => {
       selectSchemaPointer(item.pointer);
     });
@@ -1417,11 +1523,13 @@ function renderSchemaItems() {
     copyButton.className = "secondary-action";
     copyButton.type = "button";
     copyButton.textContent = "คัดลอก";
+    copyButton.disabled = pictureSelection;
     copyButton.addEventListener?.("click", () => {
       void copySchemaPointer(item.pointer);
     });
     applyButton.type = "button";
     applyButton.textContent = "ใช้เป็นแท็ก";
+    applyButton.disabled = pictureSelection;
     applyButton.addEventListener?.("click", () => {
       void applySchemaPointer(item.pointer);
     });
@@ -1435,13 +1543,15 @@ function renderSchemaItems() {
 }
 
 function updateFieldPanel() {
-  const selection = fieldPanelState.selection;
+  const { selection } = fieldPanelState;
   const hasSelection = Boolean(selection?.controlKey);
   const hasTag = Boolean(selection?.tag);
-  const query = panelElements.query;
+  const pictureSelection = isPictureSelection();
+  const { query } = panelElements;
   const policy = panelElements.policySelect;
-  const required = panelElements.required;
+  const { required } = panelElements;
 
+  clearPicturePrefillState();
   setPanelText(
     panelElements.selectionTag,
     hasSelection ? selection.tag || "ยังไม่มีแท็ก" : "ยังไม่ได้เลือก"
@@ -1450,6 +1560,9 @@ function updateFieldPanel() {
     panelElements.selectionType,
     hasSelection ? typeLabel(selection.controlType) : "ยังไม่ได้เลือก"
   );
+  if (panelElements.pictureHelp) {
+    panelElements.pictureHelp.hidden = !pictureSelection;
+  }
   if (required) {
     required.checked = fieldPanelState.required;
   }
@@ -1458,19 +1571,20 @@ function updateFieldPanel() {
   }
 
   setPanelDisabled(required, !hasSelection);
-  setPanelDisabled(policy, !hasSelection);
+  setPanelDisabled(policy, !hasSelection || pictureSelection);
   setPanelDisabled(panelElements.save, !hasSelection || !hasTag);
-  setPanelDisabled(query, !hasSelection);
-  setPanelDisabled(panelElements.search, !hasSelection);
+  setPanelDisabled(query, !hasSelection || pictureSelection);
+  setPanelDisabled(panelElements.search, !hasSelection || pictureSelection);
   setPanelDisabled(
     panelElements.nextPage,
     !hasSelection ||
+      pictureSelection ||
       !fieldPanelState.schemaCursor ||
       fieldPanelState.schemaPageCount >= MAX_SCHEMA_PAGES
   );
   setPanelDisabled(
     panelElements.applyPointer,
-    !hasSelection || !fieldPanelState.selectedPointer
+    !hasSelection || pictureSelection || !fieldPanelState.selectedPointer
   );
   renderSchemaItems();
 }
@@ -1510,22 +1624,30 @@ function fieldRulesFromResponse(payload) {
 
 function panelErrorStatus(kind) {
   switch (kind) {
-    case "capability":
+    case "capability": {
       return "ไม่สามารถยืนยันสิทธิ์การตั้งค่าฟิลด์ได้";
-    case "schema":
+    }
+    case "schema": {
       return "ไม่สามารถโหลดตัวชี้ข้อมูลได้";
-    case "rules":
+    }
+    case "rules": {
       return "ไม่สามารถโหลดนโยบายฟิลด์ได้";
-    case "save":
+    }
+    case "save": {
       return "ไม่สามารถบันทึกนโยบายฟิลด์ได้";
-    case "selection":
+    }
+    case "selection": {
       return "ไม่สามารถอ่านฟิลด์ที่เลือกได้";
-    case "tag":
+    }
+    case "tag": {
       return "ไม่สามารถใช้ตัวชี้เป็นแท็กได้";
-    case "clipboard":
+    }
+    case "clipboard": {
       return "ไม่สามารถคัดลอกตัวชี้ได้";
-    default:
+    }
+    default: {
       return "เกิดข้อผิดพลาด กรุณาลองใหม่";
+    }
   }
 }
 
@@ -1550,12 +1672,13 @@ async function requestFieldApi(path, init) {
 }
 
 async function loadFieldRules() {
-  const selection = fieldPanelState.selection;
+  const { selection } = fieldPanelState;
   if (!selection?.controlKey) {
     return { ok: false, rules: [] };
   }
+  const pictureSelection = isPictureSelection();
 
-  const selectionId = selection.selectionId;
+  const { selectionId } = selection;
   try {
     const payload = await requestFieldApi(fieldRulesPath("field-rules"), {
       method: "GET",
@@ -1574,8 +1697,12 @@ async function loadFieldRules() {
     fieldPanelState.selection.rulesLoaded = true;
     fieldPanelState.selection.previousTag = rule?.tag || null;
     fieldPanelState.rules = rules;
-    fieldPanelState.currentPointer = rule?.prefillPointer || null;
-    fieldPanelState.prefillPolicy = rule?.prefillPolicy || "editable";
+    fieldPanelState.currentPointer = pictureSelection
+      ? null
+      : rule?.prefillPointer || null;
+    fieldPanelState.prefillPolicy = pictureSelection
+      ? "editable"
+      : rule?.prefillPolicy || "editable";
     fieldPanelState.required = rule?.required === true;
     fieldPanelState.selectedPointer = null;
     updateFieldPanel();
@@ -1648,6 +1775,11 @@ async function loadSchemaPage(reset = true) {
   if (!selectionId || !fieldPanelState.selection?.controlKey) {
     return { error: "ยังไม่ได้เลือกฟิลด์", items: [], ok: false };
   }
+  if (isPictureSelection()) {
+    const error = picturePrefillStatus();
+    setPanelStatus(error, "info");
+    return { error, items: [], ok: false };
+  }
   if (
     !reset &&
     (!fieldPanelState.schemaCursor ||
@@ -1719,6 +1851,11 @@ function selectSchemaPointer(pointer) {
   ) {
     return { ok: false };
   }
+  if (isPictureSelection()) {
+    const error = picturePrefillStatus();
+    setPanelStatus(error, "info");
+    return { error, ok: false };
+  }
 
   fieldPanelState.selectedPointer = pointer;
   fieldPanelState.currentPointer = pointer;
@@ -1730,6 +1867,11 @@ function selectSchemaPointer(pointer) {
 async function copySchemaPointer(pointer) {
   if (!fieldPanelState.selection?.controlKey || typeof pointer !== "string") {
     return { error: "ยังไม่ได้เลือกฟิลด์", ok: false };
+  }
+  if (isPictureSelection()) {
+    const error = picturePrefillStatus();
+    setPanelStatus(error, "info");
+    return { error, ok: false };
   }
 
   try {
@@ -1777,11 +1919,16 @@ async function applySchemaPointer(pointer) {
   if (!fieldPanelState.selection?.controlKey) {
     return { error: "ยังไม่ได้เลือกฟิลด์", ok: false };
   }
+  if (isPictureSelection()) {
+    const error = picturePrefillStatus();
+    setPanelStatus(error, "info");
+    return { error, ok: false };
+  }
   if (typeof pointer !== "string" || !pointer) {
     return { error: panelErrorStatus("tag"), ok: false };
   }
 
-  const selection = fieldPanelState.selection;
+  const { selection } = fieldPanelState;
   const scope = window.Asc.scope || (window.Asc.scope = {});
   scope.formBridgeSelectionId = selection.internalId || "";
   scope.formBridgeSelectionTag = pointer;
@@ -1816,19 +1963,28 @@ async function applySchemaPointer(pointer) {
 }
 
 async function saveFieldRule(overrides) {
-  const selection = fieldPanelState.selection;
+  const { selection } = fieldPanelState;
   if (!selection?.controlKey || !selection.tag) {
     return { error: "ยังไม่ได้เลือกฟิลด์", ok: false };
+  }
+  const pictureSelection = isPictureSelection();
+  clearPicturePrefillState();
+  const { prefillPointer: overridePrefillPointer } = overrides ?? {};
+  let prefillPointer = fieldPanelState.currentPointer;
+  if (overridePrefillPointer !== undefined) {
+    prefillPointer = overridePrefillPointer;
+  }
+  let prefillPolicy = overrides?.prefillPolicy || fieldPanelState.prefillPolicy;
+  if (pictureSelection) {
+    prefillPointer = null;
+    prefillPolicy = "editable";
   }
 
   const body = {
     documentKey: requireOption(runtimeOptions.documentKey, "documentKey"),
     previousTag: selection.previousTag || null,
-    prefillPointer:
-      overrides?.prefillPointer !== undefined
-        ? overrides.prefillPointer
-        : fieldPanelState.currentPointer,
-    prefillPolicy: overrides?.prefillPolicy || fieldPanelState.prefillPolicy,
+    prefillPointer,
+    prefillPolicy,
     required:
       overrides?.required === undefined
         ? fieldPanelState.required
@@ -1843,7 +1999,7 @@ async function saveFieldRule(overrides) {
     return { error: panelErrorStatus("save"), ok: false };
   }
 
-  const selectionId = selection.selectionId;
+  const { selectionId } = selection;
   const originalDocumentTag = selection.documentTag;
   const tagChanged = body.tag !== originalDocumentTag;
 
@@ -1854,10 +2010,17 @@ async function saveFieldRule(overrides) {
       body: JSON.stringify(body),
       method: "PATCH",
     });
-    const rule = normalizeFieldRule(payload?.rule);
-    if (!rule) {
+    const normalizedRule = normalizeFieldRule(payload?.rule);
+    if (!normalizedRule) {
       throw new Error("Invalid field rule response");
     }
+    const rule = pictureSelection
+      ? {
+          ...normalizedRule,
+          prefillPolicy: "editable",
+          prefillPointer: null,
+        }
+      : normalizedRule;
     if (fieldPanelState.selection?.selectionId !== selectionId) {
       return { ignored: true, ok: false };
     }
@@ -1889,7 +2052,7 @@ async function saveFieldRule(overrides) {
 }
 
 function getPanelState() {
-  const selection = fieldPanelState.selection;
+  const { selection } = fieldPanelState;
   return {
     currentPointer: fieldPanelState.currentPointer,
     prefillPolicy: fieldPanelState.prefillPolicy,
@@ -2007,6 +2170,7 @@ function setupFieldPanel() {
     list: panelElement(PANEL_IDS.list),
     nextPage: panelElement(PANEL_IDS.nextPage),
     panel: panelElement(PANEL_IDS.panel),
+    pictureHelp: panelElement(PANEL_IDS.pictureHelp),
     policyForm: panelElement(PANEL_IDS.policyForm),
     policySelect: panelElement(PANEL_IDS.policySelect),
     query: panelElement(PANEL_IDS.query),
@@ -2017,7 +2181,7 @@ function setupFieldPanel() {
     selectionType: panelElement(PANEL_IDS.selectionType),
     status: panelElement(PANEL_IDS.status),
   };
-  const panel = panelElements.panel;
+  const { panel } = panelElements;
   if (!panel) {
     return;
   }

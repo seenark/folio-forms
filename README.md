@@ -175,8 +175,8 @@ The Admin Form list shows lifecycle state plus active Draft and Submission count
 
 Publishing:
 
-- Validates the DOCX package and requires at least one tagged scalar content control.
-- Records each supported control's tag, type, dropdown/combo options, required state, and Prefill policy in an immutable Field Manifest.
+- Validates the DOCX package and requires at least one tagged supported content control.
+- Records each supported control's tag, type, dropdown/combo options, required state, and Prefill policy in an immutable Field Manifest. Picture fields publish as native embedded-image fields with JPEG/PNG, one-image, 10 MiB, and 4096×4096 limits.
 - Rejects blank or duplicate tags, malformed controls/options, unknown or unsupported control types, and invalid Prefill policies.
 - Creates one immutable Published Template and opaque generated share ID. Save and Publish cannot replace that structural or policy contract in place.
 - Failed publication leaves the prior Template Draft editable and exposes no shareable Published Form.
@@ -192,8 +192,9 @@ Publishing:
 6. Return through the dashboard to resume the same response.
 7. Select **Submit** to create the immutable receipt.
 
-The prefill is snapshotted when the response starts. Resuming a draft does not refresh the profile. Starting again after publication invalidates an old draft and creates a new snapshot for the new published version. The User dashboard lists the current User's Draft with the Form title and last-saved time. Save Draft is explicit: incomplete scalar values are allowed, but unknown tags, wrong types/options/dates, text over 10,000 characters, and response JSON over 256 KiB are rejected. Resume reopens the same Response and document under the owning User's Editor Lease; another User cannot access its data, Operation, editor configuration, or document.
+The prefill is snapshotted when the response starts. Resuming a draft does not refresh the profile. Starting again after publication invalidates an old draft and creates a new snapshot for the new published version. The User dashboard lists the current User's Draft with the Form title and last-saved time. Save Draft is explicit: incomplete scalar and Picture values are allowed, but unknown tags, wrong types/options/dates, text over 10,000 characters, and response JSON over 256 KiB are rejected. Native Picture controls are never remote-prefilled or serialized into response JSON; submission requires a required Picture to contain one embedded JPEG/PNG within the published byte and dimension limits. Resume reopens the same Response and document under the owning User's Editor Lease; another User cannot access its data, Operation, editor configuration, or document.
 
+Static document images remain non-editable. Picture input uses ONLYOFFICE's native control; the canonical DOCX is authoritative, with no separate image upload or image object.
 Submission is complete only after the extracted field JSON and canonical filled DOCX are persisted. PDF is an on-demand export and is not durable submission state.
 
 ## DOCX template requirements
@@ -202,12 +203,15 @@ Fields are ONLYOFFICE content controls. Their tags are the stable field keys use
 
 Each Form defines its own unique, non-empty tags. Supported controls include text, checkbox, date, dropdown, combo box, and picture fields. The Form Bridge panel uses the exact content-control tag as the Field identity. JSON Pointer tags such as `/person/name` are stored literally (RFC 6901 escaping applies to `/` and `~` inside a segment); the panel's external schema search returns pointer keys and scalar types only. Supported authoring controls are text, checkbox, date, dropdown, combo box, and Picture; publication remains the authority that validates their final types and options.
 
+Picture fields accept exactly one native ONLYOFFICE embedded JPEG or PNG up to 10 MiB and 4096×4096 pixels. Required Picture fields must contain an image. Picture bytes stay in the canonical Draft/Submission DOCX and are preserved by authorized DOCX/PDF export; they never appear in scalar Response JSON or as independent image objects.
+
 The plugin extracts:
 
 - Inline and block text.
 - Checkbox values as booleans.
 - Date picker values as `YYYY-MM-DD`.
 - Dropdown and combo-box stored values.
+- Picture controls are deliberately omitted from scalar extraction; their embedded DOCX bytes are authoritative.
 
 The plugin applies prefill through ONLYOFFICE's command API, then restricts respondent sessions to form editing. The action flow temporarily switches the editor to view restriction while extracting and force-saving a draft or submission, then restores form editing.
 

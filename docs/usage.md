@@ -250,7 +250,9 @@ Editor หนึ่งรายการมี Admin แก้ไขได้ค
 
 การค้นหา Schema ใช้ External Mock เดียวของระบบและแบ่งผลลัพธ์ด้วย Cursor ผลลัพธ์มีเฉพาะ Leaf ที่เป็น scalar พร้อม RFC 6901 JSON Pointer เช่น `/person/name` และไม่แสดง Object, Array, User record หรือค่าจริงของ record กด **คัดลอกคีย์** เพื่อคัดลอก Pointer ที่ตรงตัว หรือกด **ใช้เป็น Tag** เพื่อใส่ Pointer นั้นใน Content Control ที่เลือก จากนั้นกด **บันทึกการตั้งค่า Field** การเปลี่ยน Tag จะล้างนโยบายของ Tag เดิมแบบ atomic เพื่อไม่ให้เหลือกฎขัดแย้ง
 
-รองรับ Content Control แบบ scalar สำหรับ Text, Checkbox, Date, Dropdown, Combo box และ Picture การ Save Template จะเก็บเอกสารล่าสุดและกฎ Field เพื่อเปิดกลับมาได้เหมือนเดิม แต่ Publish จะตรวจชนิด ตัวเลือก Tag และนโยบายอีกครั้ง แล้วบันทึก Field Manifest ที่เป็น authoritative contract
+รองรับ Content Control แบบ scalar สำหรับ Text, Checkbox, Date, Dropdown และ Combo box รวมถึง Picture แบบ native ของ ONLYOFFICE การ Save Template จะเก็บเอกสารล่าสุดและกฎ Field เพื่อเปิดกลับมาได้เหมือนเดิม แต่ Publish จะตรวจชนิด ตัวเลือก Tag และนโยบายอีกครั้ง แล้วบันทึก Field Manifest ที่เป็น authoritative contract
+
+Picture ใช้ภาพที่เลือกผ่าน Content Control ของ ONLYOFFICE เท่านั้น: ต้องฝังภาพ JPEG หรือ PNG ได้ไม่เกิน 1 ภาพต่อ Field ขนาดไฟล์ไม่เกิน 10 MiB และกว้าง/สูงไม่เกิน 4096×4096 พิกเซล หากตั้ง Required ต้องมีภาพอยู่ใน Field เอกสาร DOCX ที่ฝังภาพเป็นแหล่งข้อมูลหลัก ไม่มี remote Prefill, การอัปโหลดรูปภาพแยก หรือ image object แยกต่างหาก แผงจะแสดงข้อจำกัดและปิดการตั้งค่า Prefill สำหรับ Picture ส่วนรูปภาพคงที่นอก Field ยังคงแก้ไขไม่ได้
 
 เมื่อแก้ไข Template เสร็จ:
 
@@ -287,8 +289,8 @@ Form ที่ยังเป็น `Draft`, ไม่เคย Publish แล�
 
 1. Login ก่อนเปิด Share Link; บัญชีที่ถูกปิดใช้งานจะเริ่มคำตอบไม่ได้
 2. ระบบสร้าง Response ได้อย่างน้อยหนึ่งรายการต่อ User ต่อ Form แม้มีการกดเริ่มพร้อมกัน
-3. เปิดแท็บ **Form** แล้วแก้ได้เฉพาะ Content Control ที่มี Tag; ข้อความคงที่และรูปภาพของเอกสารแก้ไม่ได้
-4. กด **Save Draft** อย่างชัดเจนเพื่อบันทึกค่าที่กรอก ค่าไม่ครบยังบันทึกได้
+3. เปิดแท็บ **Form** แล้วแก้ได้เฉพาะ Content Control ที่มี Tag; ข้อความคงที่และรูปภาพคงที่นอก Field แก้ไม่ได้ ส่วน Picture ต้องเลือกผ่าน native control ของ ONLYOFFICE
+4. กด **Save Draft** อย่างชัดเจนเพื่อบันทึกค่าที่กรอก ค่า scalar และ Picture ที่ไม่ครบยังบันทึกได้ แต่ก่อน Submit Picture ที่ตั้ง Required ต้องมีภาพและต้องผ่านชนิด จำนวน ขนาดไบต์ และขนาดพิกเซล
 5. ค่า scalar ต้องตรงกับ Field Manifest: text/combo ไม่เกิน 10,000 ตัวอักษร, JSON รวมไม่เกิน 256 KiB, ส่วน dropdown/date/checkbox ต้องเป็น option, วันที่ หรือ boolean ที่ถูกต้อง
 6. กลับหน้า Dashboard เพื่อดูชื่อ Form และเวลาบันทึกล่าสุด แล้วกด **กลับไปกรอกต่อ** เพื่อเปิด Response เดิม
 7. เฉพาะ User เจ้าของเท่านั้นที่อ่าน Response, Operation, editor configuration และ DOCX ได้

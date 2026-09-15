@@ -35,16 +35,6 @@ const createHarness = ({
   const createElement = (tagName = "div", id = "") => {
     const listeners = new Map();
     const element = {
-      checked: false,
-      children: [],
-      dataset: {},
-      disabled: false,
-      hidden: false,
-      id,
-      style: {},
-      tagName: tagName.toUpperCase(),
-      textContent: "",
-      value: "",
       addEventListener(type, listener) {
         const callbacks = listeners.get(type) || [];
         callbacks.push(listener);
@@ -63,6 +53,10 @@ const createHarness = ({
         this.children.push(child);
         return child;
       },
+      checked: false,
+      children: [],
+      dataset: {},
+      disabled: false,
       dispatchEvent(event = {}) {
         const callbacks = listeners.get(event.type) || [];
         const dispatched = {
@@ -76,6 +70,8 @@ const createHarness = ({
         }
         return true;
       },
+      hidden: false,
+      id,
       remove() {
         if (!this.parentNode) {
           return;
@@ -98,6 +94,10 @@ const createHarness = ({
       setAttribute(name, value) {
         this[name] = String(value);
       },
+      style: {},
+      tagName: tagName.toUpperCase(),
+      textContent: "",
+      value: "",
     };
     if (id) {
       elements.set(id, element);
@@ -108,6 +108,7 @@ const createHarness = ({
   const panelIds = [
     "field-apply-pointer",
     "field-panel",
+    "field-picture-help",
     "field-policy-form",
     "field-prefill-policy",
     "field-required",
@@ -345,13 +346,13 @@ const createHarness = ({
     bridgeId,
     dispatch,
     editorEvents,
+    element(id) {
+      return elements.get(id);
+    },
     emitEditorEvent(name, value) {
       for (const callback of editorEvents.get(name) || []) {
         callback(value);
       }
-    },
-    element(id) {
-      return elements.get(id);
     },
     expireCapabilityRequests() {
       for (const timer of timers) {
@@ -459,10 +460,10 @@ test("accepts only authenticated parent dirty commands", async () => {
   harness.emitEditorEvent("onChangeContentControl");
 
   const validRunAction = {
+    action: "save-draft",
     bridgeId: harness.bridgeId,
     source: "folio-parent",
     type: "run-action",
-    action: "save-draft",
   };
   const invalidEvents = [
     {
@@ -541,12 +542,15 @@ test("extracts scalar form values with plugin contract semantics", async () => {
     dropdown = false,
     items = [],
     combo = false,
+    formType = "",
+    picture = false,
     tag,
     text,
   }) => ({
     GetClassType: () => "inlineLvlSdt",
     GetDate: () => dateValue,
     GetDropdownList: () => ({ GetAllItems: () => items }),
+    GetFormType: () => formType,
     GetRange: () => ({ GetText: () => text }),
     GetTag: () => tag,
     IsCheckBox: () => checkbox,
@@ -554,7 +558,9 @@ test("extracts scalar form values with plugin contract semantics", async () => {
     IsComboBox: () => combo,
     IsDatePicker: () => date,
     IsDropDownList: () => dropdown,
+    IsPicture: () => picture,
   });
+
   const harness = createHarness({
     action: "draft",
     capabilityResponses: ["save-draft-capability"],
@@ -588,6 +594,12 @@ test("extracts scalar form values with plugin contract semantics", async () => {
         tag: "custom",
         text: "Custom value",
       }),
+      control({
+        formType: "picture",
+        picture: true,
+        tag: "photo",
+        text: "picture bytes never become scalar data",
+      }),
     ],
     responses: [
       { operationCapability: "save-operation-capability", operationId: "save" },
@@ -606,6 +618,39 @@ test("extracts scalar form values with plugin contract semantics", async () => {
     notes: "line one\nline two",
     start_date: "2026-09-15",
   });
+});
+
+test("skips native picture controls during prefill without mutating them", async () => {
+  let mutationCount = 0;
+  const pictureControl = {
+    AddText: () => {
+      mutationCount += 1;
+    },
+    GetClassType: () => "inlineLvlSdt",
+    GetFormType: () => "picture",
+    GetRange: () => ({ SetText: () => mutationCount++ }),
+    GetTag: () => "photo",
+    IsPicture: () => true,
+    RemoveAllElements: () => {
+      mutationCount += 1;
+    },
+    SetLock: () => {
+      mutationCount += 1;
+    },
+  };
+  const harness = createHarness({ controls: [pictureControl] });
+
+  await expect(
+    harness.window.FormBridge.applyPrefill({
+      policies: { photo: "lock-when-available" },
+      values: { photo: "https://example.test/image.png" },
+    })
+  ).resolves.toEqual({
+    applied: [],
+    failed: [],
+    skipped: ["photo"],
+  });
+  expect(mutationCount).toBe(0);
 });
 test("applies a saved scalar response and reports Thai action status", async () => {
   const createMutableControl = ({ kind, tag, items = [] }) => {
@@ -1151,11 +1196,42 @@ test("configures the selected field with exact schema pointers and policy", asyn
   });
   expect(JSON.parse(harness.requests[3].body)).toEqual({
     documentKey: "document-key",
-    previousTag: null,
     prefillPointer: pointer,
     prefillPolicy: "lock-when-available",
+    previousTag: null,
     required: true,
     tag: pointer,
+  });
+});
+test("keeps native picture fields embedded and outside prefill configuration", async () => {
+  const harness = createHarness({
+    action: "template-edit",
+    capabilityResponses: ["picture-field-capability"],
+    responses: [
+      {
+        rules: [
+          {
+            prefillPointer: "/photo",
+            prefillPolicy: "lock-when-available",
+            required: true,
+            tag: "photo",
+          },
+        ],
+      },
+    ],
+    selection: selectedControl("photo", "picture", "picture-control"),
+  });
+  acknowledgeBridge(harness);
+  await flushPlugin();
+
+  expect(harness.element("field-picture-help").hidden).toBe(false);
+  expect(harness.element("field-prefill-policy").disabled).toBe(true);
+  expect(harness.element("field-schema-query").disabled).toBe(true);
+  expect(harness.window.FormBridge.getPanelState()).toMatchObject({
+    currentPointer: null,
+    prefillPolicy: "editable",
+    required: true,
+    selection: { controlType: "picture", tag: "photo" },
   });
 });
 
