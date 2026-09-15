@@ -31,6 +31,7 @@ const ReceiptRoute = () => {
   const { submissionId } = useParams({ from: "/receipt/$submissionId" });
   const [submission, setSubmission] = useState<Submission | null>(null);
   const [data, setData] = useState<Record<string, unknown> | null>(null);
+  const [returnUrl, setReturnUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -39,12 +40,14 @@ const ReceiptRoute = () => {
     const loadReceipt = async () => {
       try {
         const payload = await apiGet<{
-          submission: Submission;
           data: Record<string, unknown>;
+          returnUrl: string;
+          submission: Submission;
         }>(`/api/submissions/${submissionId}/data`);
         if (!cancelled) {
-          setSubmission(payload.submission);
           setData(payload.data);
+          setReturnUrl(payload.returnUrl);
+          setSubmission(payload.submission);
         }
       } catch (caughtError) {
         if (!cancelled) {
@@ -164,6 +167,14 @@ const ReceiptRoute = () => {
               <Download size={15} />
               ดาวน์โหลด PDF
             </button>
+            {returnUrl ? (
+              <a
+                href={returnUrl}
+                className="inline-flex min-h-10 items-center rounded-[10px] border border-[var(--line-strong)] bg-[var(--paper)] px-3 text-sm font-semibold hover:border-[var(--ink)]"
+              >
+                กลับไปยังระบบต้นทาง
+              </a>
+            ) : null}
           </div>
           <div className="p-5 sm:p-7">
             <div className="mb-4 flex items-center gap-2">

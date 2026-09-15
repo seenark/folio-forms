@@ -29,8 +29,13 @@ export interface ExternalPrefillHandoffInput {
   values: JsonRecord;
 }
 
+export interface ExternalPrefillStatusInput {
+  externalReference: string;
+}
+
 export interface FolioHandoffConnector {
   createHandoff: (input: ExternalPrefillHandoffInput) => Promise<Response>;
+  getStatus: (input: ExternalPrefillStatusInput) => Promise<Response>;
 }
 
 export interface PrefillMockHandlerOptions {
@@ -112,35 +117,51 @@ export const createPrefillMockHandler =
         ? launchForm(options.folioOrigin, code)
         : Response.json({ error: "invalid_request" }, { status: 400 });
     }
+    if (request.method === "POST" && url.pathname === "/status") {
+      const input = jsonObject(await request.json());
+      if (!input) {
+        return Response.json({ error: "invalid_request" }, { status: 400 });
+      }
+      return options.connector.getStatus(
+        input as unknown as ExternalPrefillStatusInput
+      );
+    }
     return Response.json({ error: "not_found" }, { status: 404 });
   };
 
 export const createFetchFolioConnector = (
   folioOrigin: string,
   secret: string
-): FolioHandoffConnector => ({
-  createHandoff: (input) =>
-    fetch(
-      `${folioOrigin.replace(/\/$/u, "")}/api/integrations/prefill/handoffs`,
-      {
+): FolioHandoffConnector => {
+  const origin = folioOrigin.replace(/\/$/u, "");
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Prefill-Handoff-Secret": secret,
+  };
+  return {
+    createHandoff: (input) =>
+      fetch(`${origin}/api/integrations/prefill/handoffs`, {
         body: JSON.stringify(input),
-        headers: {
-          "Content-Type": "application/json",
-          "X-Prefill-Handoff-Secret": secret,
-        },
+        headers,
         method: "POST",
-      }
-    ),
-});
+      }),
+    getStatus: (input) =>
+      fetch(`${origin}/api/integrations/prefill/status`, {
+        body: JSON.stringify(input),
+        headers,
+        method: "POST",
+      }),
+  };
+};
 
 export const createInProcessFolioConnector = (
   handle: (request: Request) => Response | Promise<Response>,
   secret: string
-): FolioHandoffConnector => ({
-  createHandoff: (input) =>
+): FolioHandoffConnector => {
+  const request = (path: string, input: object) =>
     Promise.resolve(
       handle(
-        new Request("http://folio.local/api/integrations/prefill/handoffs", {
+        new Request(`http://folio.local${path}`, {
           body: JSON.stringify(input),
           headers: {
             "Content-Type": "application/json",
@@ -149,8 +170,13 @@ export const createInProcessFolioConnector = (
           method: "POST",
         })
       )
-    ),
-});
+    );
+  return {
+    createHandoff: (input) =>
+      request("/api/integrations/prefill/handoffs", input),
+    getStatus: (input) => request("/api/integrations/prefill/status", input),
+  };
+};
 
 export const startPrefillMock = (
   options: PrefillMockHandlerOptions & { port?: number }

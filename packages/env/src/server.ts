@@ -62,6 +62,8 @@ export const env = createEnv({
 
     PREFILL_HANDOFF_SECRET: z.string().min(32),
 
+    PREFILL_RETURN_URL: z.url().default("http://localhost:3010/return"),
+
     RUSTFS_ACCESS_KEY_ID: z.string().min(1),
 
     RUSTFS_BUCKET: z.string().min(1),

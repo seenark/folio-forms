@@ -382,13 +382,13 @@ model Correction {
 
 model Handoff {
   id                      String        @id @default(uuid()) @db.Uuid
-  formId                  String        @map("form_id") @db.Uuid
+  formId                  String?       @map("form_id") @db.Uuid
   responseId              String?       @map("response_id") @db.Uuid
   normalizedEmail         String?       @map("normalized_email")
   externalReferenceDigest String        @map("external_reference_digest")
   codeDigest              String?       @unique @map("code_digest")
   filteredValues          Json?         @map("filtered_values")
-  configurationHash       String        @map("configuration_hash")
+  configurationHash       String?       @map("configuration_hash")
   status                  HandoffStatus @default(pending)
   expiresAt               DateTime      @map("expires_at") @db.Timestamptz(3)
   reservedAt              DateTime?     @map("reserved_at") @db.Timestamptz(3)
@@ -396,7 +396,7 @@ model Handoff {
   createdAt               DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt               DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  form         Form          @relation(fields: [formId], references: [id], onDelete: Restrict)
+  form         Form?         @relation(fields: [formId], references: [id], onDelete: SetNull)
   response     Response?     @relation(fields: [responseId], references: [id], onDelete: SetNull)
   pendingClaim PendingClaim?
 

@@ -75,6 +75,19 @@ function originOf(value: string): string | null {
     return null;
   }
 }
+function configuredPrefillReturnUrl(value: string): string {
+  const url = new URL(value);
+  if (
+    !["http:", "https:"].includes(url.protocol) ||
+    url.username ||
+    url.password
+  ) {
+    throw new Error(
+      "PREFILL_RETURN_URL must be an HTTP(S) URL without credentials"
+    );
+  }
+  return url.toString();
+}
 
 const pluginDir = path.resolve(import.meta.dirname, "../../onlyoffice-plugin");
 const fallbackTemplatePath = path.resolve(
@@ -90,6 +103,7 @@ const callbackClaimLifetimeSeconds = 5 * 60;
 const objectCleanupIntentGraceMs = 15 * 60_000;
 const handoffCodeLifetimeMs = 120_000;
 const pendingClaimLifetimeSeconds = 10 * 60;
+const handoffExpirySweepBatchSize = 100;
 const handoffCodeMaximumLength = 256;
 const handoffExternalReferenceMaximumLength = 512;
 const prefillHandoffBodyMaximumBytes = 512 * 1024;
@@ -285,7 +299,7 @@ function flattenExternalSchema(
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return items;
   }
-  for (const key of Object.keys(value).sort()) {
+  for (const key of Object.keys(value).toSorted()) {
     const pointer = `${parentPointer}/${externalSchemaPointerSegment(key)}`;
     flattenExternalSchema(
       (value as Record<string, unknown>)[key],
@@ -490,6 +504,7 @@ export interface AppOptions {
   onlyOfficeCallbackOrigins?: readonly string[];
   onlyOfficeCallbackMaxBytes?: number;
   prefillHandoffSecret?: string;
+  prefillReturnUrl?: string;
   requestIp?: (request: Request) => string | null | undefined;
 }
 
@@ -1123,6 +1138,19 @@ function handoffCreateInput(input: JsonRecord): PrefillHandoffCreateInput {
     externalReference: handoffExternalReference(input.externalReference),
     publicId: input.publicId,
     values,
+  };
+}
+function handoffStatusInput(input: JsonRecord): {
+  externalReference: string;
+} {
+  if (
+    Object.keys(input).length !== 1 ||
+    Object.keys(input)[0] !== "externalReference"
+  ) {
+    fail(400, "invalid_request", "externalReference is required");
+  }
+  return {
+    externalReference: handoffExternalReference(input.externalReference),
   };
 }
 
@@ -3899,10 +3927,59 @@ async function consumeCallbackClaim(
   });
   return existing?.consumedAt ? "replayed" : "invalid";
 }
+async function expireDuePrefillHandoffs(now: Date): Promise<void> {
+  await prisma.$transaction(async (tx) => {
+    const dueHandoffs = await tx.$queryRaw<{ id: string }[]>(
+      Prisma.sql`
+        SELECT "id"
+        FROM "handoffs"
+        WHERE "status" IN ('pending', 'reserved')
+          AND "expires_at" <= ${now}
+        ORDER BY "expires_at" ASC
+        LIMIT ${handoffExpirySweepBatchSize}
+      `
+    );
+    if (dueHandoffs.length === 0) {
+      return;
+    }
+    for (const handoff of dueHandoffs) {
+      await tx.$queryRaw<{ id: string }[]>(
+        Prisma.sql`
+          SELECT "id"
+          FROM "pending_claims"
+          WHERE "handoff_id" = ${handoff.id}::uuid
+          FOR UPDATE
+        `
+      );
+      const expired = await tx.handoff.updateMany({
+        data: {
+          codeDigest: null,
+          configurationHash: null,
+          filteredValues: Prisma.JsonNull,
+          formId: null,
+          normalizedEmail: null,
+          responseId: null,
+          status: HandoffStatus.expired,
+        },
+        where: {
+          expiresAt: { lte: now },
+          id: handoff.id,
+          status: { in: [HandoffStatus.pending, HandoffStatus.reserved] },
+        },
+      });
+      if (expired.count === 1) {
+        await tx.pendingClaim.deleteMany({
+          where: { handoffId: handoff.id },
+        });
+      }
+    }
+  });
+}
 
 export async function reconcileRecoverableState(): Promise<void> {
   await drainObjectCleanupIntents();
   const now = new Date();
+  await expireDuePrefillHandoffs(now);
   const staleBefore = new Date(now.getTime() - operationTimeoutMs);
   await prisma.editorLease.deleteMany({
     where: {
@@ -5034,7 +5111,7 @@ async function launchPrefillHandoff(
         const handoff = await tx.handoff.findUnique({
           where: { id: lockedHandoff.id },
         });
-        const form = handoff
+        const form = handoff?.formId
           ? await tx.form.findUnique({
               include: {
                 publishedTemplate: {
@@ -5397,6 +5474,269 @@ async function redeemPrefillHandoff(
     throw normalizedError;
   }
 }
+async function consumeSubmittedPrefillHandoff(
+  form: FormWithDocuments,
+  identity: Identity,
+  claimToken: string,
+  responseId: string,
+  clock: () => Date = () => new Date()
+): Promise<void> {
+  const claimDigest = tokenDigest(claimToken);
+  try {
+    await prisma.$transaction(
+      async (tx) => {
+        const [lockedForm] = await tx.$queryRaw<{ id: string }[]>(
+          Prisma.sql`
+          SELECT "id"
+          FROM "forms"
+          WHERE "id" = ${form.id}::uuid
+          FOR UPDATE
+        `
+        );
+        if (!lockedForm) {
+          handoffUnavailable();
+        }
+        const currentForm = await tx.form.findUnique({
+          include: {
+            publishedTemplate: {
+              include: { prefillConfiguration: { include: { fields: true } } },
+            },
+          },
+          where: { id: lockedForm.id },
+        });
+        const configuration = publishedPrefillConfiguration(currentForm);
+        const currentTemplate = currentForm?.publishedTemplate;
+        const [lockedClaim] = await tx.$queryRaw<{ id: string }[]>(
+          Prisma.sql`
+          SELECT "id"
+          FROM "pending_claims"
+          WHERE "claim_digest" = ${claimDigest}
+          FOR UPDATE
+        `
+        );
+        if (!lockedClaim) {
+          handoffUnavailable();
+        }
+        const pendingClaim = await tx.pendingClaim.findUnique({
+          include: { handoff: true },
+          where: { id: lockedClaim.id },
+        });
+        const handoff = pendingClaim?.handoff;
+        const currentResponse = await tx.response.findUnique({
+          select: { id: true, status: true },
+          where: { id: responseId },
+        });
+        const now = clock();
+        if (
+          !currentForm ||
+          currentForm.publicId !== form.publicId ||
+          !currentTemplate ||
+          !configuration ||
+          !currentResponse ||
+          currentResponse.status !== ResponseStatus.submitted ||
+          currentResponse.id !== responseId ||
+          !pendingClaim ||
+          !handoff ||
+          pendingClaim.consumedAt ||
+          pendingClaim.expiresAt <= now ||
+          handoff.formId !== currentForm.id ||
+          handoff.responseId ||
+          handoff.status !== HandoffStatus.reserved ||
+          handoff.consumedAt ||
+          handoff.expiresAt <= now ||
+          handoff.normalizedEmail !== normalizeEmail(identity.email) ||
+          handoff.configurationHash !== configuration.configurationHash ||
+          configuration.publishedTemplateId !== currentTemplate.id ||
+          configuration.configurationHash !== currentTemplate.contentHash
+        ) {
+          handoffUnavailable();
+        }
+        const consumedClaim = await tx.pendingClaim.updateMany({
+          data: { consumedAt: now },
+          where: {
+            consumedAt: null,
+            expiresAt: { gt: now },
+            id: pendingClaim.id,
+          },
+        });
+        if (consumedClaim.count !== 1) {
+          handoffUnavailable();
+        }
+        const consumedHandoff = await tx.handoff.updateMany({
+          data: {
+            consumedAt: now,
+            responseId,
+            status: HandoffStatus.consumed,
+          },
+          where: {
+            consumedAt: null,
+            expiresAt: { gt: now },
+            id: handoff.id,
+            responseId: null,
+            status: HandoffStatus.reserved,
+          },
+        });
+        if (consumedHandoff.count !== 1) {
+          handoffUnavailable();
+        }
+        await createFormAudit(tx, {
+          action: "redeem_handoff",
+          actorId: identity.id,
+          outcome: AuditOutcome.success,
+          safeMetadata: {},
+          targetId: currentForm.publicId,
+        });
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    );
+  } catch (error) {
+    const normalizedError =
+      databaseErrorCode(error) === "P2002" || isSerializationConflict(error)
+        ? new HttpError(
+            409,
+            "handoff_unavailable",
+            "The prefill handoff is unavailable"
+          )
+        : error;
+    try {
+      await createFormFailureAudit({
+        action: "redeem_handoff",
+        actorId: identity.id,
+        error: normalizedError,
+        targetId: publicIdPattern.test(form.publicId) ? form.publicId : null,
+      });
+    } catch {
+      // Preserve the retryable response if the failure audit cannot be written.
+    }
+    throw normalizedError;
+  }
+}
+
+type ExternalPrefillStatus =
+  | "deleted"
+  | "draft"
+  | "expired"
+  | "pending"
+  | "submitted";
+
+function externalPrefillStatus(handoff: {
+  consumedAt: Date | null;
+  createdAt: Date;
+  expiresAt: Date;
+  reservedAt: Date | null;
+  status: HandoffStatus;
+  updatedAt: Date;
+  response?: {
+    corrections: { revision: number }[];
+    status: ResponseStatus;
+    submission: { createdAt: Date } | null;
+  } | null;
+}): {
+  consumedAt: string | null;
+  createdAt: string;
+  expiresAt: string;
+  latestCorrectionNumber: number | null;
+  reservedAt: string | null;
+  status: ExternalPrefillStatus;
+  submittedAt: string | null;
+  updatedAt: string;
+} {
+  const status =
+    handoff.status === HandoffStatus.deleted
+      ? "deleted"
+      : handoff.status === HandoffStatus.expired
+        ? "expired"
+        : handoff.response?.status === ResponseStatus.submitted
+          ? "submitted"
+          : handoff.response
+            ? "draft"
+            : "pending";
+  return {
+    consumedAt: handoff.consumedAt?.toISOString() ?? null,
+    createdAt: handoff.createdAt.toISOString(),
+    expiresAt: handoff.expiresAt.toISOString(),
+    latestCorrectionNumber: handoff.response?.corrections[0]?.revision ?? null,
+    reservedAt: handoff.reservedAt?.toISOString() ?? null,
+    status,
+    submittedAt: handoff.response?.submission?.createdAt.toISOString() ?? null,
+    updatedAt: handoff.updatedAt.toISOString(),
+  };
+}
+
+async function pollPrefillHandoffStatus(
+  externalReference: string,
+  clock: () => Date = () => new Date()
+): Promise<ReturnType<typeof externalPrefillStatus>> {
+  const relations = {
+    response: {
+      select: {
+        corrections: {
+          orderBy: { revision: "desc" as const },
+          select: { revision: true },
+          take: 1,
+        },
+        status: true,
+        submission: { select: { createdAt: true } },
+      },
+    },
+  } as const;
+  const externalReferenceDigest = tokenDigest(externalReference);
+  const handoff = await prisma.$transaction(async (tx) => {
+    const current = await tx.handoff.findFirst({
+      include: relations,
+      orderBy: { createdAt: "desc" },
+      where: { externalReferenceDigest },
+    });
+    if (!current) {
+      handoffUnavailable();
+    }
+    const now = clock();
+    if (
+      (current.status === HandoffStatus.pending ||
+        current.status === HandoffStatus.reserved) &&
+      current.expiresAt <= now
+    ) {
+      await tx.$queryRaw<{ id: string }[]>(
+        Prisma.sql`
+          SELECT "id"
+          FROM "pending_claims"
+          WHERE "handoff_id" = ${current.id}::uuid
+          FOR UPDATE
+        `
+      );
+      const expired = await tx.handoff.updateMany({
+        data: {
+          codeDigest: null,
+          configurationHash: null,
+          filteredValues: Prisma.JsonNull,
+          formId: null,
+          normalizedEmail: null,
+          responseId: null,
+          status: HandoffStatus.expired,
+        },
+        where: {
+          expiresAt: { lte: now },
+          id: current.id,
+          status: { in: [HandoffStatus.pending, HandoffStatus.reserved] },
+        },
+      });
+      if (expired.count === 1) {
+        await tx.pendingClaim.deleteMany({ where: { handoffId: current.id } });
+      }
+      const refreshed = await tx.handoff.findUnique({
+        include: relations,
+        where: { id: current.id },
+      });
+      if (!refreshed) {
+        handoffUnavailable();
+      }
+      return refreshed;
+    }
+    return current;
+  });
+  return externalPrefillStatus(handoff);
+}
+
 async function findOwnedResponse(
   responseId: string,
   formId: string,
@@ -5521,6 +5861,9 @@ export function createApp(options: AppOptions = {}) {
     options.onlyOfficeCallbackMaxBytes ?? maxCallbackDocumentBytes;
   const prefillHandoffSecret =
     options.prefillHandoffSecret ?? env.PREFILL_HANDOFF_SECRET;
+  const prefillReturnUrl = configuredPrefillReturnUrl(
+    options.prefillReturnUrl ?? env.PREFILL_RETURN_URL
+  );
   const handoffClock = options.clock ?? (() => new Date());
   return new Elysia()
     .onError(({ error, set }) => {
@@ -5585,6 +5928,34 @@ export function createApp(options: AppOptions = {}) {
         return await createPrefillHandoff(handoffCreateInput(asRecord(body)));
       } catch (error) {
         if (error instanceof HttpError && error.code === "not_found") {
+          fail(
+            404,
+            "handoff_unavailable",
+            "The prefill handoff is unavailable"
+          );
+        }
+        throw error;
+      }
+    })
+    .post("/api/integrations/prefill/status", async ({ body, request }) => {
+      if (
+        !prefillHandoffSecretMatches(
+          prefillHandoffSecret,
+          request.headers.get("x-prefill-handoff-secret")
+        )
+      ) {
+        fail(404, "handoff_unavailable", "The prefill handoff is unavailable");
+      }
+      try {
+        return await pollPrefillHandoffStatus(
+          handoffStatusInput(asRecord(body)).externalReference,
+          handoffClock
+        );
+      } catch (error) {
+        if (
+          error instanceof HttpError &&
+          error.code === "handoff_unavailable"
+        ) {
           fail(
             404,
             "handoff_unavailable",
@@ -7286,6 +7657,21 @@ export function createApp(options: AppOptions = {}) {
         );
       }
       if (existing?.status === ResponseStatus.submitted) {
+        if (pendingClaimToken) {
+          try {
+            await consumeSubmittedPrefillHandoff(
+              form,
+              identity,
+              pendingClaimToken,
+              existing.id,
+              handoffClock
+            );
+            set.headers["Set-Cookie"] = pendingClaimCookie("", 0);
+          } catch (error) {
+            set.headers["Set-Cookie"] = pendingClaimCookie("", 0);
+            throw error;
+          }
+        }
         if (!existing.submission) {
           fail(500, "internal_error", "The submitted receipt is unavailable");
         }
@@ -8045,6 +8431,7 @@ export function createApp(options: AppOptions = {}) {
       canReadSubmission(identity, submission);
       return {
         data: jsonRecord(submission.data),
+        returnUrl: prefillReturnUrl,
         submission: submissionSummary(submission, {
           formPublicId: submission.form.publicId,
           formTitle: submission.form.title,
@@ -8063,7 +8450,7 @@ export function createApp(options: AppOptions = {}) {
         fail(404, "not_found", "Submission was not found");
       }
       canReadSubmission(identity, submission);
-      return new Response(JSON.stringify(jsonRecord(submission.data)), {
+      return Response.json(jsonRecord(submission.data), {
         headers: {
           "Content-Disposition": `attachment; filename="submission-${submission.id}.json"`,
           "Content-Type": "application/json; charset=utf-8",

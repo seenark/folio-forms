@@ -49,6 +49,7 @@ const app = createApp({
       Promise.resolve(new TextEncoder().encode("%PDF-test")),
     forceSave: () => Promise.resolve(false),
   },
+  prefillReturnUrl: "https://source.example.test/forms/return",
   requestIp: (request) => request.headers.get("x-test-ip"),
 });
 
@@ -2944,6 +2945,79 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(handoffRecord.filteredValues).toEqual({
     full_name: selectedPointer.endsWith("/active") ? true : "Ticket 17 Prefill",
   });
+  const pendingStatusResponse = await fetch(`${mock.url}/status`, {
+    body: JSON.stringify({ externalReference: handoffExternalReference }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(pendingStatusResponse.status).toBe(200);
+  const pendingStatusBody = (await pendingStatusResponse.json()) as Record<
+    string,
+    unknown
+  >;
+  expect(Object.keys(pendingStatusBody).toSorted()).toEqual([
+    "consumedAt",
+    "createdAt",
+    "expiresAt",
+    "latestCorrectionNumber",
+    "reservedAt",
+    "status",
+    "submittedAt",
+    "updatedAt",
+  ]);
+  expect(pendingStatusBody).toMatchObject({
+    latestCorrectionNumber: null,
+    reservedAt: null,
+    status: "pending",
+    submittedAt: null,
+  });
+  expect(JSON.stringify(pendingStatusBody)).not.toContain(userEmail);
+  expect(JSON.stringify(pendingStatusBody)).not.toContain("Ticket 17 Prefill");
+  const unknownStatusResponse = await fetch(`${mock.url}/status`, {
+    body: JSON.stringify({
+      externalReference: `ticket-19-unknown-${crypto.randomUUID()}`,
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(unknownStatusResponse.status).toBe(404);
+  expect(await unknownStatusResponse.json()).toMatchObject({
+    error: "handoff_unavailable",
+  });
+  const invalidStatusSecretResponse = await app.handle(
+    new Request("http://test.local/api/integrations/prefill/status", {
+      body: JSON.stringify({ externalReference: handoffExternalReference }),
+      headers: {
+        ...jsonHeaders,
+        "X-Prefill-Handoff-Secret": "wrong-secret",
+      },
+      method: "POST",
+    })
+  );
+  expect(invalidStatusSecretResponse.status).toBe(404);
+  expect(await invalidStatusSecretResponse.json()).toMatchObject({
+    error: "handoff_unavailable",
+  });
+  const handoffReturnOverride = await app.handle(
+    new Request("http://test.local/api/integrations/prefill/handoffs", {
+      body: JSON.stringify({
+        email: userEmail,
+        externalReference: `ticket-19-return-override-${crypto.randomUUID()}`,
+        publicId: formRecord.publicId,
+        returnUrl: "https://attacker.example.test",
+        values: handoffCandidateValues,
+      }),
+      headers: {
+        ...jsonHeaders,
+        "X-Prefill-Handoff-Secret": prefillHandoffSecret,
+      },
+      method: "POST",
+    })
+  );
+  expect(handoffReturnOverride.status).toBe(400);
+  expect(await handoffReturnOverride.json()).toMatchObject({
+    error: "invalid_request",
+  });
   const getLaunchResponse = await app.handle(
     new Request(
       `http://test.local${handoffCreateBody.launchPath}?code=${handoffCreateBody.code}`
@@ -3057,6 +3131,17 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   });
   expect(redeemedHandoffRecord.status).toBe("consumed");
   expect(redeemedHandoffRecord.responseId).toBe(handoffResponseId);
+  const draftStatusResponse = await fetch(`${mock.url}/status`, {
+    body: JSON.stringify({ externalReference: handoffExternalReference }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(draftStatusResponse.status).toBe(200);
+  expect(await draftStatusResponse.json()).toMatchObject({
+    latestCorrectionNumber: null,
+    status: "draft",
+    submittedAt: null,
+  });
   const reentryExternalReference = `ticket-18-reentry-${crypto.randomUUID()}`;
   const reentryCreateResponse = await fetch(`${mock.url}/handoffs`, {
     body: JSON.stringify({
@@ -3229,6 +3314,16 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     })
   );
   expect(discardedMissingValue.status).toBe(200);
+  const deletedStatusResponse = await fetch(`${mock.url}/status`, {
+    body: JSON.stringify({ externalReference: missingValueReference }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(deletedStatusResponse.status).toBe(200);
+  expect(await deletedStatusResponse.json()).toMatchObject({
+    status: "deleted",
+    submittedAt: null,
+  });
   const malformedValueCreate = await fetch(`${mock.url}/handoffs`, {
     body: JSON.stringify({
       email: ` ${missingValueEmail.toUpperCase()} `,
@@ -3509,10 +3604,11 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   );
   expect(discardedMandatory.status).toBe(200);
 
+  const expiredExternalReference = `ticket-17-expired-${crypto.randomUUID()}`;
   const expiredCreate = await fetch(`${mock.url}/handoffs`, {
     body: JSON.stringify({
       email: userEmail,
-      externalReference: `ticket-17-expired-${crypto.randomUUID()}`,
+      externalReference: expiredExternalReference,
       publicId: formRecord.publicId,
       values: handoffCandidateValues,
     }),
@@ -3551,6 +3647,133 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(expiredLaunch.headers.get("location")).toBe(
     "/handoff?error=handoff_unavailable"
   );
+  await reconcileRecoverableState();
+  const purgedExpiredRecord = await prisma.handoff.findUniqueOrThrow({
+    select: {
+      configurationHash: true,
+      consumedAt: true,
+      createdAt: true,
+      expiresAt: true,
+      externalReferenceDigest: true,
+      filteredValues: true,
+      formId: true,
+      id: true,
+      normalizedEmail: true,
+      reservedAt: true,
+      responseId: true,
+      status: true,
+      updatedAt: true,
+    },
+    where: { id: expiredRecord.id },
+  });
+  expect(purgedExpiredRecord).toEqual({
+    configurationHash: null,
+    consumedAt: null,
+    createdAt: expiredRecord.createdAt,
+    expiresAt: new Date(expiredRecord.createdAt.getTime() + 1),
+    externalReferenceDigest: createHash("sha256")
+      .update(expiredExternalReference)
+      .digest("hex"),
+    filteredValues: null,
+    formId: null,
+    id: expiredRecord.id,
+    normalizedEmail: null,
+    reservedAt: null,
+    responseId: null,
+    status: "expired",
+    updatedAt: expect.any(Date),
+  });
+  expect(
+    await prisma.pendingClaim.count({ where: { handoffId: expiredRecord.id } })
+  ).toBe(0);
+  const expiredStatusResponse = await fetch(`${mock.url}/status`, {
+    body: JSON.stringify({ externalReference: expiredExternalReference }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(expiredStatusResponse.status).toBe(200);
+  expect(await expiredStatusResponse.json()).toMatchObject({
+    status: "expired",
+    submittedAt: null,
+  });
+  const raceExternalReference = `ticket-19-expiry-race-${crypto.randomUUID()}`;
+  const raceCreate = await fetch(`${mock.url}/handoffs`, {
+    body: JSON.stringify({
+      email: userEmail,
+      externalReference: raceExternalReference,
+      publicId: formRecord.publicId,
+      values: handoffCandidateValues,
+    }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(raceCreate.status).toBe(200);
+  const raceCode = ((await raceCreate.json()) as { code: string }).code;
+  const raceLaunch = await app.handle(
+    new Request("http://test.local/prefill/handoff", {
+      body: new URLSearchParams({ code: raceCode }),
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+      },
+      method: "POST",
+    })
+  );
+  const raceCookie = raceLaunch.headers.get("set-cookie")?.split(";", 1)[0];
+  if (!raceCookie) {
+    throw new Error("The expiry-race handoff did not set a cookie");
+  }
+  const raceHandoff = await prisma.handoff.findFirstOrThrow({
+    where: {
+      externalReferenceDigest: createHash("sha256")
+        .update(raceExternalReference)
+        .digest("hex"),
+    },
+  });
+  await prisma.handoff.update({
+    data: { expiresAt: new Date(Date.now() - 1) },
+    where: { id: raceHandoff.id },
+  });
+  const [raceStatus, , raceRedeem] = await Promise.all([
+    fetch(`${mock.url}/status`, {
+      body: JSON.stringify({ externalReference: raceExternalReference }),
+      headers: jsonHeaders,
+      method: "POST",
+    }),
+    reconcileRecoverableState(),
+    app.handle(
+      new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+        headers: {
+          Authorization: `Bearer ${userBearer}`,
+          Cookie: raceCookie,
+        },
+        method: "POST",
+      })
+    ),
+  ]);
+  expect(raceStatus.status).toBe(200);
+  expect(await raceStatus.json()).toMatchObject({ status: "expired" });
+  expect(raceRedeem.status).toBe(409);
+  const raceRedeemError = ((await raceRedeem.json()) as { error?: unknown })
+    .error;
+  if (typeof raceRedeemError !== "string") {
+    throw new TypeError("The expiry-race redeem did not return an error code");
+  }
+  expect(["handoff_unavailable", "prefill_required"]).toContain(
+    raceRedeemError
+  );
+  expect(
+    await prisma.pendingClaim.count({ where: { handoffId: raceHandoff.id } })
+  ).toBe(0);
+  expect(
+    await prisma.handoff.findUniqueOrThrow({ where: { id: raceHandoff.id } })
+  ).toMatchObject({
+    codeDigest: null,
+    filteredValues: null,
+    normalizedEmail: null,
+    status: "expired",
+  });
   const malformedLaunch = await app.handle(
     new Request("http://test.local/prefill/handoff", {
       body: JSON.stringify({ code: handoffCreateBody.code }),
@@ -4476,6 +4699,7 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     { data: { accept_terms: "true" }, status: 422 },
     { data: { department: "not-an-option" }, status: 422 },
     { data: { start_date: "2026-02-30" }, status: 422 },
+    { data: { description_1: "x".repeat(10_001) }, status: 422 },
     { data: { description_1: "🙂".repeat(100_000) }, status: 413 },
   ];
   for (const invalidDraftCase of invalidDraftCases) {
@@ -4533,10 +4757,11 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     { "X-Editor-Capability": oversizedClientValueBody.operationCapability }
   );
   expect(oversizedClientValueOperation.status).toBe("completed");
-  const normalizedClientTamperResponse = await prisma.response.findUniqueOrThrow({
-    select: { draftData: true },
-    where: { id: responseId },
-  });
+  const normalizedClientTamperResponse =
+    await prisma.response.findUniqueOrThrow({
+      select: { draftData: true },
+      where: { id: responseId },
+    });
   expect(normalizedClientTamperResponse.draftData).toEqual({
     full_name: trustedPrefillValue,
   });
@@ -4840,21 +5065,41 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       where: { formId, userId },
     })
   ).toBe(1);
+  const postSubmitUnarchive = await app.handle(
+    new Request(`http://test.local/api/admin/forms/${formPublicId}`, {
+      body: JSON.stringify({ status: "published" }),
+      headers: { ...jsonHeaders, Authorization: `Bearer ${adminBearer}` },
+      method: "PATCH",
+    })
+  );
+  expect(postSubmitUnarchive.status).toBe(200);
+  const postSubmitUnarchiveBody = (await postSubmitUnarchive.json()) as {
+    form?: { publicId?: string; status?: string };
+  };
+  expect(postSubmitUnarchiveBody.form).toMatchObject({
+    publicId: formPublicId,
+    status: "published",
+  });
+  const postSubmitExternalReference = `ticket-17-post-submit-${crypto.randomUUID()}`;
   const postSubmitHandoffCreate = await fetch(`${mock.url}/handoffs`, {
     body: JSON.stringify({
       email: userEmail,
-      externalReference: `ticket-17-post-submit-${crypto.randomUUID()}`,
+      externalReference: postSubmitExternalReference,
       publicId: formRecord.publicId,
       values: handoffCandidateValues,
     }),
     headers: jsonHeaders,
     method: "POST",
   });
+  expect(postSubmitHandoffCreate.status).toBe(200);
   const postSubmitCode = (
     (await postSubmitHandoffCreate.json()) as {
       code: string;
     }
   ).code;
+  if (!postSubmitCode) {
+    throw new Error("The post-submit handoff code was not created");
+  }
   const postSubmitLaunch = await app.handle(
     new Request("http://test.local/prefill/handoff", {
       body: new URLSearchParams({ code: postSubmitCode }),
@@ -4865,6 +5110,10 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       },
       method: "POST",
     })
+  );
+  expect(postSubmitLaunch.status).toBe(303);
+  expect(postSubmitLaunch.headers.get("location")).toBe(
+    `/forms/${formRecord.publicId}/fill`
   );
   const postSubmitCookie = postSubmitLaunch.headers
     .get("set-cookie")
@@ -4887,11 +5136,57 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     response: { id: responseId, status: "submitted" },
     submissionId: completedSubmissionId,
   });
+  expect(postSubmitStart.headers.get("set-cookie")).toContain("Max-Age=0");
+  const postSubmitHandoffRecord = await prisma.handoff.findFirstOrThrow({
+    where: {
+      externalReferenceDigest: createHash("sha256")
+        .update(postSubmitExternalReference)
+        .digest("hex"),
+    },
+  });
+  expect(postSubmitHandoffRecord).toMatchObject({
+    responseId,
+    status: "consumed",
+  });
   expect(
     await prisma.response.count({
       where: { formId, userId },
     })
   ).toBe(1);
+  const replayPostSubmitStart = await app.handle(
+    new Request(`http://test.local/api/forms/${formRecord.publicId}/start`, {
+      headers: {
+        Authorization: `Bearer ${userBearer}`,
+        Cookie: postSubmitCookie,
+      },
+      method: "POST",
+    })
+  );
+  expect(replayPostSubmitStart.status).toBe(409);
+  expect(await replayPostSubmitStart.json()).toMatchObject({
+    error: "handoff_unavailable",
+  });
+  expect(
+    await prisma.auditEvent.findFirst({
+      orderBy: { createdAt: "desc" },
+      where: {
+        action: "redeem_handoff",
+        outcome: "failure",
+        targetId: formPublicId,
+      },
+    })
+  ).toMatchObject({ targetId: formPublicId });
+  const submittedStatusResponse = await fetch(`${mock.url}/status`, {
+    body: JSON.stringify({ externalReference: postSubmitExternalReference }),
+    headers: jsonHeaders,
+    method: "POST",
+  });
+  expect(submittedStatusResponse.status).toBe(200);
+  expect(await submittedStatusResponse.json()).toMatchObject({
+    latestCorrectionNumber: null,
+    status: "submitted",
+    submittedAt: expect.any(String),
+  });
   const immutableDraftResponse = await draftRequest(savedDraftData);
   expect(immutableDraftResponse.status).toBe(409);
   expect(await immutableDraftResponse.json()).toMatchObject({
@@ -4971,10 +5266,12 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(dataResponse.status).toBe(200);
   const dataBody = (await dataResponse.json()) as {
     data: Record<string, unknown>;
+    returnUrl: string;
     submission: Record<string, unknown>;
   };
   expect(dataBody).toMatchObject({
     data: savedDraftData,
+    returnUrl: "https://source.example.test/forms/return",
     submission: { id: completedSubmissionId, responseId },
   });
   expect(dataBody.submission).not.toHaveProperty("userEmail");
