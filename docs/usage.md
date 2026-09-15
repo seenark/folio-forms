@@ -122,6 +122,7 @@ docker compose --env-file apps/server/.env -f compose.yaml up -d --build server
 ทุกความพยายามจัดการบัญชีจะเพิ่ม Audit Event แบบ immutable พร้อมผู้กระทำ เป้าหมาย เวลา Action และ Outcome โดยไม่เก็บรหัสผ่าน, password hash, token หรือ credential material
 
 การ **ลบบัญชีถาวร** ทำได้เมื่อบัญชีนั้นไม่มี `Response` หรือไฟล์ส่วนบุคคลค้างอยู่แล้วเท่านั้น ต้องลบ Response จากหน้า **ผลลัพธ์** ก่อน ระบบจะ revoke Session และล้างข้อมูลที่เกี่ยวข้องก่อนลบบัญชี ส่วนการ Disable ยังคง Response, Prefill และ Audit ไว้เพื่อการตรวจสอบภายหลัง
+หน้า **Audit Trail** ที่ `/admin/audit` เป็น read-only สำหรับ Admin เท่านั้น รองรับกรองตามช่วงเวลา, Actor ID, Action, Target ID และ Outcome พร้อม cursor pagination ลำดับเวลา/ID คงที่ Metadata ที่แสดงเป็น allowlist และไม่รวมค่า Field, Prefill, เอกสาร, token หรือ request body
 
 ### 2.2 สิทธิ์ของแต่ละ Role
 

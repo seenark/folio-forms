@@ -6,6 +6,7 @@ import {
   KeyRound,
   LogOut,
   Menu,
+  ScrollText,
   ShieldCheck,
   UserRound,
   UsersRound,
@@ -27,6 +28,7 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
   const formsAreActive =
     location.pathname === "/admin" ||
     location.pathname.startsWith("/admin/forms/");
+  const auditAreActive = location.pathname.startsWith("/admin/audit");
   const resultsAreActive = location.pathname.startsWith("/admin/results");
 
   const logout = async () => {
@@ -108,6 +110,19 @@ export const AppShell = ({ children }: { children: React.ReactNode }) => {
                 >
                   <ClipboardList className="mr-1 inline" size={15} />
                   ผลลัพธ์
+                </Link>
+                <Link
+                  to="/admin/audit"
+                  className={`rounded-lg px-3 py-2 text-sm font-semibold text-[var(--ink-soft)] hover:bg-[var(--accent-soft)] ${
+                    auditAreActive
+                      ? "bg-[var(--accent-soft)] text-[var(--ink)]"
+                      : ""
+                  }`}
+                  aria-current={auditAreActive ? "page" : undefined}
+                  onClick={() => setOpen(false)}
+                >
+                  <ScrollText className="mr-1 inline" size={15} />
+                  Audit Trail
                 </Link>
                 <Link
                   to="/admin/users"

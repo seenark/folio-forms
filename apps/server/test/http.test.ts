@@ -8580,4 +8580,141 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
           "editor_in_use"
     )
   ).toBe(true);
+  const auditUnauthenticatedResponse = await app.handle(
+    new Request("http://test.local/api/admin/audit-events")
+  );
+  expect(auditUnauthenticatedResponse.status).toBe(401);
+  const auditUserBearer = await bearerFor(
+    otherUserEmail,
+    password,
+    `ticket-23-audit-user-${crypto.randomUUID()}`
+  );
+  const auditForbiddenResponse = await app.handle(
+    new Request("http://test.local/api/admin/audit-events", {
+      headers: { Authorization: `Bearer ${auditUserBearer}` },
+    })
+  );
+  expect(auditForbiddenResponse.status).toBe(403);
+  expect(await auditForbiddenResponse.json()).toMatchObject({
+    error: "forbidden",
+  });
+  const filteredAuditResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/audit-events?action=delete_response&target=${encodeURIComponent(pictureResponseId)}&outcome=success`,
+      { headers: { Authorization: `Bearer ${erasureAdminBearer}` } }
+    )
+  );
+  expect(filteredAuditResponse.status).toBe(200);
+  const filteredAuditBody = (await filteredAuditResponse.json()) as {
+    events?: {
+      action: string;
+      outcome: string;
+      safeMetadata: Record<string, unknown>;
+      targetId: string | null;
+    }[];
+    nextCursor?: string | null;
+  };
+  expect(filteredAuditBody.events).toHaveLength(1);
+  expect(filteredAuditBody.events?.[0]).toMatchObject({
+    action: "delete_response",
+    outcome: "success",
+    safeMetadata: {},
+    targetId: pictureResponseId,
+  });
+  const auditPageResponse = await app.handle(
+    new Request("http://test.local/api/admin/audit-events", {
+      headers: { Authorization: `Bearer ${erasureAdminBearer}` },
+    })
+  );
+  expect(auditPageResponse.status).toBe(200);
+  const auditPageBody = (await auditPageResponse.json()) as {
+    events?: {
+      action: string;
+      createdAt: string;
+      id: string;
+      safeMetadata: Record<string, unknown>;
+    }[];
+    nextCursor?: string | null;
+  };
+  if (!auditPageBody.events || auditPageBody.events.length === 0) {
+    throw new Error("The audit API returned no events");
+  }
+  for (let index = 1; index < auditPageBody.events.length; index += 1) {
+    const previous = auditPageBody.events[index - 1];
+    const current = auditPageBody.events[index];
+    if (!previous || !current) {
+      continue;
+    }
+    expect(
+      new Date(previous.createdAt).getTime() >=
+        new Date(current.createdAt).getTime()
+    ).toBe(true);
+  }
+  if (auditPageBody.nextCursor) {
+    const nextAuditPageResponse = await app.handle(
+      new Request(
+        `http://test.local/api/admin/audit-events?cursor=${encodeURIComponent(auditPageBody.nextCursor)}`,
+        { headers: { Authorization: `Bearer ${erasureAdminBearer}` } }
+      )
+    );
+    expect(nextAuditPageResponse.status).toBe(200);
+    const nextAuditPageBody = (await nextAuditPageResponse.json()) as {
+      events?: { id: string }[];
+    };
+    const auditPageIds = new Set(auditPageBody.events.map((event) => event.id));
+    for (const event of nextAuditPageBody.events ?? []) {
+      expect(auditPageIds.has(event.id)).toBe(false);
+    }
+  }
+  for (const invalidAuditQuery of [
+    "?actor=not-a-uuid",
+    "?from=2026-09-20T00:00:00.000Z&to=2026-09-19T00:00:00.000Z",
+  ]) {
+    const invalidAuditResponse = await app.handle(
+      new Request(
+        `http://test.local/api/admin/audit-events${invalidAuditQuery}`,
+        { headers: { Authorization: `Bearer ${erasureAdminBearer}` } }
+      )
+    );
+    expect(invalidAuditResponse.status).toBe(400);
+  }
+  const auditApiText = JSON.stringify({
+    events: auditPageBody.events,
+  });
+  for (const secret of [
+    adminBearer,
+    userBearer,
+    saveDraftCapability,
+    submitCapability,
+    postSubmitExternalReference,
+    savedDraftData,
+    password,
+    managedPassword,
+    resetPassword,
+  ]) {
+    expect(auditApiText).not.toContain(
+      typeof secret === "string" ? secret : JSON.stringify(secret)
+    );
+  }
+  let auditMutationBlocked = false;
+  const auditProbe = await prisma.auditEvent.findFirstOrThrow();
+  try {
+    await prisma.auditEvent.update({
+      data: { action: "tampered" },
+      where: { id: auditProbe.id },
+    });
+  } catch {
+    auditMutationBlocked = true;
+  }
+  expect(auditMutationBlocked).toBe(true);
+  let tombstoneMutationBlocked = false;
+  try {
+    await prisma.deletionTombstone.update({
+      data: { outcome: "failure" },
+      where: { responseLookupDigest: mainTombstone.responseLookupDigest },
+    });
+  } catch {
+    tombstoneMutationBlocked = true;
+  }
+  expect(tombstoneMutationBlocked).toBe(true);
 });

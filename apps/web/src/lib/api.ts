@@ -127,6 +127,22 @@ export interface AdminResultListResponse {
   nextCursor: string | null;
   results: AdminResult[];
 }
+export type AuditOutcome = "failure" | "success";
+export type AuditMetadataValue = boolean | number | string | null;
+export interface AdminAuditEvent {
+  action: string;
+  actorId: string | null;
+  createdAt: string;
+  id: string;
+  outcome: AuditOutcome;
+  safeMetadata: Record<string, AuditMetadataValue>;
+  targetId: string | null;
+  targetType: string;
+}
+export interface AdminAuditListResponse {
+  events: AdminAuditEvent[];
+  nextCursor: string | null;
+}
 export interface AdminResultDetail extends AdminResult {
   correction: {
     createdAt: string;

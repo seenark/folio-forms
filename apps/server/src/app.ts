@@ -142,6 +142,7 @@ const schemaPageSize = 5;
 const schemaQueryMaximumLength = 200;
 const accountUserPageSize = 20;
 const adminResultPageSize = 25;
+const auditEventPageSize = 50;
 const accountBodyMaximumBytes = 64 * 1024;
 const documentActionBodyMaximumBytes = 8 * 1024;
 const accountEmailMaximumLength = 254;
@@ -2117,6 +2118,103 @@ function adminResultDate(value: string | undefined, key: string): Date | null {
   }
   return date;
 }
+interface AuditEventCursor {
+  createdAt: Date;
+  id: string;
+}
+
+function auditEventCursor(value: string | undefined): AuditEventCursor | null {
+  if (value === undefined) {
+    return null;
+  }
+  try {
+    const decoded = JSON.parse(
+      Buffer.from(value, "base64url").toString("utf-8")
+    ) as { createdAt?: unknown; id?: unknown };
+    if (
+      typeof decoded.createdAt !== "string" ||
+      typeof decoded.id !== "string" ||
+      !idPattern.test(decoded.id)
+    ) {
+      fail(400, "invalid_request", "cursor is invalid");
+    }
+    const createdAt = new Date(decoded.createdAt);
+    if (!Number.isFinite(createdAt.getTime())) {
+      fail(400, "invalid_request", "cursor is invalid");
+    }
+    return { createdAt, id: decoded.id };
+  } catch {
+    fail(400, "invalid_request", "cursor is invalid");
+  }
+}
+
+function auditEventCursorValue(event: AuditEventCursor): string {
+  return Buffer.from(
+    JSON.stringify({
+      createdAt: event.createdAt.toISOString(),
+      id: event.id,
+    })
+  ).toString("base64url");
+}
+
+function auditFilterValue(
+  value: string | undefined,
+  key: string,
+  maximumLength: number
+): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > maximumLength) {
+    fail(400, "invalid_request", `${key} is invalid`);
+  }
+  return trimmed;
+}
+
+function auditOutcomeValue(
+  value: string | undefined
+): AuditOutcome | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value !== AuditOutcome.failure && value !== AuditOutcome.success) {
+    fail(400, "invalid_request", "outcome is invalid");
+  }
+  return value;
+}
+
+const auditMetadataKeys = new Set([
+  "change",
+  "errorCode",
+  "format",
+  "revision",
+  "source",
+  "sourcePublicId",
+  "state",
+  "status",
+]);
+
+function safeAuditMetadata(value: unknown): JsonRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  const source = value as JsonRecord;
+  const result: JsonRecord = {};
+  for (const key of auditMetadataKeys) {
+    const item = source[key];
+    if (
+      item === null ||
+      typeof item === "boolean" ||
+      typeof item === "number" ||
+      typeof item === "string"
+    ) {
+      result[key] = item;
+    }
+  }
+  return result;
+}
+
 function normalizedAccountEmail(value: string): string {
   const email = normalizeEmail(value);
   if (
@@ -8978,6 +9076,105 @@ export function createApp(options: AppOptions = {}) {
         };
       }
     )
+    .get("/api/admin/audit-events", async ({ request, query }) => {
+      const identity = await requireIdentity(request);
+      requireAdmin(identity);
+      const queryRecord = query as unknown as JsonRecord;
+      const cursor = auditEventCursor(queryString(queryRecord, "cursor"));
+      const actorId = auditFilterValue(
+        queryString(queryRecord, "actor"),
+        "actor",
+        64
+      );
+      const action = auditFilterValue(
+        queryString(queryRecord, "action"),
+        "action",
+        80
+      );
+      const targetId = auditFilterValue(
+        queryString(queryRecord, "target"),
+        "target",
+        200
+      );
+      const targetType = auditFilterValue(
+        queryString(queryRecord, "targetType"),
+        "targetType",
+        80
+      );
+      const outcome = auditOutcomeValue(queryString(queryRecord, "outcome"));
+      const from = adminResultDate(queryString(queryRecord, "from"), "from");
+      const to = adminResultDate(queryString(queryRecord, "to"), "to");
+      if (from && to && from > to) {
+        fail(400, "invalid_request", "from must be before to");
+      }
+      if (actorId && !idPattern.test(actorId)) {
+        fail(400, "invalid_request", "actor is invalid");
+      }
+      const and: Prisma.AuditEventWhereInput[] = [];
+      if (cursor) {
+        and.push({
+          OR: [
+            { createdAt: { lt: cursor.createdAt } },
+            { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+          ],
+        });
+      }
+      if (actorId) {
+        and.push({ actorId });
+      }
+      if (action) {
+        and.push({ action });
+      }
+      if (targetId) {
+        and.push({ targetId });
+      }
+      if (targetType) {
+        and.push({ targetType });
+      }
+      if (outcome) {
+        and.push({ outcome });
+      }
+      if (from || to) {
+        and.push({
+          createdAt: {
+            ...(from ? { gte: from } : {}),
+            ...(to ? { lte: to } : {}),
+          },
+        });
+      }
+      const events = await prisma.auditEvent.findMany({
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        select: {
+          action: true,
+          actorId: true,
+          createdAt: true,
+          id: true,
+          outcome: true,
+          safeMetadata: true,
+          targetId: true,
+          targetType: true,
+        },
+        take: auditEventPageSize + 1,
+        where: and.length > 0 ? { AND: and } : {},
+      });
+      const page = events.slice(0, auditEventPageSize);
+      return {
+        events: page.map((event) => ({
+          action: event.action,
+          actorId: event.actorId,
+          createdAt: event.createdAt,
+          id: event.id,
+          outcome: event.outcome,
+          safeMetadata: safeAuditMetadata(event.safeMetadata),
+          targetId: event.targetId,
+          targetType: event.targetType,
+        })),
+        nextCursor:
+          events.length > auditEventPageSize
+            ? auditEventCursorValue(page.at(-1) as AuditEventCursor)
+            : null,
+      };
+    })
     .get("/api/admin/results", async ({ request, query }) => {
       const identity = await requireIdentity(request);
       requireAdmin(identity);
