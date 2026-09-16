@@ -4,16 +4,16 @@ Folio Forms เป็นระบบสร้างและกรอกแบ�
 
 - **Admin** สร้าง Template, กำหนด Field, Publish และดู Submission
 - **User** เปิดลิงก์แบบฟอร์ม, กรอกข้อมูล, Save Draft, Resume และ Submit
-- **Production Compose** exposes only Caddy on the Forms and Office hosts; API, Web, ONLYOFFICE, PostgreSQL, and RustFS stay on the private Compose network.
+- **Production Compose** exposes only Caddy on one public Forms host; Caddy serves ONLYOFFICE at `https://FORMS_HOST/office`, while API, Web, ONLYOFFICE, PostgreSQL, and RustFS stay on the private Compose network.
 - **Development Mode** (section 1) runs the API on `3000`, Web on `5173`, ONLYOFFICE on `8080`, and RustFS on `9000`/`9001`.
 
 เอกสารนี้อธิบายการรันระบบ MMVP, การใช้ Share Link, การจัดการ Form และตำแหน่งข้อมูลสำคัญ
 
 ## Production single-host Compose
 
-Production uses the canonical `compose.yaml` with Caddy as the only public entry point. The Forms host serves the React app and API; the Office host serves ONLYOFFICE. PostgreSQL, RustFS, and the application containers stay on the private Compose network with no published host ports.
+Production uses the canonical `compose.yaml` with Caddy as the only public entry point. The Forms host serves the React app, API, and ONLYOFFICE at `/office`; PostgreSQL, RustFS, and the application containers stay on the private Compose network with no published host ports.
 
-Create an uncommitted deployment environment file with independent values for `DATABASE_URL`, `BETTER_AUTH_SECRET`, `EDITOR_CAPABILITY_SECRET`, `PREFILL_HANDOFF_SECRET`, `ONLYOFFICE_JWT_SECRET`, `RUSTFS_ACCESS_KEY_ID`, `RUSTFS_SECRET_ACCESS_KEY`, `RUSTFS_BUCKET`, `FORMS_HOST`, `OFFICE_HOST`, `CADDY_EMAIL`, and `PREFILL_RETURN_URL`. Set `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` consistently with `DATABASE_URL`. Bootstrap variables are needed only on the first empty database and may be removed after the first Admin replaces the temporary password.
+Create an uncommitted deployment environment file with independent values for `DATABASE_URL`, `BETTER_AUTH_SECRET`, `EDITOR_CAPABILITY_SECRET`, `PREFILL_HANDOFF_SECRET`, `ONLYOFFICE_JWT_SECRET`, `RUSTFS_ACCESS_KEY_ID`, `RUSTFS_SECRET_ACCESS_KEY`, `RUSTFS_BUCKET`, `FORMS_HOST`, `CADDY_EMAIL`, and `PREFILL_RETURN_URL`. Set `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` consistently with `DATABASE_URL`. Bootstrap variables are needed only on the first empty database and may be removed after the first Admin replaces the temporary password.
 
 Start the stack:
 
@@ -22,6 +22,17 @@ docker compose --env-file .env.production -f compose.yaml up -d --build
 docker compose --env-file .env.production -f compose.yaml ps
 curl -f https://forms.example.test/ready
 ```
+
+### Trust local Caddy CA
+
+For local Compose HTTPS using Caddy's local CA, run after Caddy is running:
+
+```bash
+docker compose --env-file .env.production -f compose.yaml cp caddy:/data/caddy/pki/authorities/local/root.crt /tmp/folio-forms-caddy-root.crt
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/folio-forms-caddy-root.crt
+```
+
+Restart the browser after trusting the certificate. Do not use disabled TLS verification as the permanent fix.
 
 The server applies checked-in Prisma migrations before listening, creates only the configured first Admin, and runs recovery reconciliation before serving readiness. Restart recovery expires stale Handoffs, Editor Leases, Operations, and callback claims, then retries only durable cleanup intents. Volumes preserve PostgreSQL, RustFS, ONLYOFFICE, and Caddy state.
 
@@ -263,6 +274,7 @@ Admin จะสามารถดูข้อมูล, เปิด Receipt แ
 | URL | ใช้งาน |
 | --- | --- |
 | `https://FORMS_HOST` | หน้าเริ่มต้นใน Production |
+| `https://FORMS_HOST/office` | ONLYOFFICE ใน Production |
 | `https://FORMS_HOST/login` | Login ใน Production |
 | `https://FORMS_HOST/dashboard` | Dashboard ของ User ใน Production |
 | `https://FORMS_HOST/admin` | Dashboard ของ Admin ใน Production |
@@ -370,7 +382,7 @@ curl -f https://forms.example.test/ready
 
 ### Editor บอกว่า Document ใช้งานไม่ได้
 
-ตรวจว่า PostgreSQL, RustFS, `rustfs-init`, ONLYOFFICE และ Server เป็น `healthy`, `TEMPLATE_PATH` มีอยู่, `ONLYOFFICE_DOCUMENT_BASE_URL` ให้ ONLYOFFICE เรียก Server ได้ และ DNS ของ Forms/Office host ชี้มายัง Caddy.
+ตรวจว่า PostgreSQL, RustFS, `rustfs-init`, ONLYOFFICE และ Server เป็น `healthy`, `TEMPLATE_PATH` มีอยู่, `ONLYOFFICE_DOCUMENT_BASE_URL` ให้ ONLYOFFICE เรียก Server ได้ และ Forms host เปิดเส้นทาง `/office` ผ่าน Caddy.
 
 ### ไม่เห็นปุ่ม Save Draft หรือ Submit
 
@@ -395,7 +407,7 @@ docker compose --env-file .env.production -f compose.yaml ps
 docker compose --env-file .env.production -f compose.yaml logs --tail=100 server
 ```
 
-มีเพียง Caddy ที่เปิด port `80/443` ภายนอก ส่วน Forms host route ไปยัง Web/API และ Office host route ไปยัง ONLYOFFICE PostgreSQL กับ RustFS ไม่มี public host port. `GET /health` เป็น liveness แบบตื้น และ `GET /ready` จะคืน `503` จนกว่า database, RustFS และไฟล์เตรียม Editor จะพร้อม.
+มีเพียง Caddy ที่เปิด port `80/443` ภายนอก และ Forms host route ไปยัง Web/API กับ ONLYOFFICE ที่ `/office`; PostgreSQL กับ RustFS ไม่มี public host port. `GET /health` เป็น liveness แบบตื้น และ `GET /ready` จะคืน `503` จนกว่า database, RustFS และไฟล์เตรียม Editor จะพร้อม.
 
 ก่อนเริ่มระบบ Server จะรัน migration, bootstrap Admin แบบ create-only และ reconcile Handoff, pending claim, Editor Lease, Operation, callback claim และ cleanup intent ที่ค้างอยู่ การ restart ไม่ลบ Form, Draft, Submission, Prefill หรือ Audit Event ที่ commit แล้ว.
 

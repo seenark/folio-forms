@@ -8,6 +8,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    ports:
+      - 5432:5432
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
@@ -28,6 +30,7 @@ services:
       RUSTFS_CONSOLE_ENABLE: "true"
     expose:
       - "9000"
+      - "9001"
     healthcheck:
       test:
         [
@@ -113,8 +116,8 @@ services:
       CORS_ORIGIN: https://${FORMS_HOST}
       SERVER_ORIGIN: https://${FORMS_HOST}
       API_BASE: https://${FORMS_HOST}
-      ONLYOFFICE_URL: https://${OFFICE_HOST:?set OFFICE_HOST}
-      ONLYOFFICE_API_BASE: https://${OFFICE_HOST}
+      ONLYOFFICE_URL: https://${FORMS_HOST:?set FORMS_HOST}/office
+      ONLYOFFICE_API_BASE: https://${FORMS_HOST:?set FORMS_HOST}/office
       ONLYOFFICE_INTERNAL_URL: http://onlyoffice
       ONLYOFFICE_DOCUMENT_BASE_URL: http://server:3000
       PREFILL_RETURN_URL: ${PREFILL_RETURN_URL:?set PREFILL_RETURN_URL}
@@ -171,7 +174,6 @@ services:
     environment:
       CADDY_EMAIL: ${CADDY_EMAIL:?set CADDY_EMAIL}
       FORMS_HOST: ${FORMS_HOST:?set FORMS_HOST}
-      OFFICE_HOST: ${OFFICE_HOST:?set OFFICE_HOST}
     ports:
       - "80:80"
       - "443:443"
@@ -189,8 +191,8 @@ services:
     working_dir: /workspace
     command: ["bun", "run", "apps/prefill-mock/src/index.ts"]
     environment:
-      FOLIO_ORIGIN: ${FOLIO_ORIGIN:?set FOLIO_ORIGIN}
       PREFILL_HANDOFF_SECRET: ${PREFILL_HANDOFF_SECRET:?set PREFILL_HANDOFF_SECRET}
+      FOLIO_ORIGIN: ${FOLIO_ORIGIN:?set FOLIO_ORIGIN}
       PREFILL_MOCK_PORT: "3010"
     ports:
       - "3010:3010"
@@ -203,5 +205,5 @@ volumes:
   onlyoffice-logs:
   onlyoffice-cache:
   rustfs-data:
-  caddy-data:
   caddy-config:
+  caddy-data:

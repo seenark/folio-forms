@@ -61,6 +61,18 @@ afterEach(() => {
   externalMock = undefined;
 });
 const jsonHeaders = { "Content-Type": "application/json" };
+const trimTrailingSlashes = (value: string): string =>
+  value.replace(/\/+$/u, "");
+const onlyOfficeBaseUrl = trimTrailingSlashes(
+  process.env.ONLYOFFICE_URL ?? "http://localhost:8080"
+);
+const apiBaseUrl = trimTrailingSlashes(
+  process.env.API_BASE ?? "http://localhost:3000"
+);
+const documentBaseUrl = trimTrailingSlashes(
+  process.env.ONLYOFFICE_DOCUMENT_BASE_URL ?? "http://host.docker.internal:3000"
+);
+
 const maxTemplateUploadBytes = 25 * 1024 * 1024;
 const templateContentTypesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="bin" ContentType="application/octet-stream"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`;
 const templateRelationshipsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`;
@@ -338,6 +350,7 @@ interface EditorConfigBody {
   config: {
     document: { key: string; url: string };
     editorConfig: {
+      callbackUrl: string;
       plugins: {
         options: Record<
           string,
@@ -348,6 +361,7 @@ interface EditorConfigBody {
             publicId?: string;
           }
         >;
+        pluginsData: string[];
       };
     };
     token: string;
@@ -1234,6 +1248,32 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(adminPluginOptions.parentOrigin).toBe(
     new URL(process.env.CORS_ORIGIN ?? "http://localhost:5173").origin
   );
+  expect(adminEditor.apiUrl).toBe(onlyOfficeBaseUrl);
+  expect(adminEditor.config.editorConfig.callbackUrl).toBe(
+    `${documentBaseUrl}/onlyoffice/callback`
+  );
+  expect(adminEditor.config.editorConfig.plugins.pluginsData).toEqual([
+    `${apiBaseUrl}/onlyoffice-plugin/config.json`,
+  ]);
+  const pluginHtmlResponse = await app.handle(
+    new Request("http://test.local/onlyoffice-plugin/index.html")
+  );
+  expect(pluginHtmlResponse.status).toBe(200);
+  expect(pluginHtmlResponse.headers.get("content-type")).toBe(
+    "text/html; charset=utf-8"
+  );
+  const pluginHtml = await pluginHtmlResponse.text();
+  const expectedPluginSdkUrl = `${onlyOfficeBaseUrl}/sdkjs-plugins/v1/plugins.js`;
+  const escapedPluginSdkUrl = expectedPluginSdkUrl
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+  expect(pluginHtml).toContain(
+    `<script src="${escapedPluginSdkUrl}"></script>`
+  );
+
   expect(adminEditor.config.token.length).toBeGreaterThan(20);
   expect(adminLease).toEqual({
     expiresAt: expect.any(String),
@@ -1730,6 +1770,11 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(crossTargetResponse.status).toBe(403);
 
   const documentUrl = adminEditor.config.document.url;
+  const parsedDocumentUrl = new URL(documentUrl);
+  expect(parsedDocumentUrl.origin).toBe(new URL(documentBaseUrl).origin);
+  expect(parsedDocumentUrl.pathname).toBe(
+    `/onlyoffice/document/${encodeURIComponent(templateDocumentKey)}`
+  );
   const unsignedDocumentResponse = await app.handle(new Request(documentUrl));
   expect(unsignedDocumentResponse.status).toBe(401);
   const alteredDocumentUrl = new URL(documentUrl);

@@ -90,6 +90,19 @@ function configuredPrefillReturnUrl(value: string): string {
   }
   return url.toString();
 }
+const onlyOfficePluginSdkUrlPlaceholder = "__ONLYOFFICE_PLUGIN_SDK_URL__";
+const htmlEscape = (value: string): string =>
+  value.replaceAll(
+    /[&<>"']/gu,
+    (character) =>
+      ({
+        '"': "&quot;",
+        "&": "&amp;",
+        "'": "&#39;",
+        "<": "&lt;",
+        ">": "&gt;",
+      })[character] ?? character
+  );
 
 const pluginDir = path.resolve(import.meta.dirname, "../../onlyoffice-plugin");
 const fallbackTemplatePath = path.resolve(
@@ -10729,9 +10742,15 @@ export function createApp(options: AppOptions = {}) {
         version: "2.1.0",
       };
     })
-    .get("/onlyoffice-plugin/index.html", () =>
-      Bun.file(path.resolve(pluginDir, "index.html"))
-    )
+    .get("/onlyoffice-plugin/index.html", async () => {
+      const html = await Bun.file(path.resolve(pluginDir, "index.html")).text();
+      const onlyOfficeBaseUrl = env.ONLYOFFICE_URL.replace(/\/+$/u, "");
+      const sdkUrl = `${onlyOfficeBaseUrl}/sdkjs-plugins/v1/plugins.js`;
+      return new Response(
+        html.replace(onlyOfficePluginSdkUrlPlaceholder, htmlEscape(sdkUrl)),
+        { headers: { "content-type": "text/html; charset=utf-8" } }
+      );
+    })
     .get("/onlyoffice-plugin/plugin.js", () =>
       Bun.file(path.resolve(pluginDir, "plugin.js"))
     )

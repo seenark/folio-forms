@@ -14,12 +14,19 @@
   handle @server {
     reverse_proxy server:3000
   }
+  handle_path /office/* {
+    reverse_proxy onlyoffice:80 {
+      header_up X-Forwarded-Host {host}/office
+      header_up X-Forwarded-Proto {scheme}
+    }
+  }
 
   handle {
     reverse_proxy web:80
   }
 }
 
-{$OFFICE_HOST} {
-  reverse_proxy onlyoffice:80
+
+http://rustfs.localhost {
+  reverse_proxy rustfs:9001
 }

@@ -14,7 +14,7 @@ The application provides:
 
 The accepted deployment target is one private single-host Docker Compose stack.
 
-The production Compose topology is defined by `compose.yaml`: Caddy publishes only the Forms and Office HTTPS hosts, while PostgreSQL, RustFS, the API, and the web container remain private. Every production credential is injected through an uncommitted environment file; no database, RustFS, bootstrap, auth, editor, Handoff, or ONLYOFFICE JWT value is committed.
+The production Compose topology is defined by `compose.yaml`: Caddy publishes one browser-facing Forms HTTPS host and serves ONLYOFFICE at `https://FORMS_HOST/office`; PostgreSQL, RustFS, the API, and the web container remain private. Every production credential is injected through an uncommitted environment file; no database, RustFS, bootstrap, auth, editor, Handoff, or ONLYOFFICE JWT value is committed.
 
 ```bash
 docker compose --env-file .env.production -f compose.yaml up -d --build
@@ -47,7 +47,7 @@ This is a single-host, single-disk deployment with no application or off-host ba
 | Component | Technology | Production exposure |
 | --- | --- | --- |
 | Forms web/API | React, Vite, Bun, Elysia | `https://FORMS_HOST` |
-| Document editor | ONLYOFFICE Docs Community Edition 9.4.0.1 | `https://OFFICE_HOST` |
+| Document editor | ONLYOFFICE Docs Community Edition 9.4.0.1 | `https://FORMS_HOST/office` |
 | Database | PostgreSQL 18 | Private Compose network only |
 | ORM and migrations | Prisma | Applied by the server before readiness |
 | Authentication | Better Auth opaque bearer sessions | Forms host only |
@@ -55,7 +55,7 @@ This is a single-host, single-disk deployment with no application or off-host ba
 
 ## Quick start
 
-This is the private single-host production stack. It requires Docker Compose, a DNS record for the Forms and Office hosts, and an uncommitted `.env.production` containing independent deployment values.
+This is the private single-host production stack. It requires Docker Compose, one DNS record for the Forms host, and an uncommitted `.env.production` containing deployment values.
 
 ### 1. Install dependencies
 
@@ -65,7 +65,7 @@ bun install
 
 ### 2. Configure deployment
 
-Set `DATABASE_URL`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `BETTER_AUTH_SECRET`, `EDITOR_CAPABILITY_SECRET`, `PREFILL_HANDOFF_SECRET`, `ONLYOFFICE_JWT_SECRET`, `RUSTFS_ACCESS_KEY_ID`, `RUSTFS_SECRET_ACCESS_KEY`, `RUSTFS_BUCKET`, `FORMS_HOST`, `OFFICE_HOST`, `CADDY_EMAIL`, and `PREFILL_RETURN_URL` in `.env.production`. Set bootstrap values for the first empty database only. Never commit this file.
+Set `DATABASE_URL`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `BETTER_AUTH_SECRET`, `EDITOR_CAPABILITY_SECRET`, `PREFILL_HANDOFF_SECRET`, `ONLYOFFICE_JWT_SECRET`, `RUSTFS_ACCESS_KEY_ID`, `RUSTFS_SECRET_ACCESS_KEY`, `RUSTFS_BUCKET`, `FORMS_HOST`, `CADDY_EMAIL`, and `PREFILL_RETURN_URL` in `.env.production`. Set bootstrap values for the first empty database only. Never commit this file.
 
 ### 3. Start the stack
 
@@ -96,10 +96,16 @@ This topology has no application or off-host backup. Disk, ransomware, or region
 
 ## Open the application
 
-Production:
+Production application:
 
 ```text
 https://<FORMS_HOST>
+```
+
+ONLYOFFICE:
+
+```text
+https://<FORMS_HOST>/office
 ```
 
 For local development only:
@@ -463,7 +469,7 @@ Do not publish database or RustFS ports. Confirm the injected `DATABASE_URL`, `R
 
 ### The editor says that a document is unavailable
 
-Confirm that PostgreSQL, RustFS, ONLYOFFICE, and the server are healthy; `TEMPLATE_PATH` exists in the server image; `ONLYOFFICE_DOCUMENT_BASE_URL` is reachable from the ONLYOFFICE container; and the Office host resolves to the Caddy endpoint.
+Confirm that PostgreSQL, RustFS, ONLYOFFICE, and the server are healthy; `TEMPLATE_PATH` exists in the server image; `ONLYOFFICE_DOCUMENT_BASE_URL` is reachable from the ONLYOFFICE container; and the Forms host serves `/office` through Caddy.
 
 ### Form actions are missing
 
