@@ -16,7 +16,7 @@
   },
   "type": "module",
   "scripts": {
-    "dev": "turbo run dev",
+    "dev": "turbo run dev --filter=server --filter=@onlyoffice/web",
     "build": "turbo run build",
     "check-types": "turbo run check-types",
     "dev:server": "turbo run dev -F server --",
@@ -41,5 +41,5 @@
     "typescript": "catalog:",
     "ultracite": "7.9.4"
   },
-  "packageManager": "bun@1.3.14"
+  "packageManager": "bun@1.4.0"
 }

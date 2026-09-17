@@ -8,8 +8,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
-    ports:
-      - 5432:5432
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
@@ -26,20 +24,11 @@ services:
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY_ID:?set RUSTFS_ACCESS_KEY_ID}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_ACCESS_KEY:?set RUSTFS_SECRET_ACCESS_KEY}
       RUSTFS_ADDRESS: ":9000"
-      RUSTFS_CONSOLE_ADDRESS: ":9001"
-      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ENABLE: "false"
     expose:
       - "9000"
-      - "9001"
     healthcheck:
-      test:
-        [
-          "CMD",
-          "curl",
-          "--fail",
-          "--silent",
-          "http://localhost:9000/health/ready",
-        ]
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:9000/health/ready"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -112,12 +101,12 @@ services:
       BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-}
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
-      BETTER_AUTH_URL: https://${FORMS_HOST:?set FORMS_HOST}
-      CORS_ORIGIN: https://${FORMS_HOST}
-      SERVER_ORIGIN: https://${FORMS_HOST}
-      API_BASE: https://${FORMS_HOST}
-      ONLYOFFICE_URL: https://${FORMS_HOST:?set FORMS_HOST}/office
-      ONLYOFFICE_API_BASE: https://${FORMS_HOST:?set FORMS_HOST}/office
+      BETTER_AUTH_URL: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN}
+      CORS_ORIGIN: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN}
+      SERVER_ORIGIN: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN}
+      API_BASE: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN}
+      ONLYOFFICE_URL: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN}/office
+      ONLYOFFICE_API_BASE: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN}/office
       ONLYOFFICE_INTERNAL_URL: http://onlyoffice
       ONLYOFFICE_DOCUMENT_BASE_URL: http://server:3000
       PREFILL_RETURN_URL: ${PREFILL_RETURN_URL:?set PREFILL_RETURN_URL}
@@ -151,7 +140,7 @@ services:
       context: .
       dockerfile: apps/web/Dockerfile
       args:
-        VITE_API_ORIGIN: https://${FORMS_HOST:?set FORMS_HOST}
+        VITE_API_ORIGIN: ${PUBLIC_ORIGIN:?set PUBLIC_ORIGIN}
     restart: unless-stopped
     expose:
       - "80"
@@ -161,8 +150,8 @@ services:
       timeout: 5s
       retries: 12
 
-  caddy:
-    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+  gateway:
+    image: vicanso/pingap:0.14.2@sha256:961e589cbeb64a3f4b11eba40e147dab9467bb8f5a29d2ecc62dba4ac839a440
     restart: unless-stopped
     depends_on:
       server:
@@ -171,19 +160,16 @@ services:
         condition: service_healthy
       onlyoffice:
         condition: service_healthy
-    environment:
-      CADDY_EMAIL: ${CADDY_EMAIL:?set CADDY_EMAIL}
-      FORMS_HOST: ${FORMS_HOST:?set FORMS_HOST}
     ports:
-      - "80:80"
-      - "443:443"
+      - "${GATEWAY_PORT:-8080}:80"
+    expose:
+      - "80"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
+      - ./gateway/pingap.toml:/opt/pingap/pingap.toml:ro
+    command: ["-c", "/opt/pingap/pingap.toml", "--autoreload"]
 
   prefill-mock:
-    image: oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4
+    image: oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6
     profiles: [verification]
     depends_on:
       server:
@@ -205,5 +191,3 @@ volumes:
   onlyoffice-logs:
   onlyoffice-cache:
   rustfs-data:
-  caddy-config:
-  caddy-data:

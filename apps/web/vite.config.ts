@@ -14,5 +14,5 @@ export default defineConfig({
     tailwindcss(),
   ],
   resolve: { alias: { "@": path.resolve(root, "./src") } },
-  server: { host: "0.0.0.0", port: 5173 },
+  server: { hmr: { clientPort: 8080 }, host: "0.0.0.0", port: 5173 },
 });

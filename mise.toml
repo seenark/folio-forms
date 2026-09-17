@@ -1,4 +1,5 @@
 [tools]
 bun = "1.4"
+just = "latest"
 python = "latest"
 uv = "latest"

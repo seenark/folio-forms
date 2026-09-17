@@ -308,7 +308,7 @@ export const OnlyOfficeEditor = ({
       return;
     }
     try {
-      await apiDelete(lease.releaseUrl);
+      await apiDelete(lease.releaseUrl, undefined, { keepalive: true });
     } catch {
       // Lease expiry remains the fallback if best-effort release is unavailable.
     }

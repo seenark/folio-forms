@@ -105,6 +105,15 @@ const htmlEscape = (value: string): string =>
   );
 
 const pluginDir = path.resolve(import.meta.dirname, "../../onlyoffice-plugin");
+const pluginIndexResponse = async () => {
+  const html = await Bun.file(path.resolve(pluginDir, "index.html")).text();
+  const onlyOfficeBaseUrl = env.ONLYOFFICE_URL.replace(/\/+$/u, "");
+  const sdkUrl = `${onlyOfficeBaseUrl}/sdkjs-plugins/v1/plugins.js`;
+  return new Response(
+    html.replace(onlyOfficePluginSdkUrlPlaceholder, htmlEscape(sdkUrl)),
+    { headers: { "content-type": "text/html; charset=utf-8" } }
+  );
+};
 const fallbackTemplatePath = path.resolve(
   import.meta.dirname,
   "../../../onlyoffice-templates/template.docx"
@@ -164,11 +173,13 @@ const accountNameMaximumLength = 120;
 const accountMutationLockId = 1_604_619_418;
 const callbackInternalOrigin = originOf(env.ONLYOFFICE_INTERNAL_URL);
 const callbackPublicOrigin = originOf(env.ONLYOFFICE_URL);
+const callbackDocumentOrigin = originOf(env.ONLYOFFICE_DOCUMENT_BASE_URL);
 const callbackOrigins = new Set(
-  [callbackInternalOrigin, callbackPublicOrigin].filter(
+  [callbackInternalOrigin, callbackPublicOrigin, callbackDocumentOrigin].filter(
     (origin): origin is string => Boolean(origin)
   )
 );
+const corsOrigin = originOf(env.CORS_ORIGIN);
 const pluginOrigins = new Set(
   [env.API_BASE, env.ONLYOFFICE_URL, env.CORS_ORIGIN]
     .map(originOf)
@@ -1724,7 +1735,6 @@ async function claimEditorLease(
   const expiresAt = nextEditorLeaseExpiry(identity, now);
   const proof = editorLeaseProof(identity, targetType, targetId);
   const capabilityDigest = tokenDigest(proof);
-  const leaseId = crypto.randomUUID();
   const databaseTargetType = editorLeaseTargetType(targetType);
   const activeOperation = await prisma.operation.findFirst({
     where: {
@@ -1771,7 +1781,11 @@ async function claimEditorLease(
     );
     const sameHolder =
       current?.holderSessionId === identity.sessionId &&
-      current.holderUserId === identity.id;
+      current?.holderUserId === identity.id;
+    const leaseId =
+      sameHolder && current && current.expiresAt > now
+        ? current.id
+        : crypto.randomUUID();
     if (!sameHolder) {
       const activeOperation = await tx.operation.findFirst({
         select: { id: true },
@@ -1818,10 +1832,7 @@ async function claimEditorLease(
           ${now}
         )
         ON CONFLICT ("target_type", "target_id") DO UPDATE SET
-          "id" = CASE
-            WHEN "editor_leases"."expires_at" <= ${now} THEN EXCLUDED."id"
-            ELSE "editor_leases"."id"
-          END,
+          "id" = EXCLUDED."id",
           "holder_session_id" = EXCLUDED."holder_session_id",
           "holder_user_id" = EXCLUDED."holder_user_id",
           "capability_digest" = EXCLUDED."capability_digest",
@@ -1936,19 +1947,16 @@ async function releaseEditorLease(
         "The editor lease is no longer active"
       );
     }
-    const activeOperation =
-      lease.targetType === OperationTargetType.correction
-        ? await tx.operation.findFirst({
-            select: { id: true },
-            where: {
-              status: {
-                in: [OperationStatus.pending, OperationStatus.processing],
-              },
-              targetId: lease.targetId,
-              targetType: OperationTargetType.correction,
-            },
-          })
-        : null;
+    const activeOperation = await tx.operation.findFirst({
+      select: { id: true },
+      where: {
+        status: {
+          in: [OperationStatus.pending, OperationStatus.processing],
+        },
+        targetId: lease.targetId,
+        targetType: lease.targetType,
+      },
+    });
     if (activeOperation) {
       return null;
     }
@@ -3051,8 +3059,8 @@ async function readinessStatus(): Promise<boolean> {
 export function resolveCallbackDocumentUrl(
   value: unknown,
   allowedOrigins: ReadonlySet<string> = callbackOrigins,
-  publicOrigin: string | null = callbackPublicOrigin,
-  internalOrigin: string | null = callbackInternalOrigin
+  publicBaseUrl: string | null = env.ONLYOFFICE_URL,
+  internalBaseUrl: string | null = env.ONLYOFFICE_INTERNAL_URL
 ): string | null {
   if (typeof value !== "string") {
     return null;
@@ -3068,16 +3076,31 @@ export function resolveCallbackDocumentUrl(
     ) {
       return null;
     }
+    const publicBase = publicBaseUrl ? new URL(publicBaseUrl) : null;
+    const internalBase = internalBaseUrl ? new URL(internalBaseUrl) : null;
     if (
-      publicOrigin &&
-      internalOrigin &&
-      publicOrigin !== internalOrigin &&
-      url.origin === publicOrigin
+      publicBase &&
+      internalBase &&
+      publicBase.toString() !== internalBase.toString() &&
+      url.origin === publicBase.origin
     ) {
-      const internalUrl = new URL(internalOrigin);
-      internalUrl.pathname = url.pathname;
-      internalUrl.search = url.search;
-      url = internalUrl;
+      const publicPrefix = publicBase.pathname.replace(/\/+$/u, "");
+      const matchesPublicPrefix =
+        publicPrefix === "" ||
+        url.pathname === publicPrefix ||
+        url.pathname.startsWith(`${publicPrefix}/`);
+      if (matchesPublicPrefix) {
+        const suffix =
+          publicPrefix === ""
+            ? url.pathname
+            : url.pathname.slice(publicPrefix.length);
+        const internalPath = internalBase.pathname.replace(/\/+$/u, "");
+        internalBase.pathname = `${internalPath}${suffix}` || "/";
+      } else {
+        internalBase.pathname = url.pathname;
+      }
+      internalBase.search = url.search;
+      url = internalBase;
     }
     return url.toString();
   } catch {
@@ -4863,15 +4886,6 @@ export async function reconcileRecoverableState(): Promise<void> {
   const now = new Date();
   await expireDuePrefillHandoffs(now);
   const staleBefore = new Date(now.getTime() - operationTimeoutMs);
-  await prisma.editorLease.deleteMany({
-    where: {
-      OR: [
-        { expiresAt: { lte: now } },
-        { holderSession: { expiresAt: { lte: now } } },
-      ],
-      targetType: { not: OperationTargetType.correction },
-    },
-  });
   const staleOperations = await prisma.operation.findMany({
     select: { id: true },
     where: {
@@ -4882,33 +4896,64 @@ export async function reconcileRecoverableState(): Promise<void> {
   for (const operation of staleOperations) {
     await updateOperationFailed(operation.id, "operation_timeout", staleBefore);
   }
-  const expiredCorrectionLeases = await prisma.editorLease.findMany({
-    select: { id: true, targetId: true, workspaceObjectKey: true },
+  const expiredLeases = await prisma.editorLease.findMany({
+    select: {
+      id: true,
+      targetId: true,
+      targetType: true,
+    },
     where: {
       OR: [
         { expiresAt: { lte: now } },
         { holderSession: { expiresAt: { lte: now } } },
       ],
-      targetType: OperationTargetType.correction,
     },
   });
-  for (const lease of expiredCorrectionLeases) {
-    const activeOperation = await prisma.operation.findFirst({
-      select: { id: true },
-      where: {
-        status: { in: [OperationStatus.pending, OperationStatus.processing] },
-        targetId: lease.targetId,
-        targetType: OperationTargetType.correction,
-      },
+  for (const lease of expiredLeases) {
+    const workspaceObjectKey = await prisma.$transaction(async (tx) => {
+      const [locked] = await tx.$queryRaw<
+        {
+          expiresAt: Date;
+          sessionExpiresAt: Date;
+          workspaceObjectKey: string | null;
+        }[]
+      >(
+        Prisma.sql`
+          SELECT
+            "editor_leases"."expires_at" AS "expiresAt",
+            "session"."expires_at" AS "sessionExpiresAt",
+            "editor_leases"."workspace_object_key" AS "workspaceObjectKey"
+          FROM "editor_leases"
+          INNER JOIN "session"
+            ON "session"."id" = "editor_leases"."holder_session_id"
+          WHERE "editor_leases"."id" = ${lease.id}::uuid
+          FOR UPDATE
+        `
+      );
+      if (
+        !locked ||
+        (locked.expiresAt > now && locked.sessionExpiresAt > now)
+      ) {
+        return null;
+      }
+      const activeOperation = await tx.operation.findFirst({
+        select: { id: true },
+        where: {
+          status: { in: [OperationStatus.pending, OperationStatus.processing] },
+          targetId: lease.targetId,
+          targetType: lease.targetType,
+        },
+      });
+      if (activeOperation) {
+        return null;
+      }
+      const deleted = await tx.editorLease.deleteMany({
+        where: { id: lease.id },
+      });
+      return deleted.count === 1 ? locked.workspaceObjectKey : null;
     });
-    if (activeOperation) {
-      continue;
-    }
-    const deleted = await prisma.editorLease.deleteMany({
-      where: { id: lease.id },
-    });
-    if (deleted.count === 1 && lease.workspaceObjectKey) {
-      await deleteObjectUnlessCanonical(lease.workspaceObjectKey);
+    if (workspaceObjectKey) {
+      await deleteObjectUnlessCanonical(workspaceObjectKey);
     }
   }
   await prisma.callbackClaim.deleteMany({
@@ -10709,7 +10754,7 @@ export function createApp(options: AppOptions = {}) {
       if (origin && !pluginOrigins.has(origin)) {
         fail(403, "forbidden_origin", "Origin is not allowed");
       }
-      if (origin) {
+      if (origin && origin !== corsOrigin) {
         set.headers["Access-Control-Allow-Origin"] = origin;
         set.headers.Vary = "Origin";
       }
@@ -10742,15 +10787,9 @@ export function createApp(options: AppOptions = {}) {
         version: "2.1.0",
       };
     })
-    .get("/onlyoffice-plugin/index.html", async () => {
-      const html = await Bun.file(path.resolve(pluginDir, "index.html")).text();
-      const onlyOfficeBaseUrl = env.ONLYOFFICE_URL.replace(/\/+$/u, "");
-      const sdkUrl = `${onlyOfficeBaseUrl}/sdkjs-plugins/v1/plugins.js`;
-      return new Response(
-        html.replace(onlyOfficePluginSdkUrlPlaceholder, htmlEscape(sdkUrl)),
-        { headers: { "content-type": "text/html; charset=utf-8" } }
-      );
-    })
+    .get("/onlyoffice-plugin", pluginIndexResponse)
+    .get("/onlyoffice-plugin/", pluginIndexResponse)
+    .get("/onlyoffice-plugin/index.html", pluginIndexResponse)
     .get("/onlyoffice-plugin/plugin.js", () =>
       Bun.file(path.resolve(pluginDir, "plugin.js"))
     )

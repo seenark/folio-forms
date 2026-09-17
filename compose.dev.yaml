@@ -1,0 +1,28 @@
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5433:5432"
+
+  rustfs:
+    ports:
+      - "127.0.0.1:9000:9000"
+
+  onlyoffice:
+    ports:
+      - "127.0.0.1:8081:80"
+
+  dev-gateway:
+    image: vicanso/pingap:0.14.2@sha256:961e589cbeb64a3f4b11eba40e147dab9467bb8f5a29d2ecc62dba4ac839a440
+    restart: unless-stopped
+    depends_on:
+      onlyoffice:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8080}:80"
+    expose:
+      - "80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./gateway/pingap.dev.toml:/opt/pingap/pingap.toml:ro
+    command: ["-c", "/opt/pingap/pingap.toml", "--autoreload"]

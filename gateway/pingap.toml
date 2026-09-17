@@ -1,0 +1,102 @@
+# Portable internal gateway. TLS and public hostnames belong to external ingress.
+# Pingap listens on plain HTTP so it works behind any TLS terminator.
+
+[upstreams.server]
+addrs = ["server:3000"]
+
+[upstreams.web]
+addrs = ["web:80"]
+
+[upstreams.onlyoffice]
+addrs = ["onlyoffice:80"]
+
+
+[plugins.compression]
+category = "compression"
+gzip_level = 6
+
+# Pingap 0.14.2's enable_reverse_proxy_headers uses $scheme for
+# X-Forwarded-Proto. Keep that setting off so an external ingress' trusted
+# X-Forwarded-Proto value is not replaced with http. Normal routes preserve
+# Host and X-Forwarded-Host; X-Forwarded-For is rebuilt with the gateway peer.
+# The office route passes the public host and prefix separately, so local
+# ports remain part of generated ONLYOFFICE URLs.
+
+[locations.api]
+path = "~^/api(?:/|$)"
+upstream = "server"
+proxy_set_headers = [
+  "Host:$http_host",
+  "X-Forwarded-For:$proxy_add_x_forwarded_for",
+]
+plugins = ["compression"]
+
+[locations.health]
+path = "=/health"
+upstream = "server"
+proxy_set_headers = [
+  "Host:$http_host",
+  "X-Forwarded-For:$proxy_add_x_forwarded_for",
+]
+plugins = ["compression"]
+
+[locations.ready]
+path = "=/ready"
+upstream = "server"
+proxy_set_headers = [
+  "Host:$http_host",
+  "X-Forwarded-For:$proxy_add_x_forwarded_for",
+]
+plugins = ["compression"]
+
+[locations.onlyoffice]
+path = "/onlyoffice"
+upstream = "server"
+proxy_set_headers = [
+  "Host:$http_host",
+  "X-Forwarded-For:$proxy_add_x_forwarded_for",
+]
+plugins = ["compression"]
+
+[locations.prefill]
+path = "/prefill"
+upstream = "server"
+proxy_set_headers = [
+  "Host:$http_host",
+  "X-Forwarded-For:$proxy_add_x_forwarded_for",
+]
+plugins = ["compression"]
+
+[locations.office]
+path = "~^/office(?:/|$)"
+upstream = "onlyoffice"
+rewrite = "^/office/?(.*)$ /$1"
+proxy_set_headers = [
+  "Host:$http_host",
+  "X-Forwarded-For:$proxy_add_x_forwarded_for",
+  "X-Forwarded-Host:$http_host",
+  "X-Forwarded-Prefix:/office",
+]
+plugins = ["compression"]
+
+
+[locations.web]
+path = "/"
+upstream = "web"
+proxy_set_headers = [
+  "Host:$http_host",
+  "X-Forwarded-For:$proxy_add_x_forwarded_for",
+]
+plugins = ["compression"]
+
+[servers.main]
+addr = "0.0.0.0:80"
+locations = [
+  "health",
+  "ready",
+  "api",
+  "onlyoffice",
+  "prefill",
+  "office",
+  "web",
+]

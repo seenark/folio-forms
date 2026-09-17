@@ -503,6 +503,17 @@ const tamperAuthorization = (authorization: string): string => {
   return `${scheme} ${header}.${payload}.${signature[0] === "a" ? "b" : "a"}${signature.slice(1)}`;
 };
 
+test("rewrites public ONLYOFFICE callback paths to the internal base", () => {
+  expect(
+    resolveCallbackDocumentUrl(
+      "http://localhost:8080/office/cache/files/data/example/output.docx?md5=x",
+      new Set(["http://localhost:8080"]),
+      "http://localhost:8080/office",
+      "http://localhost:8081"
+    )
+  ).toBe("http://localhost:8081/cache/files/data/example/output.docx?md5=x");
+});
+
 test("serves authenticated Admin and User workflows through HTTP", async () => {
   const adminEmail = `ticket-02-admin-${crypto.randomUUID()}@example.com`;
   const userEmail = `ticket-02-user-${crypto.randomUUID()}@example.com`;
@@ -528,6 +539,14 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
       "http://onlyoffice"
     )
   ).toBe("http://onlyoffice//169.254.169.254/latest/meta-data?key=value");
+  const callbackDocumentUrl = new URL(
+    "/onlyoffice/document/template.docx",
+    process.env.ONLYOFFICE_DOCUMENT_BASE_URL ??
+      "http://host.docker.internal:3000"
+  ).toString();
+  expect(resolveCallbackDocumentUrl(callbackDocumentUrl)).toBe(
+    callbackDocumentUrl
+  );
   expect(
     resolveCallbackDocumentUrl(
       "https://user:password@docs.example/document.docx",
@@ -1255,6 +1274,13 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   expect(adminEditor.config.editorConfig.plugins.pluginsData).toEqual([
     `${apiBaseUrl}/onlyoffice-plugin/config.json`,
   ]);
+  const pluginRootResponse = await app.handle(
+    new Request("http://test.local/onlyoffice-plugin/")
+  );
+  expect(pluginRootResponse.status).toBe(200);
+  expect(pluginRootResponse.headers.get("content-type")).toBe(
+    "text/html; charset=utf-8"
+  );
   const pluginHtmlResponse = await app.handle(
     new Request("http://test.local/onlyoffice-plugin/index.html")
   );
@@ -1593,6 +1619,19 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
         90 * 1000
     )
   ).toBeLessThanOrEqual(1000);
+
+  const repeatedAdminEditorResponse = await app.handle(
+    new Request(
+      `http://test.local/api/admin/forms/${formPublicId}/editor-config`,
+      {
+        headers: { Authorization: `Bearer ${adminBearer}` },
+      }
+    )
+  );
+  expect(repeatedAdminEditorResponse.status).toBe(200);
+  const repeatedAdminEditor =
+    (await repeatedAdminEditorResponse.json()) as EditorConfigBody;
+  expect(repeatedAdminEditor.bridge.lease.id).toBe(adminLease.id);
 
   const competingAdminEditorResponse = await app.handle(
     new Request(
@@ -4737,6 +4776,58 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     submitCapability = refreshedSubmitCapability;
     userLease = refreshedConfig.bridge.lease;
   };
+  await prisma.editorLease.update({
+    data: { createdAt: new Date(0), expiresAt: new Date(1) },
+    where: { id: userLease.id },
+  });
+
+  const previousUserLeaseId = userLease.id;
+  await refreshResponseEditor();
+  expect(userLease.id).not.toBe(previousUserLeaseId);
+  const staleUserLeaseRelease = await app.handle(
+    new Request(`http://test.local/api/editor-leases/${previousUserLeaseId}`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(staleUserLeaseRelease.status).toBe(409);
+  expect(await staleUserLeaseRelease.json()).toMatchObject({
+    error: "editor_lease_inactive",
+  });
+  const activeLeaseOperationId = crypto.randomUUID();
+  await prisma.operation.create({
+    data: {
+      actorId: userId,
+      documentKey: responseDocumentKey,
+      formId,
+      id: activeLeaseOperationId,
+      metadata: {
+        action: "save-draft",
+        finalObjectKey: `operations/${activeLeaseOperationId}/final.docx`,
+        formId,
+        responseId,
+        stagedObjectKey: `operations/${activeLeaseOperationId}/staged.docx`,
+      },
+      ownerUserId: userId,
+      responseId,
+      stagingObjectKey: `operations/${activeLeaseOperationId}/staged.docx`,
+      status: "processing",
+      targetId: responseId,
+      targetType: "response",
+      type: "save_draft",
+    },
+  });
+  const releaseDuringOperationResponse = await app.handle(
+    new Request(`http://test.local${userLease.releaseUrl}`, {
+      headers: { Authorization: `Bearer ${userBearer}` },
+      method: "DELETE",
+    })
+  );
+  expect(releaseDuringOperationResponse.status).toBe(200);
+  expect(
+    await prisma.editorLease.findUnique({ where: { id: userLease.id } })
+  ).not.toBeNull();
+  await prisma.operation.delete({ where: { id: activeLeaseOperationId } });
   const sessionOnlyUserDraftResponse = await app.handle(
     new Request(`http://test.local/api/forms/${formRecord.publicId}/draft`, {
       body: JSON.stringify({
@@ -6581,6 +6672,10 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     data: { createdAt: new Date(0), expiresAt: new Date(1) },
     where: { id: expiredLease.id },
   });
+  await prisma.operation.update({
+    data: { updatedAt: new Date() },
+    where: { id: staleOperationId },
+  });
   const cleanupIntentObjectKey = objectKey(
     "cleanup-intents",
     crypto.randomUUID(),
@@ -6612,6 +6707,9 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
     },
   });
   await reconcileRecoverableState();
+  expect(
+    await prisma.editorLease.findUnique({ where: { id: expiredLease.id } })
+  ).not.toBeNull();
   expect(await objectExists(cleanupIntentObjectKey)).toBe(false);
   expect(
     await prisma.objectCleanupIntent.findUnique({
@@ -6627,6 +6725,10 @@ test("serves authenticated Admin and User workflows through HTTP", async () => {
   await prisma.objectCleanupIntent.update({
     data: { cleanupAfter: new Date(0) },
     where: { objectKey: inFlightCleanupObjectKey },
+  });
+  await prisma.operation.update({
+    data: { updatedAt: new Date(0) },
+    where: { id: staleOperationId },
   });
   await reconcileRecoverableState();
   expect(await objectExists(inFlightCleanupObjectKey)).toBe(false);

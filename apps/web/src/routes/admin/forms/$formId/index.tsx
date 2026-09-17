@@ -84,6 +84,9 @@ const detailErrorMessage = (caughtError: unknown, fallback: string): string => {
       case "editor_lease_inactive": {
         return "เซสชันตัวแก้ไขหมดอายุ กรุณาลองใหม่";
       }
+      case "operation_in_progress": {
+        return "มีการบันทึกเอกสารกำลังดำเนินการ กรุณารอแล้วลองใหม่";
+      }
       case "form_not_published": {
         return "เก็บถาวรหรือยกเลิกเก็บถาวรได้เฉพาะแบบฟอร์มที่เผยแพร่แล้ว";
       }

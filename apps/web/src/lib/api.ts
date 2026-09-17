@@ -1,6 +1,6 @@
 // oxlint-disable no-await-in-loop avoid-new -- Polling and delay are intentionally sequential.
 export const API_ORIGIN =
-  import.meta.env.VITE_API_ORIGIN ?? "http://localhost:3000";
+  import.meta.env.VITE_API_ORIGIN ?? "http://localhost:8080";
 export const SESSION_KEY = "onlyoffice.sessionToken";
 
 export class ApiError extends Error {
@@ -367,10 +367,15 @@ export const apiPatch = <T>(path: string, body?: unknown) =>
     body: JSON.stringify(body ?? {}),
     method: "PATCH",
   });
-export const apiDelete = <T>(path: string, body?: unknown) =>
+export const apiDelete = <T>(
+  path: string,
+  body?: unknown,
+  options?: Pick<RequestInit, "keepalive">
+) =>
   request<T>(path, {
     body: body === undefined ? undefined : JSON.stringify(body),
     method: "DELETE",
+    ...options,
   });
 export const downloadArtifact = async (path: string, filename: string) => {
   const token = getToken();
